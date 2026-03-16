@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -12,25 +13,95 @@ from RLAlg.nn.steps import StochasticContinuousPolicyStep, ValueStep
 from RLAlg.alg.ppo import PPO
 from RLAlg.logger import WandbLogger, MetricsTracker
 
-from model.actor import Actor
+from model.actor import AdaINActor, AdaINResActor, SplitEncoderActor, VanilaActor
 from model.critic import Critic
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Random agent for Isaac Lab environments.")
+    parser.add_argument(
+        "--actor-type",
+        default="vanila",
+        help="Actor architecture to train: vanila, split_encoder, adain, or adain_res.",
+    )
     AppLauncher.add_app_launcher_args(parser)
     return parser
 
 class Trainer:
     @staticmethod
-    def _get_policy_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        return torch.cat((obs["motion"], obs["robot"]), dim=-1)
+    def _normalize_actor_type(actor_type: str) -> str:
+        normalized = actor_type.lower().replace("-", "_")
+        alias_map = {
+            "vanila": "vanila",
+            "vanilla": "vanila",
+            "split": "split_encoder",
+            "split_encoder": "split_encoder",
+            "adain": "adain",
+            "adain_res": "adain_res",
+            "adainres": "adain_res",
+        }
+        try:
+            return alias_map[normalized]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported actor type '{actor_type}'.") from exc
+
+    @staticmethod
+    def _build_actor(cfg, actor_type: str, action_dim: int) -> torch.nn.Module:
+        if actor_type == "vanila":
+            return VanilaActor(cfg.policy_observation_space, action_dim)
+        if actor_type == "split_encoder":
+            return SplitEncoderActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+        if actor_type == "adain":
+            return AdaINActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+        if actor_type == "adain_res":
+            return AdaINResActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+        raise ValueError(f"Unsupported actor type '{actor_type}'.")
+
+    @staticmethod
+    def _get_actor_observation(obs: dict[str, torch.Tensor], actor_type: str) -> dict[str, torch.Tensor]:
+        if actor_type == "vanila":
+            return {"obs": torch.cat((obs["motion"], obs["robot"]), dim=-1)}
+        return {
+            "motion_obs": obs["motion"],
+            "robot_obs": obs["robot"],
+        }
+
+    @staticmethod
+    def _get_policy_storage_specs(cfg, actor_type: str) -> dict[str, tuple[int, ...]]:
+        if actor_type == "vanila":
+            return {"policy_observations": (cfg.policy_observation_space,)}
+        return {
+            "motion_observations": (cfg.motion_observation_space,),
+            "robot_observations": (cfg.robot_observation_space,),
+        }
+
+    @staticmethod
+    def _get_policy_records(actor_obs: dict[str, torch.Tensor], actor_type: str) -> dict[str, torch.Tensor]:
+        if actor_type == "vanila":
+            return {"policy_observations": actor_obs["obs"]}
+        return {
+            "motion_observations": actor_obs["motion_obs"],
+            "robot_observations": actor_obs["robot_obs"],
+        }
+
+    @staticmethod
+    def _get_policy_batch(
+        batch: dict[str, torch.Tensor],
+        actor_type: str,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        if actor_type == "vanila":
+            return {"obs": batch["policy_observations"].to(device)}
+        return {
+            "motion_obs": batch["motion_observations"].to(device),
+            "robot_obs": batch["robot_observations"].to(device),
+        }
 
     @staticmethod
     def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
         return obs["privilege"]
 
-    def __init__(self):
+    def __init__(self, actor_type: str):
         from env.cfg import G1JabTrainingEnv
 
         self.cfg = G1JabTrainingEnv()
@@ -42,12 +113,13 @@ class Trainer:
         print(self.cfg.scene.num_envs)
 
         self.device = self.env.unwrapped.device
+        self.actor_type = self._normalize_actor_type(actor_type)
+        self.motion_name = Path(self.cfg.expert_motion_file).stem if self.cfg.expert_motion_file else "motion_tracking"
         
-        policy_obs_dim = self.cfg.policy_observation_space
         critic_obs_dim = self.cfg.critic_observation_space
         action_dim = self.cfg.action_space
 
-        self.actor = Actor(policy_obs_dim, action_dim).to(self.device)
+        self.actor = self._build_actor(self.cfg, self.actor_type, action_dim).to(self.device)
         self.critic = Critic(critic_obs_dim).to(self.device)
 
         self.ac_optimizer = torch.optim.Adam(
@@ -69,17 +141,21 @@ class Trainer:
             self.steps
         )
 
-        self.batch_keys = ["policy_observations",
-                           "critic_observations",
-                           "actions",
-                           "log_probs",
-                           "rewards",
-                           "values",
-                           "returns",
-                           "advantages"
-                        ]
+        self.policy_storage_specs = self._get_policy_storage_specs(self.cfg, self.actor_type)
+        self.policy_batch_keys = list(self.policy_storage_specs)
+        self.batch_keys = [
+            *self.policy_batch_keys,
+            "critic_observations",
+            "actions",
+            "log_probs",
+            "rewards",
+            "values",
+            "returns",
+            "advantages",
+        ]
 
-        self.rollout_buffer.create_storage_space("policy_observations", (policy_obs_dim,), torch.float32)
+        for key, shape in self.policy_storage_specs.items():
+            self.rollout_buffer.create_storage_space(key, shape, torch.float32)
         self.rollout_buffer.create_storage_space("critic_observations", (critic_obs_dim,), torch.float32)
         self.rollout_buffer.create_storage_space("actions", (action_dim,), torch.float32)
         self.rollout_buffer.create_storage_space("log_probs", (), torch.float32)
@@ -101,7 +177,12 @@ class Trainer:
         WandbLogger.init_project("Mimic", f"G1_Pick")
         
     @torch.no_grad()
-    def get_action(self, actorobs_batch:torch.Tensor, criticobs_batch:torch.Tensor, determine:bool=False):
+    def get_action(
+        self,
+        actorobs_batch: dict[str, torch.Tensor],
+        criticobs_batch: torch.Tensor,
+        determine: bool = False,
+    ):
         actor_step:StochasticContinuousPolicyStep = self.actor(actorobs_batch, update_normlizer=True)
         action = actor_step.action
         log_prob = actor_step.log_prob
@@ -116,9 +197,9 @@ class Trainer:
     def rollout(self, obs):
         for _ in range(self.steps):
             self.global_step += 1
-            policy_obs = self._get_policy_observation(obs)
+            actor_obs = self._get_actor_observation(obs, self.actor_type)
             critic_obs = self._get_critic_observation(obs)
-            action, log_prob, value = self.get_action(policy_obs, critic_obs)
+            action, log_prob, value = self.get_action(actor_obs, critic_obs)
             next_obs, task_reward, terminate, timeout, info = self.env.step(action)
             
             #reward = torch.sigmoid(task_reward)
@@ -148,7 +229,6 @@ class Trainer:
                 WandbLogger.log_metrics(episode_info, self.global_step)
 
             records = {
-                "policy_observations": policy_obs,
                 "critic_observations": critic_obs,
                 "actions": action,
                 "log_probs": log_prob,
@@ -156,14 +236,15 @@ class Trainer:
                 "values": value,
                 "terminate": terminate
             }
+            records.update(self._get_policy_records(actor_obs, self.actor_type))
 
             self.rollout_buffer.add_records(records)
 
             obs = next_obs
 
-        policy_obs = self._get_policy_observation(obs)
+        actor_obs = self._get_actor_observation(obs, self.actor_type)
         critic_obs = self._get_critic_observation(obs)
-        _, _, last_value = self.get_action(policy_obs, critic_obs)
+        _, _, last_value = self.get_action(actor_obs, critic_obs)
         returns, advantages = compute_gae(
             self.rollout_buffer.data["rewards"],
             self.rollout_buffer.data["values"],
@@ -187,7 +268,7 @@ class Trainer:
 
         for i in range(5):
             for batch in self.rollout_buffer.sample_batchs(self.batch_keys, 4096*10):
-                policy_obs_batch = batch["policy_observations"].to(self.device)
+                policy_obs_batch = self._get_policy_batch(batch, self.actor_type, self.device)
                 critic_obs_batch = batch["critic_observations"].to(self.device)
                 action_batch = batch["actions"].to(self.device)
                 log_prob_batch = batch["log_probs"].to(self.device)
@@ -247,9 +328,11 @@ class Trainer:
 
     def save_weight(self, name:str):
         joint_params = self.env.unwrapped.get_joint_params()
+        checkpoint_name = f"{self.motion_name}_{self.actor_type}_{name}"
 
         torch.save(
             {
+                "actor_type": self.actor_type,
                 "actor": self.actor.state_dict(), 
                 "critic": self.critic.state_dict(),
                 "joint_names": joint_params["joint_names"],
@@ -260,13 +343,13 @@ class Trainer:
                 "action_offset": joint_params["action_offset"],
                 "action_scale": joint_params["action_scale"],
             },
-            f"{name}.pth"
+            f"{checkpoint_name}.pth"
         )
 
     def train(self):
         obs, _ = self.env.reset()
         try:
-            for epoch in trange(2000):
+            for epoch in trange(1000):
                 obs = self.rollout(obs)
                 self.update()
 
@@ -284,7 +367,7 @@ def main():
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
     try:
-        trainer = Trainer()
+        trainer = Trainer(args_cli.actor_type)
         trainer.train()
     finally:
         simulation_app.close()

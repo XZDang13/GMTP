@@ -4,29 +4,63 @@ from isaaclab.app import AppLauncher
 
 import gymnasium
 import torch
-import numpy as np
 
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
 
-from model.actor import Actor
+from model.actor import AdaINActor, AdaINResActor, SplitEncoderActor, VanilaActor
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Random agent for Isaac Lab environments.")
     parser.add_argument("--checkpoint", default="final.pth")
+    parser.add_argument(
+        "--actor-type",
+        default=None,
+        help="Override actor architecture for checkpoints without actor metadata: vanila, split_encoder, adain, or adain_res.",
+    )
     AppLauncher.add_app_launcher_args(parser)
     return parser
 
 class Evaluator:
     @staticmethod
-    def _get_policy_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        return torch.cat((obs["motion"], obs["robot"]), dim=-1)
+    def _normalize_actor_type(actor_type: str | None) -> str:
+        normalized = (actor_type or "vanila").lower().replace("-", "_")
+        alias_map = {
+            "vanila": "vanila",
+            "vanilla": "vanila",
+            "split": "split_encoder",
+            "split_encoder": "split_encoder",
+            "adain": "adain",
+            "adain_res": "adain_res",
+            "adainres": "adain_res",
+        }
+        try:
+            return alias_map[normalized]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported actor type '{actor_type}'.") from exc
 
     @staticmethod
-    def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        return obs["privilege"]
+    def _build_actor(cfg, actor_type: str, action_dim: int) -> torch.nn.Module:
+        if actor_type == "vanila":
+            return VanilaActor(cfg.policy_observation_space, action_dim)
+        if actor_type == "split_encoder":
+            return SplitEncoderActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+        if actor_type == "adain":
+            return AdaINActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+        if actor_type == "adain_res":
+            return AdaINResActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+        raise ValueError(f"Unsupported actor type '{actor_type}'.")
 
-    def __init__(self, checkpoint_path: str):
+    @staticmethod
+    def _get_actor_observation(obs: dict[str, torch.Tensor], actor_type: str) -> dict[str, torch.Tensor]:
+        if actor_type == "vanila":
+            return {"obs": torch.cat((obs["motion"], obs["robot"]), dim=-1)}
+        return {
+            "motion_obs": obs["motion"],
+            "robot_obs": obs["robot"],
+        }
+
+    def __init__(self, checkpoint_path: str, actor_type: str | None = None):
         from env.cfg import G1JabEnv
 
         self.cfg = G1JabEnv()
@@ -45,12 +79,11 @@ class Evaluator:
 
         self.device = self.env.unwrapped.device
 
-        policy_obs_dim = self.cfg.policy_observation_space
         action_dim = self.cfg.action_space
         print("Load")
-        self.actor = Actor(policy_obs_dim, action_dim).to(self.device)
-
         weights = torch.load(self.checkpoint_path, map_location=self.device)
+        self.actor_type = self._normalize_actor_type(actor_type or weights.get("actor_type"))
+        self.actor = self._build_actor(self.cfg, self.actor_type, action_dim).to(self.device)
         actor_weights = weights["actor"]
 
         self.actor.load_state_dict(actor_weights)
@@ -64,7 +97,7 @@ class Evaluator:
         #WandbLogger.init_project("Mimic_Eval", f"G1_Pick")
 
     @torch.no_grad()
-    def get_action(self, obs_batch:torch.Tensor, determine:bool=False):
+    def get_action(self, obs_batch: dict[str, torch.Tensor], determine: bool = False):
         actor_step:StochasticContinuousPolicyStep = self.actor(obs_batch)
         action = actor_step.action
         if determine:
@@ -75,8 +108,8 @@ class Evaluator:
     
     def rollout(self, obs, info):
         for i in range(1000):
-            policy_obs = self._get_policy_observation(obs)
-            action = self.get_action(policy_obs, True)
+            actor_obs = self._get_actor_observation(obs, self.actor_type)
+            action = self.get_action(actor_obs, True)
             #print("Action:")
             #print(action)
             #print(action[0])
@@ -121,7 +154,7 @@ if __name__ == "__main__":
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
     try:
-        evaluator = Evaluator(args_cli.checkpoint)
+        evaluator = Evaluator(args_cli.checkpoint, args_cli.actor_type)
         evaluator.eval()
     finally:
         simulation_app.close()

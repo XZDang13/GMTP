@@ -5,7 +5,9 @@ from RLAlg.normalizer import Normalizer
 from RLAlg.nn.layers import MLPLayer, GaussianHead, NormPosition
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
 
-class Actor(nn.Module):
+from .adain import AdaINBlock, AdaINResBlock
+
+class VanilaActor(nn.Module):
     def __init__(self, obs_dim:int, action_dim:int):
         super().__init__()
 
@@ -15,13 +17,119 @@ class Actor(nn.Module):
             MLPLayer(obs_dim, 512, nn.SiLU(), NormPosition.POST),
             MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
             MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
         )
 
         self.head = GaussianHead(512, action_dim)
 
-    def forward(self, obs:torch.Tensor, action:torch.Tensor|None=None, update_normlizer:bool=False) -> StochasticContinuousPolicyStep:
+    def forward(self, obs_dict:dict[str, torch.Tensor], action:torch.Tensor|None=None, update_normlizer:bool=False) -> StochasticContinuousPolicyStep:
+        obs = obs_dict["obs"]
         obs = self.normlizer(obs, update=update_normlizer)
         x = self.encoder(obs)
+        step = self.head(x, action)
+
+        return step
+    
+class SplitEncoderActor(nn.Module):
+    def __init__(self, robot_obs_dim:int, motion_obs_dim:int, action_dim:int):
+        super().__init__()
+
+        self.robot_obs_normlizer = Normalizer((robot_obs_dim,))
+        self.motion_obs_normlizer = Normalizer((motion_obs_dim,))
+
+        self.robot_encoder = MLPLayer(robot_obs_dim, 256, nn.Identity())
+        self.motion_encoder = MLPLayer(motion_obs_dim, 256, nn.Identity())
+        
+
+        self.encoder = nn.Sequential(
+            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
+        )
+
+        self.head = GaussianHead(512, action_dim)
+
+    def forward(self, obs_dict:dict[str, torch.Tensor], action:torch.Tensor|None=None, update_normlizer:bool=False) -> StochasticContinuousPolicyStep:
+        robot_obs = obs_dict["robot_obs"]
+        motion_obs = obs_dict["motion_obs"]
+
+        robot_obs = self.robot_obs_normlizer(robot_obs, update_normlizer)
+        motion_obs = self.motion_obs_normlizer(motion_obs, update_normlizer)
+
+        x_robot = self.robot_encoder(robot_obs)
+        x_motion = self.motion_encoder(motion_obs)
+
+        x = torch.cat([x_robot, x_motion], dim=-1)
+
+        x = self.encoder(x)
+        step = self.head(x, action)
+
+        return step
+
+class AdaINActor(nn.Module):
+    def __init__(self, robot_obs_dim:int, motion_obs_dim:int, action_dim:int):
+        super().__init__()
+
+        self.robot_obs_normlizer = Normalizer((robot_obs_dim,))
+        self.motion_obs_normlizer = Normalizer((motion_obs_dim,))
+
+        self.robot_encoder = nn.Linear(robot_obs_dim, 512, bias=False)
+        self.motion_encoder = nn.Linear(motion_obs_dim, 512, bias=False)
+        
+        self.block_1 = AdaINBlock(512, 512)
+        self.block_2 = AdaINBlock(512, 512)
+        self.block_3 = AdaINBlock(512, 512)
+
+        self.head = GaussianHead(512, action_dim)
+
+    def forward(self, obs_dict:dict[str, torch.Tensor], action:torch.Tensor|None=None, update_normlizer:bool=False) -> StochasticContinuousPolicyStep:
+        robot_obs = obs_dict["robot_obs"]
+        motion_obs = obs_dict["motion_obs"]
+
+        robot_obs = self.robot_obs_normlizer(robot_obs, update_normlizer)
+        motion_obs = self.motion_obs_normlizer(motion_obs, update_normlizer)
+
+        x_robot = self.robot_encoder(robot_obs)
+        x_motion = self.motion_encoder(motion_obs)
+
+        x = self.block_1(x_robot, x_motion)
+        x = self.block_2(x, x_motion)
+        x = self.block_3(x, x_motion)
+        
+        step = self.head(x, action)
+
+        return step
+
+class AdaINResActor(nn.Module):
+    def __init__(self, robot_obs_dim:int, motion_obs_dim:int, action_dim:int):
+        super().__init__()
+
+        self.robot_obs_normlizer = Normalizer((robot_obs_dim,))
+        self.motion_obs_normlizer = Normalizer((motion_obs_dim,))
+
+        self.robot_encoder = MLPLayer(robot_obs_dim, 512, nn.Identity(), NormPosition.PRE)
+        self.motion_encoder = MLPLayer(motion_obs_dim, 512, nn.Identity(), NormPosition.PRE)
+        
+        self.block_1 = AdaINResBlock(512, 512)
+        self.block_2 = AdaINResBlock(512, 512)
+        self.block_3 = AdaINResBlock(512, 512)
+
+        self.head = GaussianHead(512, action_dim)
+
+    def forward(self, obs_dict:dict[str, torch.Tensor], action:torch.Tensor|None=None, update_normlizer:bool=False) -> StochasticContinuousPolicyStep:
+        robot_obs = obs_dict["robot_obs"]
+        motion_obs = obs_dict["motion_obs"]
+
+        #robot_obs = self.robot_obs_normlizer(robot_obs, update_normlizer)
+        #motion_obs = self.motion_obs_normlizer(motion_obs, update_normlizer)
+
+        x_robot = self.robot_encoder(robot_obs)
+        x_motion = self.motion_encoder(motion_obs)
+
+        x = self.block_1(x_robot, x_motion)
+        x = self.block_2(x, x_motion)
+        x = self.block_3(x, x_motion)
+        
         step = self.head(x, action)
 
         return step
