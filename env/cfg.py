@@ -1,16 +1,17 @@
-import torch
-import numpy as np
 from isaaclab.utils import configclass
-from Ref2Act.config.env_cfg import G1MotionTrackingEnvCfg, EventCfg, ActionMod
-from Ref2Act.sampler import SamplerMod
+from Ref2Act.config.env_cfg import ActionMod, G1MotionTrackingEnvCfg, G1TrainingEventCfg
+from Ref2Act.sampler import SamplingStrategy
 
 @configclass
 class G1JabEnv(G1MotionTrackingEnvCfg):
-    expert_motion_file = "env/assests/jab.npz"
-    sampler_mod = SamplerMod.Clamp
+    expert_motion_file = "env/assests/pick_up.npz"
     episode_length_s = 20
     action_mod = ActionMod.Offset
+    random_start = False
+    events = None
 
 @configclass
 class G1JabTrainingEnv(G1JabEnv):
-    events = EventCfg()
+    sampling_strategy = SamplingStrategy.FailureWeighted
+    random_start = False
+    events = G1TrainingEventCfg()

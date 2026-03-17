@@ -65,10 +65,10 @@ class AdaINResBlock(nn.Module):
 
     def forward(self, x, cond):
 
+        identity = x
+
         h = self.fc1(x)
         h = self.act(h)
-
-        identity = h
 
         h = self.fc2(h)
         h = self.norm(h)

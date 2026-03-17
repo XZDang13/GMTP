@@ -1,4 +1,5 @@
 import argparse
+import re
 
 from isaaclab.app import AppLauncher
 
@@ -40,15 +41,57 @@ class Evaluator:
             raise ValueError(f"Unsupported actor type '{actor_type}'.") from exc
 
     @staticmethod
-    def _build_actor(cfg, actor_type: str, action_dim: int) -> torch.nn.Module:
+    def _normalize_adain_res_blocks(num_blocks: int) -> int:
+        if num_blocks < 1:
+            raise ValueError(f"adain_res_blocks must be positive, got {num_blocks}.")
+        return num_blocks
+
+    @staticmethod
+    def _infer_adain_res_blocks(actor_weights: dict[str, torch.Tensor]) -> int:
+        block_pattern = re.compile(r"^block_(\d+)\.")
+        block_ids = [
+            int(match.group(1))
+            for key in actor_weights
+            if (match := block_pattern.match(key)) is not None
+        ]
+        return max(block_ids, default=5)
+
+    @staticmethod
+    def _infer_observation_dims(obs: dict[str, torch.Tensor]) -> dict[str, int]:
+        required_keys = ("motion", "robot", "privilege")
+        missing_keys = [key for key in required_keys if key not in obs]
+        if missing_keys:
+            raise KeyError(f"Environment observation is missing required keys: {missing_keys}.")
+
+        motion_dim = obs["motion"].shape[-1]
+        robot_dim = obs["robot"].shape[-1]
+
+        return {
+            "motion": motion_dim,
+            "robot": robot_dim,
+            "policy": motion_dim + robot_dim,
+        }
+
+    @staticmethod
+    def _build_actor(
+        obs_dims: dict[str, int],
+        actor_type: str,
+        action_dim: int,
+        adain_res_blocks: int,
+    ) -> torch.nn.Module:
         if actor_type == "vanila":
-            return VanilaActor(cfg.policy_observation_space, action_dim)
+            return VanilaActor(obs_dims["policy"], action_dim)
         if actor_type == "split_encoder":
-            return SplitEncoderActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+            return SplitEncoderActor(obs_dims["robot"], obs_dims["motion"], action_dim)
         if actor_type == "adain":
-            return AdaINActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+            return AdaINActor(obs_dims["robot"], obs_dims["motion"], action_dim)
         if actor_type == "adain_res":
-            return AdaINResActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+            return AdaINResActor(
+                obs_dims["robot"],
+                obs_dims["motion"],
+                action_dim,
+                num_blocks=adain_res_blocks,
+            )
         raise ValueError(f"Unsupported actor type '{actor_type}'.")
 
     @staticmethod
@@ -60,7 +103,12 @@ class Evaluator:
             "robot_obs": obs["robot"],
         }
 
-    def __init__(self, checkpoint_path: str, actor_type: str | None = None):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        actor_type: str | None = None,
+        adain_res_blocks: int | None = None,
+    ):
         from env.cfg import G1JabEnv
 
         self.cfg = G1JabEnv()
@@ -74,17 +122,36 @@ class Evaluator:
         self.cfg.add_obs_noise = False
         self.cfg.add_reset_noise = False
         self.cfg.random_start = False
+        self.cfg.events = None
 
         self.env = gymnasium.make(self.env_name, cfg=self.cfg)
 
         self.device = self.env.unwrapped.device
+        self.initial_obs, _ = self.env.reset()
+        self.obs_dims = self._infer_observation_dims(self.initial_obs)
 
         action_dim = self.cfg.action_space
         print("Load")
         weights = torch.load(self.checkpoint_path, map_location=self.device)
         self.actor_type = self._normalize_actor_type(actor_type or weights.get("actor_type"))
-        self.actor = self._build_actor(self.cfg, self.actor_type, action_dim).to(self.device)
         actor_weights = weights["actor"]
+        actor_kwargs = dict(weights.get("actor_kwargs", {}))
+
+        actor_block_count = 5
+        if self.actor_type == "adain_res":
+            if adain_res_blocks is not None:
+                actor_block_count = self._normalize_adain_res_blocks(adain_res_blocks)
+            else:
+                actor_block_count = self._normalize_adain_res_blocks(
+                    actor_kwargs.get("num_blocks", self._infer_adain_res_blocks(actor_weights))
+                )
+
+        self.actor = self._build_actor(
+            self.obs_dims,
+            self.actor_type,
+            action_dim,
+            actor_block_count,
+        ).to(self.device)
 
         self.actor.load_state_dict(actor_weights)
         self.actor.eval()
@@ -144,7 +211,8 @@ class Evaluator:
         return obs, info
 
     def eval(self):
-        obs, info = self.env.reset()
+        obs = self.initial_obs
+        info = {}
         obs, info = self.rollout(obs, info)
 
         self.env.close()
@@ -154,7 +222,7 @@ if __name__ == "__main__":
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
     try:
-        evaluator = Evaluator(args_cli.checkpoint, args_cli.actor_type)
+        evaluator = Evaluator(args_cli.checkpoint, args_cli.actor_type, 10)
         evaluator.eval()
     finally:
         simulation_app.close()

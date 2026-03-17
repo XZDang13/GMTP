@@ -73,8 +73,8 @@ class AdaINActor(nn.Module):
         self.robot_obs_normlizer = Normalizer((robot_obs_dim,))
         self.motion_obs_normlizer = Normalizer((motion_obs_dim,))
 
-        self.robot_encoder = nn.Linear(robot_obs_dim, 512, bias=False)
-        self.motion_encoder = nn.Linear(motion_obs_dim, 512, bias=False)
+        self.robot_encoder = MLPLayer(robot_obs_dim, 512, nn.Identity())
+        self.motion_encoder = MLPLayer(motion_obs_dim, 512, nn.Identity())
         
         self.block_1 = AdaINBlock(512, 512)
         self.block_2 = AdaINBlock(512, 512)
@@ -101,20 +101,44 @@ class AdaINActor(nn.Module):
         return step
 
 class AdaINResActor(nn.Module):
-    def __init__(self, robot_obs_dim:int, motion_obs_dim:int, action_dim:int):
+    def __init__(
+        self,
+        robot_obs_dim: int,
+        motion_obs_dim: int,
+        action_dim: int,
+        num_blocks: int = 5,
+    ):
         super().__init__()
+
+        if num_blocks < 1:
+            raise ValueError(f"num_blocks must be positive, got {num_blocks}.")
 
         self.robot_obs_normlizer = Normalizer((robot_obs_dim,))
         self.motion_obs_normlizer = Normalizer((motion_obs_dim,))
+        self.num_blocks = num_blocks
 
-        self.robot_encoder = MLPLayer(robot_obs_dim, 512, nn.Identity(), NormPosition.PRE)
-        self.motion_encoder = MLPLayer(motion_obs_dim, 512, nn.Identity(), NormPosition.PRE)
-        
-        self.block_1 = AdaINResBlock(512, 512)
-        self.block_2 = AdaINResBlock(512, 512)
-        self.block_3 = AdaINResBlock(512, 512)
+        self.robot_encoder = nn.Sequential(
+            MLPLayer(robot_obs_dim, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.Identity()),
+        )
+
+
+
+        self.motion_encoder = nn.Sequential(
+            MLPLayer(motion_obs_dim, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.Identity()),
+        )
+
+        for block_idx in range(self.num_blocks):
+            setattr(self, f"block_{block_idx + 1}", AdaINResBlock(512, 512))
 
         self.head = GaussianHead(512, action_dim)
+
+    def _iter_blocks(self):
+        for block_idx in range(self.num_blocks):
+            yield getattr(self, f"block_{block_idx + 1}")
 
     def forward(self, obs_dict:dict[str, torch.Tensor], action:torch.Tensor|None=None, update_normlizer:bool=False) -> StochasticContinuousPolicyStep:
         robot_obs = obs_dict["robot_obs"]
@@ -126,9 +150,9 @@ class AdaINResActor(nn.Module):
         x_robot = self.robot_encoder(robot_obs)
         x_motion = self.motion_encoder(motion_obs)
 
-        x = self.block_1(x_robot, x_motion)
-        x = self.block_2(x, x_motion)
-        x = self.block_3(x, x_motion)
+        x = x_robot
+        for block in self._iter_blocks():
+            x = block(x, x_motion)
         
         step = self.head(x, action)
 

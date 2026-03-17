@@ -46,15 +46,49 @@ class Trainer:
             raise ValueError(f"Unsupported actor type '{actor_type}'.") from exc
 
     @staticmethod
-    def _build_actor(cfg, actor_type: str, action_dim: int) -> torch.nn.Module:
+    def _normalize_adain_res_blocks(num_blocks: int) -> int:
+        if num_blocks < 1:
+            raise ValueError(f"adain_res_blocks must be positive, got {num_blocks}.")
+        return num_blocks
+
+    @staticmethod
+    def _infer_observation_dims(obs: dict[str, torch.Tensor]) -> dict[str, int]:
+        required_keys = ("motion", "robot", "privilege")
+        missing_keys = [key for key in required_keys if key not in obs]
+        if missing_keys:
+            raise KeyError(f"Environment observation is missing required keys: {missing_keys}.")
+
+        motion_dim = obs["motion"].shape[-1]
+        robot_dim = obs["robot"].shape[-1]
+        critic_dim = obs["privilege"].shape[-1]
+
+        return {
+            "motion": motion_dim,
+            "robot": robot_dim,
+            "critic": critic_dim,
+            "policy": motion_dim + robot_dim,
+        }
+
+    @staticmethod
+    def _build_actor(
+        obs_dims: dict[str, int],
+        actor_type: str,
+        action_dim: int,
+        adain_res_blocks: int,
+    ) -> torch.nn.Module:
         if actor_type == "vanila":
-            return VanilaActor(cfg.policy_observation_space, action_dim)
+            return VanilaActor(obs_dims["policy"], action_dim)
         if actor_type == "split_encoder":
-            return SplitEncoderActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+            return SplitEncoderActor(obs_dims["robot"], obs_dims["motion"], action_dim)
         if actor_type == "adain":
-            return AdaINActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+            return AdaINActor(obs_dims["robot"], obs_dims["motion"], action_dim)
         if actor_type == "adain_res":
-            return AdaINResActor(cfg.robot_observation_space, cfg.motion_observation_space, action_dim)
+            return AdaINResActor(
+                obs_dims["robot"],
+                obs_dims["motion"],
+                action_dim,
+                num_blocks=adain_res_blocks,
+            )
         raise ValueError(f"Unsupported actor type '{actor_type}'.")
 
     @staticmethod
@@ -67,12 +101,12 @@ class Trainer:
         }
 
     @staticmethod
-    def _get_policy_storage_specs(cfg, actor_type: str) -> dict[str, tuple[int, ...]]:
+    def _get_policy_storage_specs(obs_dims: dict[str, int], actor_type: str) -> dict[str, tuple[int, ...]]:
         if actor_type == "vanila":
-            return {"policy_observations": (cfg.policy_observation_space,)}
+            return {"policy_observations": (obs_dims["policy"],)}
         return {
-            "motion_observations": (cfg.motion_observation_space,),
-            "robot_observations": (cfg.robot_observation_space,),
+            "motion_observations": (obs_dims["motion"],),
+            "robot_observations": (obs_dims["robot"],),
         }
 
     @staticmethod
@@ -101,7 +135,7 @@ class Trainer:
     def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
         return obs["privilege"]
 
-    def __init__(self, actor_type: str):
+    def __init__(self, actor_type: str, adain_res_blocks: int):
         from env.cfg import G1JabTrainingEnv
 
         self.cfg = G1JabTrainingEnv()
@@ -114,14 +148,22 @@ class Trainer:
 
         self.device = self.env.unwrapped.device
         self.actor_type = self._normalize_actor_type(actor_type)
+        self.adain_res_blocks = self._normalize_adain_res_blocks(adain_res_blocks)
         self.motion_name = Path(self.cfg.expert_motion_file).stem if self.cfg.expert_motion_file else "motion_tracking"
-        
-        critic_obs_dim = self.cfg.critic_observation_space
+
+        self.initial_obs, _ = self.env.reset()
+        self.obs_dims = self._infer_observation_dims(self.initial_obs)
+
+        critic_obs_dim = self.obs_dims["critic"]
         action_dim = self.cfg.action_space
 
-        self.actor = self._build_actor(self.cfg, self.actor_type, action_dim).to(self.device)
+        self.actor = self._build_actor(
+            self.obs_dims,
+            self.actor_type,
+            action_dim,
+            self.adain_res_blocks,
+        ).to(self.device)
         self.critic = Critic(critic_obs_dim).to(self.device)
-
         self.ac_optimizer = torch.optim.Adam(
             [
                 {'params': self.actor.parameters(),
@@ -133,7 +175,6 @@ class Trainer:
         )
 
         self.lr_scheduler = KLAdaptiveLR(self.ac_optimizer, 0.01)
-
         self.steps = 20
 
         self.rollout_buffer = ReplayBuffer(
@@ -141,7 +182,7 @@ class Trainer:
             self.steps
         )
 
-        self.policy_storage_specs = self._get_policy_storage_specs(self.cfg, self.actor_type)
+        self.policy_storage_specs = self._get_policy_storage_specs(self.obs_dims, self.actor_type)
         self.policy_batch_keys = list(self.policy_storage_specs)
         self.batch_keys = [
             *self.policy_batch_keys,
@@ -162,7 +203,6 @@ class Trainer:
         self.rollout_buffer.create_storage_space("rewards", (), torch.float32)
         self.rollout_buffer.create_storage_space("values", (), torch.float32)
         self.rollout_buffer.create_storage_space("terminate", (), torch.float32)
-
         self.global_step = 0
         self.tracker = MetricsTracker()
 
@@ -333,6 +373,7 @@ class Trainer:
         torch.save(
             {
                 "actor_type": self.actor_type,
+                "actor_kwargs": {"num_blocks": self.adain_res_blocks} if self.actor_type == "adain_res" else {},
                 "actor": self.actor.state_dict(), 
                 "critic": self.critic.state_dict(),
                 "joint_names": joint_params["joint_names"],
@@ -347,9 +388,9 @@ class Trainer:
         )
 
     def train(self):
-        obs, _ = self.env.reset()
+        obs = self.initial_obs
         try:
-            for epoch in trange(1000):
+            for epoch in trange(2000):
                 obs = self.rollout(obs)
                 self.update()
 
@@ -367,7 +408,7 @@ def main():
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
     try:
-        trainer = Trainer(args_cli.actor_type)
+        trainer = Trainer(args_cli.actor_type, 3)
         trainer.train()
     finally:
         simulation_app.close()
