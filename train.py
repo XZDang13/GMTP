@@ -1,5 +1,4 @@
 import argparse
-from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -15,6 +14,7 @@ from RLAlg.logger import WandbLogger, MetricsTracker
 
 from model.actor import AdaINActor, AdaINResActor, SplitEncoderActor, VanilaActor
 from model.critic import Critic
+from env.motions import motion_label, motion_names, resolve_motion_files
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -136,9 +136,10 @@ class Trainer:
         return obs["privilege"]
 
     def __init__(self, actor_type: str, adain_res_blocks: int):
-        from env.cfg import G1JabTrainingEnv
+        from env.cfg import G1MultiMotionTrainingEnv
 
-        self.cfg = G1JabTrainingEnv()
+        self.cfg = G1MultiMotionTrainingEnv()
+        self.cfg.expert_motion_file = resolve_motion_files(self.cfg.expert_motion_file)
         self.env_name = "G1MotionTracking-v0"
         #self.cfg.random_start = False
 
@@ -149,7 +150,8 @@ class Trainer:
         self.device = self.env.unwrapped.device
         self.actor_type = self._normalize_actor_type(actor_type)
         self.adain_res_blocks = self._normalize_adain_res_blocks(adain_res_blocks)
-        self.motion_name = Path(self.cfg.expert_motion_file).stem if self.cfg.expert_motion_file else "motion_tracking"
+        self.motion_files = list(self.cfg.expert_motion_file)
+        self.motion_name = motion_label(self.motion_files)
 
         self.initial_obs, _ = self.env.reset()
         self.obs_dims = self._infer_observation_dims(self.initial_obs)
@@ -213,8 +215,7 @@ class Trainer:
         self.tracker.add_list_metrics("kl_divergence")
         self.tracker.add_list_metrics("value_loss")
 
-
-        WandbLogger.init_project("Mimic", f"G1_Pick")
+        WandbLogger.init_project("Mimic", f"G1_{self.motion_name}")
         
     @torch.no_grad()
     def get_action(
@@ -374,6 +375,9 @@ class Trainer:
             {
                 "actor_type": self.actor_type,
                 "actor_kwargs": {"num_blocks": self.adain_res_blocks} if self.actor_type == "adain_res" else {},
+                "motion_files": self.motion_files,
+                "motion_names": motion_names(self.motion_files),
+                "motion_label": self.motion_name,
                 "actor": self.actor.state_dict(), 
                 "critic": self.critic.state_dict(),
                 "joint_names": joint_params["joint_names"],
@@ -390,7 +394,7 @@ class Trainer:
     def train(self):
         obs = self.initial_obs
         try:
-            for epoch in trange(2000):
+            for epoch in trange(3000):
                 obs = self.rollout(obs)
                 self.update()
 

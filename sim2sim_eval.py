@@ -8,11 +8,12 @@ import torch
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
 from Ref2Act.sim2sim import MujocoEnv
 
+from env.motions import DEFAULT_EXPERIMENT_MOTION_FILES, motion_label, resolve_motion_files
 from model.actor import AdaINActor, AdaINResActor, SplitEncoderActor, VanilaActor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_MOTION_FILE = PROJECT_ROOT / "env" / "assests" / "pick_up.npz"
+DEFAULT_MOTION_FILES = resolve_motion_files(DEFAULT_EXPERIMENT_MOTION_FILES)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -25,8 +26,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--motion-file",
+        nargs="+",
         default=None,
-        help="Reference motion .npz used by sim2sim. Defaults to inferring from checkpoint name.",
+        help="Reference motion .npz file(s) used by sim2sim. Defaults to checkpoint metadata or the walk/runing/jump experiment set.",
     )
     parser.add_argument("--num-steps", type=int, default=1000)
     parser.add_argument("--simulation-dt", type=float, default=1 / 200)
@@ -81,9 +83,26 @@ class Sim2SimEvaluator:
         return path
 
     @classmethod
-    def _infer_motion_file(cls, checkpoint_path: Path, actor_type: str, motion_file: str | None) -> Path:
-        if motion_file is not None:
-            return cls._resolve_existing_path(motion_file)
+    def _infer_motion_files(
+        cls,
+        checkpoint_path: Path,
+        actor_type: str,
+        checkpoint_weights: dict,
+        motion_files: list[str] | None,
+    ) -> list[str]:
+        if motion_files is not None:
+            return resolve_motion_files(motion_files)
+
+        checkpoint_motion_files = checkpoint_weights.get("motion_files")
+        if checkpoint_motion_files:
+            try:
+                return resolve_motion_files(checkpoint_motion_files)
+            except FileNotFoundError:
+                pass
+
+        checkpoint_motion_names = checkpoint_weights.get("motion_names")
+        if checkpoint_motion_names:
+            return resolve_motion_files(checkpoint_motion_names)
 
         marker = f"_{actor_type}_"
         checkpoint_stem = checkpoint_path.stem
@@ -91,14 +110,9 @@ class Sim2SimEvaluator:
             motion_name = checkpoint_stem.rsplit(marker, 1)[0]
             candidate = PROJECT_ROOT / "env" / "assests" / f"{motion_name}.npz"
             if candidate.exists():
-                return candidate
+                return [str(candidate.resolve())]
 
-        if not DEFAULT_MOTION_FILE.exists():
-            raise FileNotFoundError(
-                "Failed to infer the reference motion file from the checkpoint name, and "
-                f"the fallback file is missing: {DEFAULT_MOTION_FILE}"
-            )
-        return DEFAULT_MOTION_FILE
+        return list(DEFAULT_MOTION_FILES)
 
     @staticmethod
     def _infer_observation_dims(actor_weights: dict[str, torch.Tensor], actor_type: str) -> dict[str, int]:
@@ -193,7 +207,7 @@ class Sim2SimEvaluator:
         self,
         checkpoint_path: str,
         actor_type: str | None = None,
-        motion_file: str | None = None,
+        motion_files: list[str] | None = None,
         num_steps: int = 1000,
         simulation_dt: float = 1 / 200,
         decimation: int = 4,
@@ -236,20 +250,36 @@ class Sim2SimEvaluator:
         self.actor.load_state_dict(actor_weights)
         self.actor.eval()
 
-        self.motion_file = self._infer_motion_file(self.checkpoint_path, self.actor_type, motion_file)
+        self.motion_files = self._infer_motion_files(
+            self.checkpoint_path,
+            self.actor_type,
+            weights,
+            motion_files,
+        )
+        self.motion_name = motion_label(self.motion_files)
+        self.simulation_dt = simulation_dt
+        self.decimation = decimation
+        self.root_name = root_name
+        self.kp = weights["joint_stiffness"].detach().cpu()
+        self.kd = weights["joint_damping"].detach().cpu()
+        self.effort_limits = weights["joint_effort_limits"].detach().cpu()
+        self.joint_pos_limits = weights["joint_pos_limits"].detach().cpu()
+        self.action_offset = weights["action_offset"].detach().cpu()
+        self.action_scale = weights["action_scale"].detach().cpu()
 
-        self.env = MujocoEnv(
-            simulation_dt=simulation_dt,
-            decimation=decimation,
-            kp=weights["joint_stiffness"].detach().cpu(),
-            kd=weights["joint_damping"].detach().cpu(),
-            effort_limits=weights["joint_effort_limits"].detach().cpu(),
-            joint_pos_limits=weights["joint_pos_limits"].detach().cpu(),
-            action_offset=weights["action_offset"].detach().cpu(),
-            action_scale=weights["action_scale"].detach().cpu(),
-            expert_motion_file=str(self.motion_file),
-            root_name=root_name,
-            render=render,
+    def _build_env(self, motion_file: str) -> MujocoEnv:
+        return MujocoEnv(
+            simulation_dt=self.simulation_dt,
+            decimation=self.decimation,
+            kp=self.kp,
+            kd=self.kd,
+            effort_limits=self.effort_limits,
+            joint_pos_limits=self.joint_pos_limits,
+            action_offset=self.action_offset,
+            action_scale=self.action_scale,
+            expert_motion_file=motion_file,
+            root_name=self.root_name,
+            render=self.render,
         )
 
     def _get_actor_observation(self, flat_obs: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -276,8 +306,9 @@ class Sim2SimEvaluator:
             return actor_step.mean
         return actor_step.action
 
-    def eval(self) -> None:
-        obs = self.env.reset()
+    def _eval_motion_file(self, motion_file: str) -> tuple[int, dict[str, float]]:
+        env = self._build_env(motion_file)
+        obs = env.reset()
         metrics = defaultdict(float)
         steps_run = 0
 
@@ -285,28 +316,50 @@ class Sim2SimEvaluator:
             for _ in range(self.num_steps):
                 actor_obs = self._get_actor_observation(obs)
                 action = self.get_action(actor_obs, determine=True).squeeze(0).detach().cpu()
-                obs = self.env.step(action)
+                obs = env.step(action)
 
                 for key, value in self._extract_metrics(obs, self.action_dim).items():
                     metrics[key] += value
 
                 steps_run += 1
 
-                if self.render and self.env.mj_viewer is None:
+                if self.render and env.mj_viewer is None:
                     break
         finally:
-            self.env.close()
-
-        print(f"checkpoint: {self.checkpoint_path}")
-        print(f"motion_file: {self.motion_file}")
-        print(f"actor_type: {self.actor_type}")
-        print(f"steps: {steps_run}")
+            env.close()
 
         if steps_run == 0:
+            return 0, {}
+
+        return steps_run, {key: value / steps_run for key, value in metrics.items()}
+
+    def eval(self) -> None:
+        aggregate_metrics = defaultdict(float)
+        aggregate_steps = 0
+
+        print(f"checkpoint: {self.checkpoint_path}")
+        print(f"motion_label: {self.motion_name}")
+        print(f"actor_type: {self.actor_type}")
+
+        for motion_file in self.motion_files:
+            steps_run, metrics = self._eval_motion_file(motion_file)
+
+            print(f"motion_file: {motion_file}")
+            print(f"steps: {steps_run}")
+
+            for key, value in metrics.items():
+                print(f"{key}: {value:.6f}")
+                aggregate_metrics[key] += value * steps_run
+
+            aggregate_steps += steps_run
+
+        if aggregate_steps == 0:
             return
 
-        for key, value in metrics.items():
-            print(f"{key}: {value / steps_run:.6f}")
+        if len(self.motion_files) > 1:
+            print(f"aggregate_steps: {aggregate_steps}")
+            for key, total_value in aggregate_metrics.items():
+                print(f"aggregate_{key}: {total_value / aggregate_steps:.6f}")
 
 
 def main():
@@ -314,7 +367,7 @@ def main():
     evaluator = Sim2SimEvaluator(
         checkpoint_path=args.checkpoint,
         actor_type=args.actor_type,
-        motion_file=args.motion_file,
+        motion_files=args.motion_file,
         num_steps=args.num_steps,
         simulation_dt=args.simulation_dt,
         decimation=args.decimation,

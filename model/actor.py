@@ -123,8 +123,6 @@ class AdaINResActor(nn.Module):
             MLPLayer(512, 512, nn.Identity()),
         )
 
-
-
         self.motion_encoder = nn.Sequential(
             MLPLayer(motion_obs_dim, 512, nn.SiLU(), NormPosition.POST),
             MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
@@ -144,8 +142,8 @@ class AdaINResActor(nn.Module):
         robot_obs = obs_dict["robot_obs"]
         motion_obs = obs_dict["motion_obs"]
 
-        #robot_obs = self.robot_obs_normlizer(robot_obs, update_normlizer)
-        #motion_obs = self.motion_obs_normlizer(motion_obs, update_normlizer)
+        robot_obs = self.robot_obs_normlizer(robot_obs, update_normlizer)
+        motion_obs = self.motion_obs_normlizer(motion_obs, update_normlizer)
 
         x_robot = self.robot_encoder(robot_obs)
         x_motion = self.motion_encoder(motion_obs)
