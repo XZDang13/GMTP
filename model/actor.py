@@ -118,21 +118,21 @@ class AdaINResActor(nn.Module):
         self.num_blocks = num_blocks
 
         self.robot_encoder = nn.Sequential(
-            MLPLayer(robot_obs_dim, 512, nn.SiLU(), NormPosition.POST),
-            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
-            MLPLayer(512, 512, nn.Identity()),
+            MLPLayer(robot_obs_dim, 256, nn.SiLU(), NormPosition.POST),
+            MLPLayer(256, 256, nn.SiLU(), NormPosition.POST),
+            MLPLayer(256, 256, nn.Identity()),
         )
 
         self.motion_encoder = nn.Sequential(
-            MLPLayer(motion_obs_dim, 512, nn.SiLU(), NormPosition.POST),
-            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
-            MLPLayer(512, 512, nn.Identity()),
+            MLPLayer(motion_obs_dim, 256, nn.SiLU(), NormPosition.POST),
+            MLPLayer(256, 256, nn.SiLU(), NormPosition.POST),
+            MLPLayer(256, 256, nn.Identity()),
         )
 
         for block_idx in range(self.num_blocks):
-            setattr(self, f"block_{block_idx + 1}", AdaINResBlock(512, 512))
+            setattr(self, f"block_{block_idx + 1}", AdaINResBlock(256, 256))
 
-        self.head = GaussianHead(512, action_dim)
+        self.head = GaussianHead(256, action_dim)
 
     def _iter_blocks(self):
         for block_idx in range(self.num_blocks):
