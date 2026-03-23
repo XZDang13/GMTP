@@ -6,7 +6,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MOTION_ASSET_DIR = PROJECT_ROOT / "env" / "assests"
 
 DEFAULT_EXPERIMENT_MOTION_FILES = (
-    "env/assests/runing.npz",
+    "env/assests/auto_2.npz",
     #"env/assests/runing.npz",
     #"env/assests/handshake.npz",
 )
