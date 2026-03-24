@@ -27,6 +27,68 @@ def build_arg_parser() -> argparse.ArgumentParser:
     AppLauncher.add_app_launcher_args(parser)
     return parser
 
+
+class OptimizerCollection(torch.optim.Optimizer):
+    """Expose multiple optimizers as a single Optimizer for schedulers."""
+
+    def __init__(self, *optimizers: torch.optim.Optimizer):
+        self.optimizers = [optimizer for optimizer in optimizers if optimizer is not None]
+        if not self.optimizers:
+            raise ValueError("OptimizerCollection requires at least one optimizer.")
+
+        params = []
+        seen_params = set()
+        for optimizer in self.optimizers:
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    param_id = id(param)
+                    if param_id in seen_params:
+                        raise ValueError("OptimizerCollection does not support duplicated parameters.")
+                    seen_params.add(param_id)
+                    params.append(param)
+
+        super().__init__(params, defaults={})
+        self.param_groups = [
+            group
+            for optimizer in self.optimizers
+            for group in optimizer.param_groups
+        ]
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for optimizer in self.optimizers:
+            optimizer.step()
+
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {"optimizers": [optimizer.state_dict() for optimizer in self.optimizers]}
+
+    def load_state_dict(self, state_dict):
+        optimizer_states = state_dict["optimizers"]
+        if len(optimizer_states) != len(self.optimizers):
+            raise ValueError(
+                f"Expected {len(self.optimizers)} optimizer states, got {len(optimizer_states)}."
+            )
+
+        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
+            optimizer.load_state_dict(optimizer_state)
+
+        self.param_groups = [
+            group
+            for optimizer in self.optimizers
+            for group in optimizer.param_groups
+        ]
+
 class Trainer:
     @staticmethod
     def _normalize_actor_type(actor_type: str) -> str:
@@ -135,6 +197,43 @@ class Trainer:
     def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
         return obs["privilege"]
 
+    @staticmethod
+    def _split_optimizer_param_groups(
+        modules: dict[str, torch.nn.Module],
+    ) -> tuple[list[dict], list[dict], dict[str, int]]:
+        muon_groups = []
+        adamw_groups = []
+        stats = {
+            "muon_tensors": 0,
+            "muon_numel": 0,
+            "adamw_tensors": 0,
+            "adamw_numel": 0,
+        }
+
+        for module_name, module in modules.items():
+            muon_params = []
+            adamw_params = []
+
+            for _, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
+
+                if param.ndim == 2:
+                    muon_params.append(param)
+                    stats["muon_tensors"] += 1
+                    stats["muon_numel"] += param.numel()
+                else:
+                    adamw_params.append(param)
+                    stats["adamw_tensors"] += 1
+                    stats["adamw_numel"] += param.numel()
+
+            if muon_params:
+                muon_groups.append({"params": muon_params, "name": module_name})
+            if adamw_params:
+                adamw_groups.append({"params": adamw_params, "name": f"{module_name}_adamw"})
+
+        return muon_groups, adamw_groups, stats
+
     def __init__(self, actor_type: str, adain_res_blocks: int):
         from env.cfg import G1MultiMotionTrainingEnv
 
@@ -166,14 +265,25 @@ class Trainer:
             self.adain_res_blocks,
         ).to(self.device)
         self.critic = Critic(critic_obs_dim).to(self.device)
-        self.ac_optimizer = torch.optim.Adam(
-            [
-                {'params': self.actor.parameters(),
-                 "name": "actor"},
-                 {'params': self.critic.parameters(),
-                 "name": "critic"},
-            ],
-            lr=1e-3
+        muon_groups, adamw_groups, optimizer_stats = self._split_optimizer_param_groups(
+            {
+                "actor": self.actor,
+                "critic": self.critic,
+            }
+        )
+
+        optimizers = []
+        if muon_groups:
+            # Muon only supports 2D tensors such as linear weights.
+            optimizers.append(torch.optim.Muon(muon_groups, lr=1e-3, weight_decay=0.0))
+        if adamw_groups:
+            optimizers.append(torch.optim.AdamW(adamw_groups, lr=1e-3, weight_decay=0.0))
+        self.ac_optimizer = OptimizerCollection(*optimizers)
+
+        print(
+            "optimizer split:",
+            f"Muon={optimizer_stats['muon_tensors']} tensors / {optimizer_stats['muon_numel']} params,",
+            f"AdamW={optimizer_stats['adamw_tensors']} tensors / {optimizer_stats['adamw_numel']} params",
         )
 
         self.lr_scheduler = KLAdaptiveLR(self.ac_optimizer, 0.01)
