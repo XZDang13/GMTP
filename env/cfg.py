@@ -14,7 +14,7 @@ class G1MultiMotionEnv(G1MotionTrackingEnvCfg):
 @configclass
 class G1MultiMotionTrainingEnv(G1MultiMotionEnv):
     sampling_strategy = SamplingStrategy.FailureWeighted
-    random_start = False
+    random_start = True
     events = G1TrainingEventCfg()
 
 

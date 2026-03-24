@@ -151,7 +151,7 @@ class Sim2SimEvaluator:
         raise ValueError(f"Unsupported actor type '{actor_type}'.")
 
     @staticmethod
-    def _split_sim2sim_obs(flat_obs: torch.Tensor, action_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _parse_sim2sim_obs(flat_obs: torch.Tensor, action_dim: int) -> dict[str, torch.Tensor]:
         expected_dim = action_dim * 5 + 9
         if flat_obs.ndim != 1:
             raise ValueError(f"Expected a flat sim2sim observation, got shape {tuple(flat_obs.shape)}.")
@@ -160,47 +160,65 @@ class Sim2SimEvaluator:
 
         offset = 0
 
-        target_joint_pos = flat_obs[offset : offset + action_dim]
-        offset += action_dim
-
-        target_joint_vel = flat_obs[offset : offset + action_dim]
-        offset += action_dim
-
         target_projected_gravity = flat_obs[offset : offset + 3]
         offset += 3
-
-        robot_obs = flat_obs[offset:]
-        motion_obs = torch.cat((target_projected_gravity, target_joint_pos, target_joint_vel), dim=-1)
-
-        return motion_obs, robot_obs
-
-    @staticmethod
-    def _extract_metrics(flat_obs: torch.Tensor, action_dim: int) -> dict[str, float]:
-        offset = 0
 
         target_joint_pos = flat_obs[offset : offset + action_dim]
         offset += action_dim
 
         target_joint_vel = flat_obs[offset : offset + action_dim]
         offset += action_dim
-
-        target_projected_gravity = flat_obs[offset : offset + 3]
-        offset += 3
 
         robot_projected_gravity = flat_obs[offset : offset + 3]
         offset += 3
 
+        base_ang_vel = flat_obs[offset : offset + 3]
         offset += 3
 
         robot_joint_pos = flat_obs[offset : offset + action_dim]
         offset += action_dim
 
         robot_joint_vel = flat_obs[offset : offset + action_dim]
+        offset += action_dim
+
+        previous_action = flat_obs[offset : offset + action_dim]
 
         return {
-            "joint_pos_mae": torch.mean(torch.abs(target_joint_pos - robot_joint_pos)).item(),
-            "joint_vel_mae": torch.mean(torch.abs(target_joint_vel - robot_joint_vel)).item(),
-            "gravity_mae": torch.mean(torch.abs(target_projected_gravity - robot_projected_gravity)).item(),
+            "motion_obs": torch.cat((target_projected_gravity, target_joint_pos, target_joint_vel), dim=-1),
+            "robot_obs": torch.cat(
+                (
+                    robot_projected_gravity,
+                    base_ang_vel,
+                    robot_joint_pos,
+                    robot_joint_vel,
+                    previous_action,
+                ),
+                dim=-1,
+            ),
+            "target_projected_gravity": target_projected_gravity,
+            "target_joint_pos": target_joint_pos,
+            "target_joint_vel": target_joint_vel,
+            "robot_projected_gravity": robot_projected_gravity,
+            "base_ang_vel": base_ang_vel,
+            "robot_joint_pos": robot_joint_pos,
+            "robot_joint_vel": robot_joint_vel,
+            "previous_action": previous_action,
+        }
+
+    @staticmethod
+    def _extract_metrics(flat_obs: torch.Tensor, action_dim: int) -> dict[str, float]:
+        obs_parts = Sim2SimEvaluator._parse_sim2sim_obs(flat_obs, action_dim)
+
+        return {
+            "joint_pos_mae": torch.mean(
+                torch.abs(obs_parts["target_joint_pos"] - obs_parts["robot_joint_pos"])
+            ).item(),
+            "joint_vel_mae": torch.mean(
+                torch.abs(obs_parts["target_joint_vel"] - obs_parts["robot_joint_vel"])
+            ).item(),
+            "gravity_mae": torch.mean(
+                torch.abs(obs_parts["target_projected_gravity"] - obs_parts["robot_projected_gravity"])
+            ).item(),
         }
 
     def __init__(
@@ -283,7 +301,9 @@ class Sim2SimEvaluator:
         )
 
     def _get_actor_observation(self, flat_obs: torch.Tensor) -> dict[str, torch.Tensor]:
-        motion_obs, robot_obs = self._split_sim2sim_obs(flat_obs, self.action_dim)
+        obs_parts = self._parse_sim2sim_obs(flat_obs, self.action_dim)
+        motion_obs = obs_parts["motion_obs"]
+        robot_obs = obs_parts["robot_obs"]
 
         if "motion" in self.obs_dims and motion_obs.numel() != self.obs_dims["motion"]:
             raise ValueError(f"Expected motion observation dim {self.obs_dims['motion']}, got {motion_obs.numel()}.")
