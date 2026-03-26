@@ -6,9 +6,37 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MOTION_ASSET_DIR = PROJECT_ROOT / "env" / "assests"
 
 DEFAULT_EXPERIMENT_MOTION_FILES = (
-    "env/assests/auto_2.npz",
-    #"env/assests/runing.npz",
-    #"env/assests/handshake.npz",
+    #"env/assests/test.npz"
+    #"env/assests/01_01_stageii.npz",
+    #"env/assests/05_01_stageii.npz",
+    "env/assests/05_05_stageii.npz",
+    #"env/assests/05_06_stageii.npz",
+    #"env/assests/05_09_stageii.npz",
+    #"env/assests/05_13_stageii.npz",
+    #"env/assests/05_14_stageii.npz",
+    #"env/assests/10_02_stageii.npz",
+    #"env/assests/10_03_stageii.npz",
+    #"env/assests/10_04_stageii.npz",
+    #"env/assests/118_01_stageii.npz",
+    #"env/assests/118_16_stageii.npz",
+    #"env/assests/118_20_stageii.npz",
+    #"env/assests/12_01_stageii.npz",
+    #"env/assests/12_02_stageii.npz",
+    #"env/assests/12_03_stageii.npz",
+    #"env/assests/139_02_stageii.npz",
+    #"env/assests/139_11_stageii.npz",
+    #"env/assests/139_30_stageii.npz",
+    #"env/assests/16_34_stageii.npz",
+    #"env/assests/16_35_stageii.npz",
+    #"env/assests/30_01_stageii.npz",
+    #"env/assests/30_11_stageii.npz",
+    #"env/assests/30_15_stageii.npz",
+    #"env/assests/79_02_stageii.npz",
+    #"env/assests/79_32_stageii.npz",
+    #"env/assests/79_40_stageii.npz",
+    #"env/assests/79_60_stageii.npz",
+    #"env/assests/79_65_stageii.npz",
+    #"env/assests/79_95_stageii.npz",
 )
 
 

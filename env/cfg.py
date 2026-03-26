@@ -8,7 +8,7 @@ class G1MultiMotionEnv(G1MotionTrackingEnvCfg):
     expert_motion_file = resolve_motion_files(DEFAULT_EXPERIMENT_MOTION_FILES)
     episode_length_s = 20
     action_mod = ActionMod.Offset
-    random_start = False
+    random_start = True
     events = None
 
 @configclass

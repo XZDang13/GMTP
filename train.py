@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 
 from isaaclab.app import AppLauncher
 
@@ -251,6 +252,10 @@ class Trainer:
         self.adain_res_blocks = self._normalize_adain_res_blocks(adain_res_blocks)
         self.motion_files = list(self.cfg.expert_motion_file)
         self.motion_name = motion_label(self.motion_files)
+        self.run_date = datetime.now().strftime("%Y%m%d")
+        self.checkpoint_date = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_name = f"G1_{len(self.motion_files)}_{self.run_date}"
+        self.checkpoint_interval = 4000
 
         self.initial_obs, _ = self.env.reset()
         self.obs_dims = self._infer_observation_dims(self.initial_obs)
@@ -278,6 +283,7 @@ class Trainer:
             optimizers.append(torch.optim.Muon(muon_groups, lr=1e-3, weight_decay=0.0))
         if adamw_groups:
             optimizers.append(torch.optim.AdamW(adamw_groups, lr=1e-3, weight_decay=0.0))
+            
         self.ac_optimizer = OptimizerCollection(*optimizers)
 
         print(
@@ -325,7 +331,7 @@ class Trainer:
         self.tracker.add_list_metrics("kl_divergence")
         self.tracker.add_list_metrics("value_loss")
 
-        WandbLogger.init_project("Mimic", f"G1_{self.motion_name}")
+        WandbLogger.init_project("Mimic", self.run_name)
         
     @torch.no_grad()
     def get_action(
@@ -477,9 +483,9 @@ class Trainer:
 
         WandbLogger.log_metrics(train_info, self.global_step)
 
-    def save_weight(self, name:str):
+    def save_weight(self, name: str):
         joint_params = self.env.unwrapped.get_joint_params()
-        checkpoint_name = f"{self.motion_name}_{self.actor_type}_{name}"
+        checkpoint_name = f"{self.checkpoint_date}_{self.actor_type}_{name}"
 
         torch.save(
             {
@@ -508,8 +514,8 @@ class Trainer:
                 obs = self.rollout(obs)
                 self.update()
 
-                #if (epoch+1) % 1000 == 0:
-                #    self.save_weight(epoch+1)
+                if (epoch + 1) % self.checkpoint_interval == 0:
+                    self.save_weight(epoch + 1)
             self.save_weight("final")
             print(self.env.unwrapped.sampler.bin_sample_counts)
         finally:

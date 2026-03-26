@@ -3,6 +3,8 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+import imageio.v2 as imageio
+import mujoco
 import torch
 
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
@@ -14,6 +16,11 @@ from model.actor import AdaINActor, AdaINResActor, SplitEncoderActor, VanilaActo
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_MOTION_FILES = resolve_motion_files(DEFAULT_EXPERIMENT_MOTION_FILES)
+DEFAULT_CAMERA_DISTANCE = 3.0
+DEFAULT_CAMERA_AZIMUTH = 135.0
+DEFAULT_CAMERA_ELEVATION = -20.0
+DEFAULT_VIDEO_WIDTH = 1280
+DEFAULT_VIDEO_HEIGHT = 720
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -36,7 +43,150 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--root-name", default="pelvis")
     parser.add_argument("--render", action="store_true")
+    parser.add_argument(
+        "--random-start",
+        action="store_true",
+        help="Reset each replay from a uniformly sampled time within the motion clip instead of t=0.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional random seed for random-start sampling.",
+    )
+    parser.add_argument(
+        "--camera-track-body",
+        default=None,
+        help="MuJoCo body name to follow. Defaults to --root-name.",
+    )
+    parser.add_argument("--camera-distance", type=float, default=DEFAULT_CAMERA_DISTANCE)
+    parser.add_argument("--camera-azimuth", type=float, default=DEFAULT_CAMERA_AZIMUTH)
+    parser.add_argument("--camera-elevation", type=float, default=DEFAULT_CAMERA_ELEVATION)
+    parser.add_argument(
+        "--video-dir",
+        default=None,
+        help="Optional output directory for replay videos. Saves one MP4 per motion file.",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=int,
+        default=None,
+        help="Replay video FPS. Defaults to the sim2sim policy rate.",
+    )
+    parser.add_argument("--video-width", type=int, default=DEFAULT_VIDEO_WIDTH)
+    parser.add_argument("--video-height", type=int, default=DEFAULT_VIDEO_HEIGHT)
     return parser
+
+
+class ReplayCameraRecorder:
+    @staticmethod
+    def _fit_video_size(
+        requested_width: int,
+        requested_height: int,
+        max_width: int,
+        max_height: int,
+    ) -> tuple[int, int]:
+        if requested_width <= max_width and requested_height <= max_height:
+            return requested_width, requested_height
+
+        scale = min(max_width / requested_width, max_height / requested_height)
+        width = max(1, int(requested_width * scale))
+        height = max(1, int(requested_height * scale))
+        return width, height
+
+    def __init__(
+        self,
+        env: MujocoEnv,
+        track_body_name: str,
+        camera_distance: float,
+        camera_azimuth: float,
+        camera_elevation: float,
+        video_path: Path | None = None,
+        video_width: int = DEFAULT_VIDEO_WIDTH,
+        video_height: int = DEFAULT_VIDEO_HEIGHT,
+        video_fps: int = 30,
+    ):
+        self.env = env
+        self.body_id = self._resolve_body_id(track_body_name)
+        self.camera = mujoco.MjvCamera()
+        self.camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        self.camera.fixedcamid = -1
+        self.camera.trackbodyid = self.body_id
+        self.camera.distance = camera_distance
+        self.camera.azimuth = camera_azimuth
+        self.camera.elevation = camera_elevation
+        self.renderer: mujoco.Renderer | None = None
+        self.writer = None
+        self.video_path = video_path
+        self.video_size = (video_width, video_height)
+
+        self._sync_camera_pose()
+        self._apply_to_viewer()
+
+        if self.video_path is not None:
+            max_width = int(self.env.mj_model.vis.global_.offwidth)
+            max_height = int(self.env.mj_model.vis.global_.offheight)
+            self.video_size = self._fit_video_size(video_width, video_height, max_width, max_height)
+            self.video_path.parent.mkdir(parents=True, exist_ok=True)
+            self.renderer = mujoco.Renderer(
+                self.env.mj_model,
+                height=self.video_size[1],
+                width=self.video_size[0],
+            )
+            self.writer = imageio.get_writer(
+                self.video_path,
+                fps=video_fps,
+                codec="libx264",
+                macro_block_size=None,
+            )
+
+    def _resolve_body_id(self, track_body_name: str) -> int:
+        body_id = mujoco.mj_name2id(
+            self.env.mj_model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            track_body_name,
+        )
+        if body_id == -1:
+            raise ValueError(f"MuJoCo body '{track_body_name}' does not exist in the robot model.")
+        return body_id
+
+    def _sync_camera_pose(self) -> None:
+        self.camera.lookat[:] = self.env.mj_data.xpos[self.body_id]
+
+    def _apply_to_viewer(self) -> None:
+        if self.env.mj_viewer is None:
+            return
+
+        self._sync_camera_pose()
+        viewer_camera = self.env.mj_viewer.cam
+        viewer_camera.type = self.camera.type
+        viewer_camera.fixedcamid = self.camera.fixedcamid
+        viewer_camera.trackbodyid = self.camera.trackbodyid
+        viewer_camera.distance = self.camera.distance
+        viewer_camera.azimuth = self.camera.azimuth
+        viewer_camera.elevation = self.camera.elevation
+        viewer_camera.lookat[:] = self.camera.lookat
+
+    def render_viewer(self) -> None:
+        self._apply_to_viewer()
+        if self.env.mj_viewer is not None and self.env.mj_viewer.is_alive:
+            self.env.mj_viewer.render()
+
+    def capture_frame(self) -> None:
+        if self.renderer is None or self.writer is None:
+            return
+
+        self._sync_camera_pose()
+        self.renderer.update_scene(self.env.mj_data, camera=self.camera)
+        self.writer.append_data(self.renderer.render())
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+        if self.renderer is not None:
+            self.renderer.close()
+            self.renderer = None
 
 
 class Sim2SimEvaluator:
@@ -80,6 +230,13 @@ class Sim2SimEvaluator:
             path = (Path.cwd() / path).resolve()
         if not path.exists():
             raise FileNotFoundError(f"Path does not exist: {path}")
+        return path
+
+    @staticmethod
+    def _resolve_output_path(path_str: str) -> Path:
+        path = Path(path_str).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
         return path
 
     @classmethod
@@ -232,15 +389,38 @@ class Sim2SimEvaluator:
         device: str = "cpu",
         root_name: str = "pelvis",
         render: bool = False,
+        random_start: bool = False,
+        seed: int | None = None,
         adain_res_blocks: int | None = None,
+        camera_track_body: str | None = None,
+        camera_distance: float = DEFAULT_CAMERA_DISTANCE,
+        camera_azimuth: float = DEFAULT_CAMERA_AZIMUTH,
+        camera_elevation: float = DEFAULT_CAMERA_ELEVATION,
+        video_dir: str | None = None,
+        video_fps: int | None = None,
+        video_width: int = DEFAULT_VIDEO_WIDTH,
+        video_height: int = DEFAULT_VIDEO_HEIGHT,
     ):
         if num_steps < 1:
             raise ValueError(f"num_steps must be positive, got {num_steps}.")
+        if video_width < 1 or video_height < 1:
+            raise ValueError(
+                f"Video dimensions must be positive, got width={video_width}, height={video_height}."
+            )
+        if video_fps is not None and video_fps < 1:
+            raise ValueError(f"video_fps must be positive, got {video_fps}.")
 
         self.checkpoint_path = self._resolve_existing_path(checkpoint_path)
         self.device = torch.device(device)
         self.num_steps = num_steps
         self.render = render
+        self.random_start = random_start
+        self.random_generator = torch.Generator(device="cpu")
+        if seed is None:
+            self.seed = int(self.random_generator.seed())
+        else:
+            self.seed = int(seed)
+            self.random_generator.manual_seed(self.seed)
 
         weights = torch.load(self.checkpoint_path, map_location="cpu")
         self.actor_type = self._normalize_actor_type(actor_type or weights.get("actor_type"))
@@ -278,12 +458,102 @@ class Sim2SimEvaluator:
         self.simulation_dt = simulation_dt
         self.decimation = decimation
         self.root_name = root_name
+        self.camera_track_body = camera_track_body or root_name
+        self.camera_distance = camera_distance
+        self.camera_azimuth = camera_azimuth
+        self.camera_elevation = camera_elevation
+        self.video_dir = self._resolve_output_path(video_dir) if video_dir is not None else None
+        self.video_fps = video_fps or max(1, round(1.0 / (self.simulation_dt * self.decimation)))
+        self.video_width = video_width
+        self.video_height = video_height
         self.kp = weights["joint_stiffness"].detach().cpu()
         self.kd = weights["joint_damping"].detach().cpu()
         self.effort_limits = weights["joint_effort_limits"].detach().cpu()
         self.joint_pos_limits = weights["joint_pos_limits"].detach().cpu()
         self.action_offset = weights["action_offset"].detach().cpu()
         self.action_scale = weights["action_scale"].detach().cpu()
+
+    def _sample_start_time(self, env: MujocoEnv) -> float:
+        if not self.random_start:
+            return 0.0
+
+        duration = float(env.motion_lib.get_duration(env.motion_id).squeeze(0).item())
+        if duration <= 0.0:
+            return 0.0
+
+        start_time = float(torch.rand(1, generator=self.random_generator).item() * duration)
+        if duration > 1e-6:
+            start_time = min(start_time, duration - 1e-6)
+        return start_time
+
+    def _reset_env(self, env: MujocoEnv, start_time: float) -> torch.Tensor:
+        mujoco.mj_resetData(env.mj_model, env.mj_data)
+
+        env.previous_action[:] = 0.0
+        env.motion_id.zero_()
+        env.times = torch.tensor([start_time], dtype=torch.float32)
+        env.n_steps = 0
+
+        reference_motion = env.motion_lib.sample_motion(motion_ids=env.motion_id, times=env.times)
+
+        joint_positions = reference_motion["joint_pos"].squeeze(0).numpy()[env.isaac2mujoco]
+        joint_velocities = reference_motion["joint_vel"].squeeze(0).numpy()[env.isaac2mujoco]
+        body_positions = reference_motion["body_positions"].squeeze(0).numpy()
+        body_rotations = reference_motion["body_quaternions"].squeeze(0).numpy()
+        body_linear_velocities = reference_motion["body_linear_velocities"].squeeze(0).numpy()
+        body_angular_velocities = reference_motion["body_angular_velocities"].squeeze(0).numpy()
+
+        root_pos = body_positions[env.root_index]
+        root_pos[2] += 0.05
+        root_quat = body_rotations[env.root_index]
+        root_linear_vel = body_linear_velocities[env.root_index]
+        root_ang_vel = body_angular_velocities[env.root_index]
+
+        env.mj_data.qpos[0] = 0.0
+        env.mj_data.qpos[1] = 0.0
+        env.mj_data.qpos[2] = root_pos[2]
+        env.mj_data.qpos[3:7] = root_quat
+        env.mj_data.qpos[7:] = joint_positions
+
+        env.mj_data.qvel[:3] = root_linear_vel
+        env.mj_data.qvel[3:6] = root_ang_vel
+        env.mj_data.qvel[6:] = joint_velocities
+
+        mujoco.mj_forward(env.mj_model, env.mj_data)
+
+        if env.mj_viewer is not None and env.mj_viewer.is_alive:
+            env.mj_viewer.render()
+        else:
+            env.mj_viewer = None
+
+        obs = env.get_obs(advance_time=False)
+        env.target_pos = reference_motion["joint_pos"].squeeze(0).clone()
+        return obs
+
+    def _build_video_path(self, motion_file: str, motion_index: int) -> Path | None:
+        if self.video_dir is None:
+            return None
+
+        motion_stem = Path(motion_file).stem
+        safe_motion_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", motion_stem)
+        filename = f"{self.checkpoint_path.stem}_{motion_index:02d}_{safe_motion_stem}.mp4"
+        return self.video_dir / filename
+
+    def _build_replay_camera(self, env: MujocoEnv, motion_file: str, motion_index: int) -> ReplayCameraRecorder | None:
+        if not self.render and self.video_dir is None:
+            return None
+
+        return ReplayCameraRecorder(
+            env=env,
+            track_body_name=self.camera_track_body,
+            camera_distance=self.camera_distance,
+            camera_azimuth=self.camera_azimuth,
+            camera_elevation=self.camera_elevation,
+            video_path=self._build_video_path(motion_file, motion_index),
+            video_width=self.video_width,
+            video_height=self.video_height,
+            video_fps=self.video_fps,
+        )
 
     def _build_env(self, motion_file: str) -> MujocoEnv:
         return MujocoEnv(
@@ -326,17 +596,29 @@ class Sim2SimEvaluator:
             return actor_step.mean
         return actor_step.action
 
-    def _eval_motion_file(self, motion_file: str) -> tuple[int, dict[str, float]]:
+    def _eval_motion_file(self, motion_file: str, motion_index: int) -> tuple[int, dict[str, float], Path | None, float]:
         env = self._build_env(motion_file)
-        obs = env.reset()
         metrics = defaultdict(float)
         steps_run = 0
+        replay_camera = None
+        start_time = 0.0
 
         try:
+            start_time = self._sample_start_time(env)
+            obs = self._reset_env(env, start_time)
+            replay_camera = self._build_replay_camera(env, motion_file, motion_index)
+
+            if replay_camera is not None:
+                replay_camera.render_viewer()
+                replay_camera.capture_frame()
+
             for _ in range(self.num_steps):
                 actor_obs = self._get_actor_observation(obs)
                 action = self.get_action(actor_obs, determine=True).squeeze(0).detach().cpu()
                 obs = env.step(action)
+
+                if replay_camera is not None:
+                    replay_camera.capture_frame()
 
                 for key, value in self._extract_metrics(obs, self.action_dim).items():
                     metrics[key] += value
@@ -346,12 +628,19 @@ class Sim2SimEvaluator:
                 if self.render and env.mj_viewer is None:
                     break
         finally:
+            if replay_camera is not None:
+                replay_camera.close()
             env.close()
 
         if steps_run == 0:
-            return 0, {}
+            return 0, {}, replay_camera.video_path if replay_camera is not None else None, start_time
 
-        return steps_run, {key: value / steps_run for key, value in metrics.items()}
+        return (
+            steps_run,
+            {key: value / steps_run for key, value in metrics.items()},
+            replay_camera.video_path if replay_camera is not None else None,
+            start_time,
+        )
 
     def eval(self) -> None:
         aggregate_metrics = defaultdict(float)
@@ -360,12 +649,23 @@ class Sim2SimEvaluator:
         print(f"checkpoint: {self.checkpoint_path}")
         print(f"motion_label: {self.motion_name}")
         print(f"actor_type: {self.actor_type}")
+        print(f"random_start: {self.random_start}")
+        if self.random_start:
+            print(f"random_seed: {self.seed}")
 
-        for motion_file in self.motion_files:
-            steps_run, metrics = self._eval_motion_file(motion_file)
+        if self.video_dir is not None:
+            print(f"video_dir: {self.video_dir}")
+            print(f"video_fps: {self.video_fps}")
+
+        for motion_index, motion_file in enumerate(self.motion_files):
+            steps_run, metrics, video_path, start_time = self._eval_motion_file(motion_file, motion_index)
 
             print(f"motion_file: {motion_file}")
+            if self.random_start:
+                print(f"start_time: {start_time:.6f}")
             print(f"steps: {steps_run}")
+            if video_path is not None:
+                print(f"video_path: {video_path}")
 
             for key, value in metrics.items():
                 print(f"{key}: {value:.6f}")
@@ -394,6 +694,16 @@ def main():
         device=args.device,
         root_name=args.root_name,
         render=args.render,
+        random_start=args.random_start,
+        seed=args.seed,
+        camera_track_body=args.camera_track_body,
+        camera_distance=args.camera_distance,
+        camera_azimuth=args.camera_azimuth,
+        camera_elevation=args.camera_elevation,
+        video_dir=args.video_dir,
+        video_fps=args.video_fps,
+        video_width=args.video_width,
+        video_height=args.video_height,
     )
     evaluator.eval()
 
