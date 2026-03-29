@@ -13,7 +13,7 @@ from RLAlg.nn.steps import StochasticContinuousPolicyStep, ValueStep
 from RLAlg.alg.ppo import PPO
 from RLAlg.logger import WandbLogger, MetricsTracker
 
-from model.actor import AdaINActor, AdaINResActor, SplitEncoderActor, VanilaActor
+from model.actor import AdaINActor, AdaINResActor, RecurrentActor, SplitEncoderActor, VanilaActor
 from model.critic import Critic
 from env.motions import motion_label, motion_names, resolve_motion_files
 
@@ -23,7 +23,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--actor-type",
         default="vanila",
-        help="Actor architecture to train: vanila, split_encoder, adain, or adain_res.",
+        help="Actor architecture to train: vanila, recurrent, split_encoder, adain, or adain_res.",
     )
     AppLauncher.add_app_launcher_args(parser)
     return parser
@@ -91,12 +91,19 @@ class OptimizerCollection(torch.optim.Optimizer):
         ]
 
 class Trainer:
+    DEFAULT_RECURRENT_HIDDEN_SIZE = 512
+    DEFAULT_RECURRENT_NUM_LAYERS = 1
+
     @staticmethod
     def _normalize_actor_type(actor_type: str) -> str:
         normalized = actor_type.lower().replace("-", "_")
         alias_map = {
             "vanila": "vanila",
             "vanilla": "vanila",
+            "recurrent": "recurrent",
+            "gru": "recurrent",
+            "vanila_gru": "recurrent",
+            "vanilla_gru": "recurrent",
             "split": "split_encoder",
             "split_encoder": "split_encoder",
             "adain": "adain",
@@ -113,6 +120,32 @@ class Trainer:
         if num_blocks < 1:
             raise ValueError(f"adain_res_blocks must be positive, got {num_blocks}.")
         return num_blocks
+
+    @staticmethod
+    def _is_concat_actor(actor_type: str) -> bool:
+        return actor_type in {"vanila", "recurrent"}
+
+    @staticmethod
+    def _is_recurrent_actor(actor_type: str) -> bool:
+        return actor_type == "recurrent"
+
+    @staticmethod
+    def _unpack_actor_output(actor_output):
+        if isinstance(actor_output, tuple):
+            if len(actor_output) != 2:
+                raise ValueError(
+                    f"Expected recurrent actor output to be (step, next_state), got tuple of length {len(actor_output)}."
+                )
+            return actor_output
+        return actor_output, None
+
+    @staticmethod
+    def _policy_state_for_storage(policy_state: torch.Tensor) -> torch.Tensor:
+        return policy_state.transpose(0, 1)
+
+    @staticmethod
+    def _policy_state_from_storage(policy_state: torch.Tensor, device: torch.device) -> torch.Tensor:
+        return policy_state.to(device).transpose(0, 1).contiguous()
 
     @staticmethod
     def _infer_observation_dims(obs: dict[str, torch.Tensor]) -> dict[str, int]:
@@ -138,9 +171,18 @@ class Trainer:
         actor_type: str,
         action_dim: int,
         adain_res_blocks: int,
+        actor_kwargs: dict[str, int] | None = None,
     ) -> torch.nn.Module:
+        actor_kwargs = actor_kwargs or {}
         if actor_type == "vanila":
             return VanilaActor(obs_dims["policy"], action_dim)
+        if actor_type == "recurrent":
+            return RecurrentActor(
+                obs_dims["policy"],
+                action_dim,
+                hidden_size=int(actor_kwargs.get("hidden_size", Trainer.DEFAULT_RECURRENT_HIDDEN_SIZE)),
+                num_layers=int(actor_kwargs.get("num_layers", Trainer.DEFAULT_RECURRENT_NUM_LAYERS)),
+            )
         if actor_type == "split_encoder":
             return SplitEncoderActor(obs_dims["robot"], obs_dims["motion"], action_dim)
         if actor_type == "adain":
@@ -156,7 +198,7 @@ class Trainer:
 
     @staticmethod
     def _get_actor_observation(obs: dict[str, torch.Tensor], actor_type: str) -> dict[str, torch.Tensor]:
-        if actor_type == "vanila":
+        if Trainer._is_concat_actor(actor_type):
             return {"obs": torch.cat((obs["motion"], obs["robot"]), dim=-1)}
         return {
             "motion_obs": obs["motion"],
@@ -165,7 +207,7 @@ class Trainer:
 
     @staticmethod
     def _get_policy_storage_specs(obs_dims: dict[str, int], actor_type: str) -> dict[str, tuple[int, ...]]:
-        if actor_type == "vanila":
+        if Trainer._is_concat_actor(actor_type):
             return {"policy_observations": (obs_dims["policy"],)}
         return {
             "motion_observations": (obs_dims["motion"],),
@@ -174,7 +216,7 @@ class Trainer:
 
     @staticmethod
     def _get_policy_records(actor_obs: dict[str, torch.Tensor], actor_type: str) -> dict[str, torch.Tensor]:
-        if actor_type == "vanila":
+        if Trainer._is_concat_actor(actor_type):
             return {"policy_observations": actor_obs["obs"]}
         return {
             "motion_observations": actor_obs["motion_obs"],
@@ -187,12 +229,27 @@ class Trainer:
         actor_type: str,
         device: torch.device,
     ) -> dict[str, torch.Tensor]:
-        if actor_type == "vanila":
+        if Trainer._is_concat_actor(actor_type):
             return {"obs": batch["policy_observations"].to(device)}
         return {
             "motion_obs": batch["motion_observations"].to(device),
             "robot_obs": batch["robot_observations"].to(device),
         }
+
+    @staticmethod
+    def _get_actor_kwargs(
+        actor: torch.nn.Module,
+        actor_type: str,
+        adain_res_blocks: int,
+    ) -> dict[str, int]:
+        if actor_type == "adain_res":
+            return {"num_blocks": adain_res_blocks}
+        if actor_type == "recurrent":
+            return {
+                "hidden_size": int(actor.hidden_size),
+                "num_layers": int(actor.num_layers),
+            }
+        return {}
 
     @staticmethod
     def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -249,6 +306,7 @@ class Trainer:
 
         self.device = self.env.unwrapped.device
         self.actor_type = self._normalize_actor_type(actor_type)
+        self.is_recurrent_actor = self._is_recurrent_actor(self.actor_type)
         self.adain_res_blocks = self._normalize_adain_res_blocks(adain_res_blocks)
         self.motion_files = list(self.cfg.expert_motion_file)
         self.motion_name = motion_label(self.motion_files)
@@ -268,7 +326,16 @@ class Trainer:
             self.actor_type,
             action_dim,
             self.adain_res_blocks,
+            actor_kwargs=(
+                {
+                    "hidden_size": self.DEFAULT_RECURRENT_HIDDEN_SIZE,
+                    "num_layers": self.DEFAULT_RECURRENT_NUM_LAYERS,
+                }
+                if self.is_recurrent_actor
+                else None
+            ),
         ).to(self.device)
+        self.actor_kwargs = self._get_actor_kwargs(self.actor, self.actor_type, self.adain_res_blocks)
         self.critic = Critic(critic_obs_dim).to(self.device)
         muon_groups, adamw_groups, optimizer_stats = self._split_optimizer_param_groups(
             {
@@ -294,6 +361,7 @@ class Trainer:
 
         self.lr_scheduler = KLAdaptiveLR(self.ac_optimizer, 0.01)
         self.steps = 20
+        self.sequence_batch_size = max(1, (4096 * 10) // self.steps)
 
         self.rollout_buffer = ReplayBuffer(
             self.cfg.scene.num_envs,
@@ -312,6 +380,7 @@ class Trainer:
             "returns",
             "advantages",
         ]
+        self.sequence_state_keys: list[str] = []
 
         for key, shape in self.policy_storage_specs.items():
             self.rollout_buffer.create_storage_space(key, shape, torch.float32)
@@ -321,6 +390,21 @@ class Trainer:
         self.rollout_buffer.create_storage_space("rewards", (), torch.float32)
         self.rollout_buffer.create_storage_space("values", (), torch.float32)
         self.rollout_buffer.create_storage_space("terminate", (), torch.float32)
+        if self.is_recurrent_actor:
+            self.rollout_buffer.create_storage_space("episode_starts", (), torch.bool)
+            self.rollout_buffer.create_storage_space(
+                "policy_rnn_state",
+                (self.actor.num_layers, self.actor.hidden_size),
+                torch.float32,
+            )
+            self.batch_keys.append("episode_starts")
+            self.sequence_state_keys.append("policy_rnn_state")
+            self.policy_state = self.actor.get_initial_state(self.cfg.scene.num_envs, device=self.device)
+            self.episode_starts = torch.ones(
+                self.cfg.scene.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
         self.global_step = 0
         self.tracker = MetricsTracker()
 
@@ -334,29 +418,69 @@ class Trainer:
         WandbLogger.init_project("Mimic", self.run_name)
         
     @torch.no_grad()
+    def _update_actor_statistics(
+        self,
+        actorobs_batch: dict[str, torch.Tensor],
+        policy_state: torch.Tensor | None = None,
+        episode_starts: torch.Tensor | None = None,
+    ) -> None:
+        if self.is_recurrent_actor:
+            self.actor(
+                actorobs_batch,
+                initial_state=policy_state,
+                episode_starts=episode_starts,
+                update_normlizer=True,
+            )
+            return
+        self.actor(actorobs_batch, update_normlizer=True)
+
+    @torch.no_grad()
+    def get_value(self, criticobs_batch: torch.Tensor, update_normlizer: bool = True) -> torch.Tensor:
+        critic_step: ValueStep = self.critic(criticobs_batch, update_normlizer=update_normlizer)
+        return critic_step.value
+
+    @torch.no_grad()
     def get_action(
         self,
         actorobs_batch: dict[str, torch.Tensor],
         criticobs_batch: torch.Tensor,
         determine: bool = False,
+        policy_state: torch.Tensor | None = None,
+        episode_starts: torch.Tensor | None = None,
     ):
-        actor_step:StochasticContinuousPolicyStep = self.actor(actorobs_batch, update_normlizer=True)
+        if self.is_recurrent_actor:
+            actor_output = self.actor(
+                actorobs_batch,
+                initial_state=policy_state,
+                episode_starts=episode_starts,
+                update_normlizer=True,
+            )
+        else:
+            actor_output = self.actor(actorobs_batch, update_normlizer=True)
+
+        actor_step, next_policy_state = self._unpack_actor_output(actor_output)
         action = actor_step.action
         log_prob = actor_step.log_prob
         if determine:
             action = actor_step.mean
-        
-        critic_step:ValueStep = self.critic(criticobs_batch, update_normlizer=True)
-        value = critic_step.value
 
-        return action, log_prob, value
+        value = self.get_value(criticobs_batch, update_normlizer=True)
+
+        return action, log_prob, value, next_policy_state
     
     def rollout(self, obs):
         for _ in range(self.steps):
             self.global_step += 1
             actor_obs = self._get_actor_observation(obs, self.actor_type)
             critic_obs = self._get_critic_observation(obs)
-            action, log_prob, value = self.get_action(actor_obs, critic_obs)
+            current_policy_state = self.policy_state if self.is_recurrent_actor else None
+            current_episode_starts = self.episode_starts if self.is_recurrent_actor else None
+            action, log_prob, value, next_policy_state = self.get_action(
+                actor_obs,
+                critic_obs,
+                policy_state=current_policy_state,
+                episode_starts=current_episode_starts,
+            )
             next_obs, task_reward, terminate, timeout, info = self.env.step(action)
             
             #reward = torch.sigmoid(task_reward)
@@ -394,14 +518,24 @@ class Trainer:
                 "terminate": terminate
             }
             records.update(self._get_policy_records(actor_obs, self.actor_type))
+            if self.is_recurrent_actor:
+                records["episode_starts"] = current_episode_starts
+                records["policy_rnn_state"] = self._policy_state_for_storage(current_policy_state)
 
             self.rollout_buffer.add_records(records)
 
+            if self.is_recurrent_actor:
+                self.policy_state = next_policy_state
+                self.episode_starts = done.to(dtype=torch.bool, device=self.device)
             obs = next_obs
 
         actor_obs = self._get_actor_observation(obs, self.actor_type)
         critic_obs = self._get_critic_observation(obs)
-        _, _, last_value = self.get_action(actor_obs, critic_obs)
+        if self.is_recurrent_actor:
+            self._update_actor_statistics(actor_obs, self.policy_state, self.episode_starts)
+        else:
+            self._update_actor_statistics(actor_obs)
+        last_value = self.get_value(critic_obs, update_normlizer=True)
         returns, advantages = compute_gae(
             self.rollout_buffer.data["rewards"],
             self.rollout_buffer.data["values"],
@@ -423,8 +557,18 @@ class Trainer:
         self.tracker.reset("kl_divergence")
         self.tracker.reset("value_loss")
 
-        for i in range(5):
-            for batch in self.rollout_buffer.sample_batchs(self.batch_keys, 4096*10):
+        for _ in range(5):
+            if self.is_recurrent_actor:
+                batch_iter = self.rollout_buffer.sample_sequence_batches(
+                    self.batch_keys,
+                    seq_len=self.steps,
+                    batch_size=self.sequence_batch_size,
+                    state_keys=self.sequence_state_keys,
+                )
+            else:
+                batch_iter = self.rollout_buffer.sample_batchs(self.batch_keys, 4096 * 10)
+
+            for batch in batch_iter:
                 policy_obs_batch = self._get_policy_batch(batch, self.actor_type, self.device)
                 critic_obs_batch = batch["critic_observations"].to(self.device)
                 action_batch = batch["actions"].to(self.device)
@@ -433,24 +577,57 @@ class Trainer:
                 return_batch = batch["returns"].to(self.device)
                 advantage_batch = batch["advantages"].to(self.device)
 
-                policy_loss_dict = PPO.compute_policy_loss(self.actor,
-                                                           log_prob_batch,
-                                                           policy_obs_batch,
-                                                           action_batch,
-                                                           advantage_batch,
-                                                           0.2,
-                                                           0.0)
-                
+                if self.is_recurrent_actor:
+                    episode_starts_batch = batch["episode_starts"].to(self.device)
+                    valid_mask = batch["valid_mask"].to(self.device)
+                    initial_policy_state = self._policy_state_from_storage(
+                        batch["policy_rnn_state_init"],
+                        self.device,
+                    )
+                    policy_loss_dict = PPO.compute_policy_loss_recurrent(
+                        self.actor,
+                        log_prob_batch,
+                        policy_obs_batch,
+                        action_batch,
+                        advantage_batch,
+                        0.2,
+                        episode_starts=episode_starts_batch,
+                        initial_state=initial_policy_state,
+                        valid_mask=valid_mask,
+                        regularization_weight=0.0,
+                    )
+                    flat_valid_mask = valid_mask.reshape(-1)
+                    flat_critic_obs = critic_obs_batch.reshape(-1, critic_obs_batch.shape[-1])[flat_valid_mask]
+                    flat_value = value_batch.reshape(-1)[flat_valid_mask]
+                    flat_return = return_batch.reshape(-1)[flat_valid_mask]
+                    value_loss_dict = PPO.compute_clipped_value_loss(
+                        self.critic,
+                        flat_critic_obs,
+                        flat_value,
+                        flat_return,
+                        0.2,
+                    )
+                else:
+                    policy_loss_dict = PPO.compute_policy_loss(
+                        self.actor,
+                        log_prob_batch,
+                        policy_obs_batch,
+                        action_batch,
+                        advantage_batch,
+                        0.2,
+                        0.0,
+                    )
+                    value_loss_dict = PPO.compute_clipped_value_loss(
+                        self.critic,
+                        critic_obs_batch,
+                        value_batch,
+                        return_batch,
+                        0.2,
+                    )
+
                 policy_loss = policy_loss_dict["loss"]
                 entropy = policy_loss_dict["entropy"]
                 kl_divergence = policy_loss_dict["kl_divergence"]
-
-                value_loss_dict = PPO.compute_clipped_value_loss(self.critic,
-                                                    critic_obs_batch,
-                                                    value_batch,
-                                                    return_batch,
-                                                    0.2)
-                
                 value_loss = value_loss_dict["loss"]
 
                 ac_loss = policy_loss - entropy * 0.005 + value_loss * 1.0
@@ -462,7 +639,6 @@ class Trainer:
                 self.ac_optimizer.step()
                 self.lr_scheduler.set_kl(kl_divergence)
                 self.lr_scheduler.step()
-                
 
                 self.tracker.add_values("policy_loss", policy_loss)
                 self.tracker.add_values("entropy_loss", entropy)
@@ -490,7 +666,7 @@ class Trainer:
         torch.save(
             {
                 "actor_type": self.actor_type,
-                "actor_kwargs": {"num_blocks": self.adain_res_blocks} if self.actor_type == "adain_res" else {},
+                "actor_kwargs": self.actor_kwargs,
                 "motion_files": self.motion_files,
                 "motion_names": motion_names(self.motion_files),
                 "motion_label": self.motion_name,
@@ -510,7 +686,7 @@ class Trainer:
     def train(self):
         obs = self.initial_obs
         try:
-            for epoch in trange(1000):
+            for epoch in trange(4000):
                 obs = self.rollout(obs)
                 self.update()
 

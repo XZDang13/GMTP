@@ -10,8 +10,9 @@ import torch
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
 from Ref2Act.sim2sim import MujocoEnv
 
+from debug_log import RolloutDebugLogger
 from env.motions import DEFAULT_EXPERIMENT_MOTION_FILES, motion_label, resolve_motion_files
-from model.actor import AdaINActor, AdaINResActor, SplitEncoderActor, VanilaActor
+from model.actor import AdaINActor, AdaINResActor, RecurrentActor, SplitEncoderActor, VanilaActor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -29,7 +30,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--actor-type",
         default=None,
-        help="Override actor architecture for checkpoints without actor metadata: vanila, split_encoder, adain, or adain_res.",
+        help="Override actor architecture for checkpoints without actor metadata: vanila, recurrent, split_encoder, adain, or adain_res.",
     )
     parser.add_argument(
         "--motion-file",
@@ -41,6 +42,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--simulation-dt", type=float, default=1 / 200)
     parser.add_argument("--decimation", type=int, default=4)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--action-mode",
+        default=None,
+        help="Override checkpoint action mode: absolute, median, offset, or residual.",
+    )
     parser.add_argument("--root-name", default="pelvis")
     parser.add_argument("--render", action="store_true")
     parser.add_argument(
@@ -75,6 +81,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--video-width", type=int, default=DEFAULT_VIDEO_WIDTH)
     parser.add_argument("--video-height", type=int, default=DEFAULT_VIDEO_HEIGHT)
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Optional directory to save rollout debug logs as NPZ+JSON.",
+    )
     return parser
 
 
@@ -196,6 +207,10 @@ class Sim2SimEvaluator:
         alias_map = {
             "vanila": "vanila",
             "vanilla": "vanila",
+            "recurrent": "recurrent",
+            "gru": "recurrent",
+            "vanila_gru": "recurrent",
+            "vanilla_gru": "recurrent",
             "split": "split_encoder",
             "split_encoder": "split_encoder",
             "adain": "adain",
@@ -214,6 +229,38 @@ class Sim2SimEvaluator:
         return num_blocks
 
     @staticmethod
+    def _is_concat_actor(actor_type: str) -> bool:
+        return actor_type in {"vanila", "recurrent"}
+
+    @staticmethod
+    def _is_recurrent_actor(actor_type: str) -> bool:
+        return actor_type == "recurrent"
+
+    @staticmethod
+    def _unpack_actor_output(actor_output):
+        if isinstance(actor_output, tuple):
+            if len(actor_output) != 2:
+                raise ValueError(
+                    f"Expected recurrent actor output to be (step, next_state), got tuple of length {len(actor_output)}."
+                )
+            return actor_output
+        return actor_output, None
+
+    @staticmethod
+    def _normalize_action_mode(action_mode: object | None) -> str:
+        normalized = str(action_mode or "absolute").split(".")[-1].lower().replace("-", "_")
+        alias_map = {
+            "absolute": "absolute",
+            "median": "median",
+            "offset": "offset",
+            "residual": "residual",
+        }
+        try:
+            return alias_map[normalized]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported action mode '{action_mode}'.") from exc
+
+    @staticmethod
     def _infer_adain_res_blocks(actor_weights: dict[str, torch.Tensor]) -> int:
         block_pattern = re.compile(r"^block_(\d+)\.")
         block_ids = [
@@ -222,6 +269,23 @@ class Sim2SimEvaluator:
             if (match := block_pattern.match(key)) is not None
         ]
         return max(block_ids, default=5)
+
+    @staticmethod
+    def _infer_recurrent_actor_kwargs(actor_weights: dict[str, torch.Tensor]) -> dict[str, int]:
+        layer_pattern = re.compile(r"^gru\.gru\.weight_ih_l(\d+)$")
+        layer_ids = [
+            int(match.group(1))
+            for key in actor_weights
+            if (match := layer_pattern.match(key)) is not None
+        ]
+        if not layer_ids:
+            raise ValueError("Could not infer recurrent actor configuration from checkpoint weights.")
+
+        hidden_size = int(actor_weights["gru.gru.weight_hh_l0"].shape[1])
+        return {
+            "hidden_size": hidden_size,
+            "num_layers": max(layer_ids) + 1,
+        }
 
     @staticmethod
     def _resolve_existing_path(path_str: str) -> Path:
@@ -238,6 +302,20 @@ class Sim2SimEvaluator:
         if not path.is_absolute():
             path = (Path.cwd() / path).resolve()
         return path
+
+    @staticmethod
+    def _build_actor_obs_log_fields(actor_obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {f"actor_obs_{key}": value for key, value in actor_obs.items()}
+
+    @staticmethod
+    def _get_actor_state_log_fields(actor_state: torch.Tensor | None) -> dict[str, float]:
+        if actor_state is None:
+            return {}
+        actor_state = actor_state.detach()
+        return {
+            "actor_state_l2": float(actor_state.norm().item()),
+            "actor_state_max_abs": float(actor_state.abs().max().item()),
+        }
 
     @classmethod
     def _infer_motion_files(
@@ -273,7 +351,7 @@ class Sim2SimEvaluator:
 
     @staticmethod
     def _infer_observation_dims(actor_weights: dict[str, torch.Tensor], actor_type: str) -> dict[str, int]:
-        if actor_type == "vanila":
+        if Sim2SimEvaluator._is_concat_actor(actor_type):
             policy_dim = actor_weights["normlizer.mean"].shape[0]
             return {"policy": policy_dim}
 
@@ -286,14 +364,63 @@ class Sim2SimEvaluator:
         }
 
     @staticmethod
+    def _infer_legacy_action_mode(
+        action_offset: torch.Tensor,
+        action_scale: torch.Tensor,
+        joint_pos_limits: torch.Tensor,
+    ) -> str:
+        lower_limits = joint_pos_limits[:, 0]
+        upper_limits = joint_pos_limits[:, 1]
+        median_offset = 0.5 * (upper_limits + lower_limits)
+        median_scale = 0.5 * (upper_limits - lower_limits)
+
+        if torch.allclose(action_offset, median_offset, atol=1e-5, rtol=1e-4) and torch.allclose(
+            action_scale, median_scale, atol=1e-5, rtol=1e-4
+        ):
+            return "median"
+
+        if torch.allclose(action_offset, torch.zeros_like(action_offset), atol=1e-6, rtol=0.0):
+            return "residual"
+
+        return "offset"
+
+    @classmethod
+    def _resolve_action_mode(
+        cls,
+        checkpoint_weights: dict,
+        action_mode: object | None,
+        action_offset: torch.Tensor,
+        action_scale: torch.Tensor,
+        joint_pos_limits: torch.Tensor,
+    ) -> tuple[str, str]:
+        if action_mode is not None:
+            return cls._normalize_action_mode(action_mode), "argument"
+
+        for key in ("action_mode", "action_mod"):
+            checkpoint_action_mode = checkpoint_weights.get(key)
+            if checkpoint_action_mode is not None:
+                return cls._normalize_action_mode(checkpoint_action_mode), f"checkpoint:{key}"
+
+        return cls._infer_legacy_action_mode(action_offset, action_scale, joint_pos_limits), "inferred"
+
+    @staticmethod
     def _build_actor(
         obs_dims: dict[str, int],
         actor_type: str,
         action_dim: int,
         adain_res_blocks: int,
+        actor_kwargs: dict[str, int] | None = None,
     ) -> torch.nn.Module:
+        actor_kwargs = actor_kwargs or {}
         if actor_type == "vanila":
             return VanilaActor(obs_dims["policy"], action_dim)
+        if actor_type == "recurrent":
+            return RecurrentActor(
+                obs_dims["policy"],
+                action_dim,
+                hidden_size=int(actor_kwargs.get("hidden_size", RecurrentActor.DEFAULT_HIDDEN_SIZE)),
+                num_layers=int(actor_kwargs.get("num_layers", RecurrentActor.DEFAULT_NUM_LAYERS)),
+            )
         if actor_type == "split_encoder":
             return SplitEncoderActor(obs_dims["robot"], obs_dims["motion"], action_dim)
         if actor_type == "adain":
@@ -378,6 +505,44 @@ class Sim2SimEvaluator:
             ).item(),
         }
 
+    @classmethod
+    def _build_debug_step_payload(
+        cls,
+        action_dim: int,
+        flat_obs: torch.Tensor,
+        actor_obs: dict[str, torch.Tensor],
+        action: torch.Tensor,
+        metrics: dict[str, float],
+        sim_target_pos,
+        sim_ctrl,
+        sim_qpos,
+        sim_qvel,
+        actor_state: torch.Tensor | None = None,
+        sim_motion_time: float | None = None,
+    ) -> dict[str, object]:
+        obs_parts = cls._parse_sim2sim_obs(flat_obs, action_dim)
+        payload: dict[str, object] = {
+            "obs_target_projected_gravity": obs_parts["target_projected_gravity"],
+            "obs_target_joint_pos": obs_parts["target_joint_pos"],
+            "obs_target_joint_vel": obs_parts["target_joint_vel"],
+            "obs_robot_projected_gravity": obs_parts["robot_projected_gravity"],
+            "obs_base_ang_vel": obs_parts["base_ang_vel"],
+            "obs_robot_joint_pos": obs_parts["robot_joint_pos"],
+            "obs_robot_joint_vel": obs_parts["robot_joint_vel"],
+            "obs_previous_action": obs_parts["previous_action"],
+            "action": action,
+            "sim_target_pos": sim_target_pos,
+            "sim_ctrl": sim_ctrl,
+            "sim_qpos": sim_qpos,
+            "sim_qvel": sim_qvel,
+            **metrics,
+        }
+        if sim_motion_time is not None:
+            payload["sim_motion_time"] = sim_motion_time
+        payload.update(cls._build_actor_obs_log_fields(actor_obs))
+        payload.update(cls._get_actor_state_log_fields(actor_state))
+        return payload
+
     def __init__(
         self,
         checkpoint_path: str,
@@ -387,6 +552,7 @@ class Sim2SimEvaluator:
         simulation_dt: float = 1 / 200,
         decimation: int = 4,
         device: str = "cpu",
+        action_mode: str | None = None,
         root_name: str = "pelvis",
         render: bool = False,
         random_start: bool = False,
@@ -400,6 +566,7 @@ class Sim2SimEvaluator:
         video_fps: int | None = None,
         video_width: int = DEFAULT_VIDEO_WIDTH,
         video_height: int = DEFAULT_VIDEO_HEIGHT,
+        log_dir: str | None = None,
     ):
         if num_steps < 1:
             raise ValueError(f"num_steps must be positive, got {num_steps}.")
@@ -424,6 +591,7 @@ class Sim2SimEvaluator:
 
         weights = torch.load(self.checkpoint_path, map_location="cpu")
         self.actor_type = self._normalize_actor_type(actor_type or weights.get("actor_type"))
+        self.is_recurrent_actor = self._is_recurrent_actor(self.actor_type)
         actor_weights = weights["actor"]
         actor_kwargs = dict(weights.get("actor_kwargs", {}))
 
@@ -438,15 +606,32 @@ class Sim2SimEvaluator:
                 actor_block_count = self._normalize_adain_res_blocks(
                     actor_kwargs.get("num_blocks", self._infer_adain_res_blocks(actor_weights))
                 )
+            actor_kwargs = {"num_blocks": actor_block_count}
+        elif self.actor_type == "recurrent":
+            inferred_actor_kwargs = self._infer_recurrent_actor_kwargs(actor_weights)
+            actor_kwargs = {
+                "hidden_size": int(actor_kwargs.get("hidden_size", inferred_actor_kwargs["hidden_size"])),
+                "num_layers": int(actor_kwargs.get("num_layers", inferred_actor_kwargs["num_layers"])),
+            }
+        else:
+            actor_kwargs = {}
 
         self.actor = self._build_actor(
             self.obs_dims,
             self.actor_type,
             self.action_dim,
             actor_block_count,
+            actor_kwargs=actor_kwargs,
         ).to(self.device)
         self.actor.load_state_dict(actor_weights)
         self.actor.eval()
+        self.actor_kwargs = actor_kwargs
+        self.actor_state = (
+            self.actor.get_initial_state(1, device=self.device)
+            if self.is_recurrent_actor
+            else None
+        )
+        self.actor_episode_starts = torch.ones(1, dtype=torch.bool, device=self.device)
 
         self.motion_files = self._infer_motion_files(
             self.checkpoint_path,
@@ -463,6 +648,7 @@ class Sim2SimEvaluator:
         self.camera_azimuth = camera_azimuth
         self.camera_elevation = camera_elevation
         self.video_dir = self._resolve_output_path(video_dir) if video_dir is not None else None
+        self.log_dir = self._resolve_output_path(log_dir) if log_dir is not None else None
         self.video_fps = video_fps or max(1, round(1.0 / (self.simulation_dt * self.decimation)))
         self.video_width = video_width
         self.video_height = video_height
@@ -472,6 +658,13 @@ class Sim2SimEvaluator:
         self.joint_pos_limits = weights["joint_pos_limits"].detach().cpu()
         self.action_offset = weights["action_offset"].detach().cpu()
         self.action_scale = weights["action_scale"].detach().cpu()
+        self.action_mode, self.action_mode_source = self._resolve_action_mode(
+            weights,
+            action_mode,
+            self.action_offset,
+            self.action_scale,
+            self.joint_pos_limits,
+        )
 
     def _sample_start_time(self, env: MujocoEnv) -> float:
         if not self.random_start:
@@ -539,6 +732,15 @@ class Sim2SimEvaluator:
         filename = f"{self.checkpoint_path.stem}_{motion_index:02d}_{safe_motion_stem}.mp4"
         return self.video_dir / filename
 
+    def _build_log_prefix(self, motion_file: str, motion_index: int) -> Path | None:
+        if self.log_dir is None:
+            return None
+
+        motion_stem = Path(motion_file).stem
+        safe_motion_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", motion_stem)
+        filename = f"{self.checkpoint_path.stem}_{motion_index:02d}_{safe_motion_stem}"
+        return self.log_dir / filename
+
     def _build_replay_camera(self, env: MujocoEnv, motion_file: str, motion_index: int) -> ReplayCameraRecorder | None:
         if not self.render and self.video_dir is None:
             return None
@@ -568,6 +770,7 @@ class Sim2SimEvaluator:
             expert_motion_file=motion_file,
             root_name=self.root_name,
             render=self.render,
+            action_mode=self.action_mode,
         )
 
     def _get_actor_observation(self, flat_obs: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -580,7 +783,7 @@ class Sim2SimEvaluator:
         if "robot" in self.obs_dims and robot_obs.numel() != self.obs_dims["robot"]:
             raise ValueError(f"Expected robot observation dim {self.obs_dims['robot']}, got {robot_obs.numel()}.")
 
-        if self.actor_type == "vanila":
+        if self._is_concat_actor(self.actor_type):
             policy_obs = torch.cat((motion_obs, robot_obs), dim=-1)
             return {"obs": policy_obs.unsqueeze(0).to(self.device)}
 
@@ -591,10 +794,25 @@ class Sim2SimEvaluator:
 
     @torch.no_grad()
     def get_action(self, obs_batch: dict[str, torch.Tensor], determine: bool = True) -> torch.Tensor:
-        actor_step: StochasticContinuousPolicyStep = self.actor(obs_batch)
+        if self.is_recurrent_actor:
+            actor_output = self.actor(
+                obs_batch,
+                initial_state=self.actor_state,
+                episode_starts=self.actor_episode_starts,
+            )
+        else:
+            actor_output = self.actor(obs_batch)
+
+        actor_step, next_state = self._unpack_actor_output(actor_output)
         if determine:
-            return actor_step.mean
-        return actor_step.action
+            action = actor_step.mean
+        else:
+            action = actor_step.action
+
+        if self.is_recurrent_actor:
+            self.actor_state = next_state
+
+        return action
 
     def _eval_motion_file(self, motion_file: str, motion_index: int) -> tuple[int, dict[str, float], Path | None, float]:
         env = self._build_env(motion_file)
@@ -602,32 +820,83 @@ class Sim2SimEvaluator:
         steps_run = 0
         replay_camera = None
         start_time = 0.0
+        logger = RolloutDebugLogger(self._build_log_prefix(motion_file, motion_index))
+        error_message: str | None = None
 
         try:
             start_time = self._sample_start_time(env)
             obs = self._reset_env(env, start_time)
+            if self.is_recurrent_actor:
+                self.actor_state = self.actor.get_initial_state(1, device=self.device)
+                self.actor_episode_starts = torch.ones(1, dtype=torch.bool, device=self.device)
             replay_camera = self._build_replay_camera(env, motion_file, motion_index)
 
             if replay_camera is not None:
                 replay_camera.render_viewer()
                 replay_camera.capture_frame()
 
-            for _ in range(self.num_steps):
-                actor_obs = self._get_actor_observation(obs)
+            for step_idx in range(self.num_steps):
+                current_obs = obs
+                actor_obs = self._get_actor_observation(current_obs)
+                actor_state_before_step = self.actor_state if self.is_recurrent_actor else None
                 action = self.get_action(actor_obs, determine=True).squeeze(0).detach().cpu()
                 obs = env.step(action)
+                if self.is_recurrent_actor:
+                    self.actor_episode_starts = torch.zeros(1, dtype=torch.bool, device=self.device)
 
                 if replay_camera is not None:
                     replay_camera.capture_frame()
 
-                for key, value in self._extract_metrics(obs, self.action_dim).items():
+                step_metrics = self._extract_metrics(obs, self.action_dim)
+                for key, value in step_metrics.items():
                     metrics[key] += value
+                logger.log_step(
+                    step_idx,
+                    self._build_debug_step_payload(
+                        self.action_dim,
+                        flat_obs=current_obs,
+                        actor_obs=actor_obs,
+                        action=action,
+                        metrics=step_metrics,
+                        sim_target_pos=env.target_pos,
+                        sim_ctrl=env.mj_data.ctrl,
+                        sim_qpos=env.mj_data.qpos,
+                        sim_qvel=env.mj_data.qvel,
+                        actor_state=actor_state_before_step,
+                        sim_motion_time=float(env.times.item()),
+                    ),
+                )
 
                 steps_run += 1
 
                 if self.render and env.mj_viewer is None:
                     break
+        except Exception as exc:
+            error_message = repr(exc)
+            raise
         finally:
+            log_paths = logger.finish(
+                {
+                    "checkpoint": str(self.checkpoint_path),
+                    "actor_type": self.actor_type,
+                    "actor_kwargs": self.actor_kwargs,
+                    "action_mode": self.action_mode,
+                    "action_mode_source": self.action_mode_source,
+                    "motion_file": motion_file,
+                    "motion_index": motion_index,
+                    "start_time": start_time,
+                    "num_steps_requested": self.num_steps,
+                    "num_steps_executed": steps_run,
+                    "joint_pos_mae_mean": (metrics["joint_pos_mae"] / steps_run) if steps_run else None,
+                    "joint_vel_mae_mean": (metrics["joint_vel_mae"] / steps_run) if steps_run else None,
+                    "gravity_mae_mean": (metrics["gravity_mae"] / steps_run) if steps_run else None,
+                    "error": error_message,
+                }
+            )
+            if log_paths is not None:
+                npz_path, json_path = log_paths
+                print(f"debug_log_npz: {npz_path}")
+                print(f"debug_log_json: {json_path}")
             if replay_camera is not None:
                 replay_camera.close()
             env.close()
@@ -649,6 +918,8 @@ class Sim2SimEvaluator:
         print(f"checkpoint: {self.checkpoint_path}")
         print(f"motion_label: {self.motion_name}")
         print(f"actor_type: {self.actor_type}")
+        print(f"action_mode: {self.action_mode}")
+        print(f"action_mode_source: {self.action_mode_source}")
         print(f"random_start: {self.random_start}")
         if self.random_start:
             print(f"random_seed: {self.seed}")
@@ -692,6 +963,7 @@ def main():
         simulation_dt=args.simulation_dt,
         decimation=args.decimation,
         device=args.device,
+        action_mode=args.action_mode,
         root_name=args.root_name,
         render=args.render,
         random_start=args.random_start,
@@ -704,6 +976,7 @@ def main():
         video_fps=args.video_fps,
         video_width=args.video_width,
         video_height=args.video_height,
+        log_dir=args.log_dir,
     )
     evaluator.eval()
 

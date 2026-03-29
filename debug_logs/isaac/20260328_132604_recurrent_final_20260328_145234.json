@@ -1,0 +1,38 @@
+{
+  "actor_kwargs": {
+    "hidden_size": 512,
+    "num_layers": 1
+  },
+  "actor_type": "recurrent",
+  "checkpoint": "/home/xdang/Desktop/GMTP/20260328_132604_recurrent_final.pth",
+  "error": null,
+  "excluded_npz_keys": {},
+  "first_done_step": 359,
+  "info_metadata": {},
+  "json_path": "/home/xdang/Desktop/GMTP/debug_logs/isaac/20260328_132604_recurrent_final_20260328_145234.json",
+  "logged_keys": [
+    "action",
+    "actor_obs_obs",
+    "actor_state_l2",
+    "actor_state_max_abs",
+    "done",
+    "obs_motion",
+    "obs_privilege",
+    "obs_robot",
+    "reward",
+    "step",
+    "terminate",
+    "timeout"
+  ],
+  "motion_files": [
+    "/home/xdang/Desktop/GMTP/env/assests/120_01_stageii.npz"
+  ],
+  "npz_path": "/home/xdang/Desktop/GMTP/debug_logs/isaac/20260328_132604_recurrent_final_20260328_145234.npz",
+  "num_logged_steps": 1000,
+  "num_steps_executed": 1000,
+  "num_steps_requested": 1000,
+  "reward_max": 0.09788433462381363,
+  "reward_mean": 0.09049562965333462,
+  "reward_min": 0.01738981157541275,
+  "reward_sum": 90.49562965333462
+}
