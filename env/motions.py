@@ -7,7 +7,7 @@ MOTION_ASSET_DIR = PROJECT_ROOT / "env" / "assests"
 
 DEFAULT_EXPERIMENT_MOTION_FILES = (
     #"env/assests/test.npz"
-    "env/assests/115_06_stageii.npz",
+    "env/assests/120_01_stageii.npz",
     #"env/assests/05_01_stageii.npz",
     #"env/assests/05_05_stageii.npz",
     #"env/assests/05_06_stageii.npz",

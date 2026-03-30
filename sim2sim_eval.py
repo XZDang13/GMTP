@@ -5,10 +5,11 @@ from pathlib import Path
 
 import imageio.v2 as imageio
 import mujoco
+import numpy as np
 import torch
 
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
-from Ref2Act.sim2sim import MujocoEnv
+from Ref2Act.sim2sim import MujocoEnv, quat_rotate_inverse
 
 from debug_log import RolloutDebugLogger
 from env.motions import DEFAULT_EXPERIMENT_MOTION_FILES, motion_label, resolve_motion_files
@@ -22,6 +23,38 @@ DEFAULT_CAMERA_AZIMUTH = 135.0
 DEFAULT_CAMERA_ELEVATION = -20.0
 DEFAULT_VIDEO_WIDTH = 1280
 DEFAULT_VIDEO_HEIGHT = 720
+DEFAULT_ROOT_NAME = "torso_link"
+DEFAULT_ANCHOR_BODY_NAME = "torso_link"
+
+
+def _quat_conjugate(quat: torch.Tensor) -> torch.Tensor:
+    return torch.cat((quat[:1], -quat[1:]), dim=0)
+
+
+def _quat_inverse(quat: torch.Tensor) -> torch.Tensor:
+    return _quat_conjugate(quat) / torch.dot(quat, quat)
+
+
+def _quat_mul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    w1, x1, y1, z1 = lhs
+    w2, x2, y2, z2 = rhs
+    return torch.stack(
+        (
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        )
+    )
+
+
+def _quat_rotate(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    quat_w = quat[0]
+    quat_vec = quat[1:4]
+    a = vec * (2.0 * quat_w**2 - 1.0)
+    b = torch.cross(quat_vec, vec, dim=-1) * quat_w * 2.0
+    c = quat_vec * (torch.dot(quat_vec, vec)) * 2.0
+    return a + b + c
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -38,7 +71,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Reference motion .npz file(s) used by sim2sim. Defaults to checkpoint metadata or the walk/runing/jump experiment set.",
     )
-    parser.add_argument("--num-steps", type=int, default=1000)
+    parser.add_argument("--num-steps", type=int, default=2000)
     parser.add_argument("--simulation-dt", type=float, default=1 / 200)
     parser.add_argument("--decimation", type=int, default=4)
     parser.add_argument("--device", default="cpu")
@@ -47,7 +80,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override checkpoint action mode: absolute, median, offset, or residual.",
     )
-    parser.add_argument("--root-name", default="pelvis")
+    parser.add_argument(
+        "--root-name",
+        default=DEFAULT_ROOT_NAME,
+        help="Reference root link used to initialize the MuJoCo free body. Defaults to Ref2Act's current G1 root link.",
+    )
+    parser.add_argument(
+        "--anchor-body-name",
+        default=DEFAULT_ANCHOR_BODY_NAME,
+        help="Reference/robot body used for policy observations. Defaults to Ref2Act's current G1 anchor body.",
+    )
     parser.add_argument("--render", action="store_true")
     parser.add_argument(
         "--random-start",
@@ -63,7 +105,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--camera-track-body",
         default=None,
-        help="MuJoCo body name to follow. Defaults to --root-name.",
+        help="MuJoCo body name to follow. Defaults to --anchor-body-name.",
     )
     parser.add_argument("--camera-distance", type=float, default=DEFAULT_CAMERA_DISTANCE)
     parser.add_argument("--camera-azimuth", type=float, default=DEFAULT_CAMERA_AZIMUTH)
@@ -435,6 +477,78 @@ class Sim2SimEvaluator:
         raise ValueError(f"Unsupported actor type '{actor_type}'.")
 
     @staticmethod
+    def _resolve_motion_body_index(env: MujocoEnv, body_name: str) -> int:
+        try:
+            return env.motion_lib.body_names.index(body_name)
+        except ValueError as exc:
+            raise ValueError(f"Motion body '{body_name}' does not exist in the loaded motion clip.") from exc
+
+    @staticmethod
+    def _resolve_mujoco_body_id(model: mujoco.MjModel, body_name: str) -> int:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id == -1:
+            raise ValueError(f"MuJoCo body '{body_name}' does not exist in the robot model.")
+        return body_id
+
+    @staticmethod
+    def _resolve_free_joint(model: mujoco.MjModel) -> tuple[slice, slice, int]:
+        for joint_id in range(model.njnt):
+            if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+                qpos_adr = int(model.jnt_qposadr[joint_id])
+                dof_adr = int(model.jnt_dofadr[joint_id])
+                body_id = int(model.jnt_bodyid[joint_id])
+                return slice(qpos_adr, qpos_adr + 7), slice(dof_adr, dof_adr + 6), body_id
+        raise ValueError("MuJoCo model does not contain a free joint for the floating base.")
+
+    @staticmethod
+    def _get_body_spatial_velocity(env: MujocoEnv, body_id: int) -> torch.Tensor:
+        velocity = np.zeros(6, dtype=np.float64)
+        mujoco.mj_objectVelocity(
+            env.mj_model,
+            env.mj_data,
+            mujoco.mjtObj.mjOBJ_BODY,
+            body_id,
+            velocity,
+            0,
+        )
+        return torch.from_numpy(velocity.astype(np.float32))
+
+    def _sample_reference_motion(self, env: MujocoEnv):
+        return env.motion_lib.sample_motion(motion_ids=env.motion_id, times=env.times)
+
+    def _build_sim2sim_flat_obs(self, env: MujocoEnv, reference_motion=None) -> torch.Tensor:
+        if reference_motion is None:
+            reference_motion = self._sample_reference_motion(env)
+
+        anchor_motion_index = self._resolve_motion_body_index(env, self.anchor_body_name)
+        anchor_body_id = self._resolve_mujoco_body_id(env.mj_model, self.anchor_body_name)
+
+        target_joint_pos = reference_motion["joint_pos"].squeeze(0).detach().cpu().clone()
+        target_joint_vel = reference_motion["joint_vel"].squeeze(0).detach().cpu().clone()
+        target_anchor_quat = reference_motion["body_quaternions"].squeeze(0)[anchor_motion_index].detach().cpu().clone()
+        target_projected_gravity = quat_rotate_inverse(target_anchor_quat, env.gravity_vector)
+
+        robot_anchor_quat = torch.from_numpy(env.mj_data.xquat[anchor_body_id].copy()).float()
+        robot_projected_gravity = quat_rotate_inverse(robot_anchor_quat, env.gravity_vector)
+        anchor_ang_vel = self._get_body_spatial_velocity(env, anchor_body_id)[:3]
+        robot_joint_pos = env.get_joint_pos().clone()
+        robot_joint_vel = env.get_joint_vel().clone()
+        previous_action = env.previous_action.clone()
+
+        return torch.cat(
+            (
+                target_projected_gravity,
+                target_joint_pos,
+                target_joint_vel,
+                robot_projected_gravity,
+                anchor_ang_vel,
+                robot_joint_pos,
+                robot_joint_vel,
+                previous_action,
+            )
+        )
+
+    @staticmethod
     def _parse_sim2sim_obs(flat_obs: torch.Tensor, action_dim: int) -> dict[str, torch.Tensor]:
         expected_dim = action_dim * 5 + 9
         if flat_obs.ndim != 1:
@@ -456,7 +570,7 @@ class Sim2SimEvaluator:
         robot_projected_gravity = flat_obs[offset : offset + 3]
         offset += 3
 
-        base_ang_vel = flat_obs[offset : offset + 3]
+        anchor_ang_vel = flat_obs[offset : offset + 3]
         offset += 3
 
         robot_joint_pos = flat_obs[offset : offset + action_dim]
@@ -472,7 +586,7 @@ class Sim2SimEvaluator:
             "robot_obs": torch.cat(
                 (
                     robot_projected_gravity,
-                    base_ang_vel,
+                    anchor_ang_vel,
                     robot_joint_pos,
                     robot_joint_vel,
                     previous_action,
@@ -483,7 +597,7 @@ class Sim2SimEvaluator:
             "target_joint_pos": target_joint_pos,
             "target_joint_vel": target_joint_vel,
             "robot_projected_gravity": robot_projected_gravity,
-            "base_ang_vel": base_ang_vel,
+            "anchor_ang_vel": anchor_ang_vel,
             "robot_joint_pos": robot_joint_pos,
             "robot_joint_vel": robot_joint_vel,
             "previous_action": previous_action,
@@ -526,7 +640,7 @@ class Sim2SimEvaluator:
             "obs_target_joint_pos": obs_parts["target_joint_pos"],
             "obs_target_joint_vel": obs_parts["target_joint_vel"],
             "obs_robot_projected_gravity": obs_parts["robot_projected_gravity"],
-            "obs_base_ang_vel": obs_parts["base_ang_vel"],
+            "obs_anchor_ang_vel": obs_parts["anchor_ang_vel"],
             "obs_robot_joint_pos": obs_parts["robot_joint_pos"],
             "obs_robot_joint_vel": obs_parts["robot_joint_vel"],
             "obs_previous_action": obs_parts["previous_action"],
@@ -548,12 +662,13 @@ class Sim2SimEvaluator:
         checkpoint_path: str,
         actor_type: str | None = None,
         motion_files: list[str] | None = None,
-        num_steps: int = 1000,
+        num_steps: int = 4000,
         simulation_dt: float = 1 / 200,
         decimation: int = 4,
         device: str = "cpu",
         action_mode: str | None = None,
-        root_name: str = "pelvis",
+        root_name: str = DEFAULT_ROOT_NAME,
+        anchor_body_name: str = DEFAULT_ANCHOR_BODY_NAME,
         render: bool = False,
         random_start: bool = False,
         seed: int | None = None,
@@ -643,7 +758,8 @@ class Sim2SimEvaluator:
         self.simulation_dt = simulation_dt
         self.decimation = decimation
         self.root_name = root_name
-        self.camera_track_body = camera_track_body or root_name
+        self.anchor_body_name = anchor_body_name
+        self.camera_track_body = camera_track_body or anchor_body_name
         self.camera_distance = camera_distance
         self.camera_azimuth = camera_azimuth
         self.camera_elevation = camera_elevation
@@ -687,30 +803,53 @@ class Sim2SimEvaluator:
         env.times = torch.tensor([start_time], dtype=torch.float32)
         env.n_steps = 0
 
-        reference_motion = env.motion_lib.sample_motion(motion_ids=env.motion_id, times=env.times)
+        reference_motion = self._sample_reference_motion(env)
+        joint_positions = reference_motion["joint_pos"].squeeze(0).detach().cpu().numpy()[env.isaac2mujoco]
+        joint_velocities = reference_motion["joint_vel"].squeeze(0).detach().cpu().numpy()[env.isaac2mujoco]
 
-        joint_positions = reference_motion["joint_pos"].squeeze(0).numpy()[env.isaac2mujoco]
-        joint_velocities = reference_motion["joint_vel"].squeeze(0).numpy()[env.isaac2mujoco]
-        body_positions = reference_motion["body_positions"].squeeze(0).numpy()
-        body_rotations = reference_motion["body_quaternions"].squeeze(0).numpy()
-        body_linear_velocities = reference_motion["body_linear_velocities"].squeeze(0).numpy()
-        body_angular_velocities = reference_motion["body_angular_velocities"].squeeze(0).numpy()
+        root_motion_index = self._resolve_motion_body_index(env, self.root_name)
+        root_body_id = self._resolve_mujoco_body_id(env.mj_model, self.root_name)
+        free_qpos_slice, free_qvel_slice, _ = self._resolve_free_joint(env.mj_model)
 
-        root_pos = body_positions[env.root_index]
-        root_pos[2] += 0.05
-        root_quat = body_rotations[env.root_index]
-        root_linear_vel = body_linear_velocities[env.root_index]
-        root_ang_vel = body_angular_velocities[env.root_index]
+        desired_root_pos = reference_motion["body_positions"].squeeze(0)[root_motion_index].detach().cpu().clone()
+        desired_root_pos[2] += 0.05
+        desired_root_quat = reference_motion["body_quaternions"].squeeze(0)[root_motion_index].detach().cpu().clone()
+        desired_root_lin_vel = reference_motion["body_linear_velocities"].squeeze(0)[root_motion_index].detach().cpu().numpy()
+        desired_root_ang_vel = reference_motion["body_angular_velocities"].squeeze(0)[root_motion_index].detach().cpu().numpy()
+        desired_root_spatial = np.concatenate((desired_root_ang_vel, desired_root_lin_vel), axis=0)
 
-        env.mj_data.qpos[0] = 0.0
-        env.mj_data.qpos[1] = 0.0
-        env.mj_data.qpos[2] = root_pos[2]
-        env.mj_data.qpos[3:7] = root_quat
-        env.mj_data.qpos[7:] = joint_positions
+        env.mj_data.qpos[:] = 0.0
+        env.mj_data.qvel[:] = 0.0
+        env.mj_data.qpos[free_qpos_slice.start + 3] = 1.0
+        env.mj_data.qpos[free_qpos_slice.stop :] = joint_positions
+        mujoco.mj_forward(env.mj_model, env.mj_data)
 
-        env.mj_data.qvel[:3] = root_linear_vel
-        env.mj_data.qvel[3:6] = root_ang_vel
-        env.mj_data.qvel[6:] = joint_velocities
+        root_local_pos = torch.from_numpy(env.mj_data.xpos[root_body_id].copy()).float()
+        root_local_quat = torch.from_numpy(env.mj_data.xquat[root_body_id].copy()).float()
+        base_quat = _quat_mul(desired_root_quat, _quat_inverse(root_local_quat))
+        base_pos = desired_root_pos - _quat_rotate(base_quat, root_local_pos)
+
+        env.mj_data.qpos[:] = 0.0
+        env.mj_data.qvel[:] = 0.0
+        env.mj_data.qpos[free_qpos_slice.start : free_qpos_slice.start + 3] = base_pos.numpy()
+        env.mj_data.qpos[free_qpos_slice.start + 3 : free_qpos_slice.stop] = base_quat.numpy()
+        env.mj_data.qpos[free_qpos_slice.stop :] = joint_positions
+        env.mj_data.qvel[free_qvel_slice.stop :] = joint_velocities
+        mujoco.mj_forward(env.mj_model, env.mj_data)
+
+        joint_velocity_only = self._get_body_spatial_velocity(env, root_body_id).numpy()
+        free_to_root_velocity = np.zeros((6, 6), dtype=np.float64)
+        for i in range(6):
+            env.mj_data.qvel[:] = 0.0
+            env.mj_data.qvel[free_qvel_slice.start + i] = 1.0
+            mujoco.mj_forward(env.mj_model, env.mj_data)
+            free_to_root_velocity[:, i] = self._get_body_spatial_velocity(env, root_body_id).numpy()
+
+        free_velocity = np.linalg.solve(free_to_root_velocity, desired_root_spatial - joint_velocity_only)
+
+        env.mj_data.qvel[:] = 0.0
+        env.mj_data.qvel[free_qvel_slice] = free_velocity
+        env.mj_data.qvel[free_qvel_slice.stop :] = joint_velocities
 
         mujoco.mj_forward(env.mj_model, env.mj_data)
 
@@ -719,7 +858,7 @@ class Sim2SimEvaluator:
         else:
             env.mj_viewer = None
 
-        obs = env.get_obs(advance_time=False)
+        obs = self._build_sim2sim_flat_obs(env, reference_motion=reference_motion)
         env.target_pos = reference_motion["joint_pos"].squeeze(0).clone()
         return obs
 
@@ -840,7 +979,8 @@ class Sim2SimEvaluator:
                 actor_obs = self._get_actor_observation(current_obs)
                 actor_state_before_step = self.actor_state if self.is_recurrent_actor else None
                 action = self.get_action(actor_obs, determine=True).squeeze(0).detach().cpu()
-                obs = env.step(action)
+                env.step(action)
+                obs = self._build_sim2sim_flat_obs(env)
                 if self.is_recurrent_actor:
                     self.actor_episode_starts = torch.zeros(1, dtype=torch.bool, device=self.device)
 
@@ -920,6 +1060,8 @@ class Sim2SimEvaluator:
         print(f"actor_type: {self.actor_type}")
         print(f"action_mode: {self.action_mode}")
         print(f"action_mode_source: {self.action_mode_source}")
+        print(f"root_name: {self.root_name}")
+        print(f"anchor_body_name: {self.anchor_body_name}")
         print(f"random_start: {self.random_start}")
         if self.random_start:
             print(f"random_seed: {self.seed}")
@@ -965,6 +1107,7 @@ def main():
         device=args.device,
         action_mode=args.action_mode,
         root_name=args.root_name,
+        anchor_body_name=args.anchor_body_name,
         render=args.render,
         random_start=args.random_start,
         seed=args.seed,

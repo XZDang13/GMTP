@@ -686,7 +686,7 @@ class Trainer:
     def train(self):
         obs = self.initial_obs
         try:
-            for epoch in trange(4000):
+            for epoch in trange(1000):
                 obs = self.rollout(obs)
                 self.update()
 
