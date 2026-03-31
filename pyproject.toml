@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gmtp"
+version = "0.1.0"
+description = "GMTP policy experiments built on top of Ref2Act."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "RLAlg @ git+https://github.com/XZDang13/RLAlg.git",
+    "gymnasium",
+    "imageio",
+    "numpy",
+    "torch",
+]
+
+[project.optional-dependencies]
+sim2sim = [
+    "mujoco",
+    "mujoco-python-viewer",
+]
+
+[project.scripts]
+gmtp = "gmtp.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gmtp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]

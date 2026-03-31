@@ -3,3 +3,7 @@ __pycache__/
 *$py.class
 .vscode/
 wandb/
+src/gmtp.egg-info/
+runs/
+debug_logs/
+.pytest_cache/
