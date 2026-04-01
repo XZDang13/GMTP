@@ -10,7 +10,6 @@ import torch
 from gmtp.integrations.ref2act.motion import motion_label, motion_names, resolve_motion_files
 from gmtp.models import get_actor_kwargs, normalize_actor_type
 
-
 CHECKPOINT_VERSION = 2
 
 

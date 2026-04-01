@@ -3,7 +3,6 @@ from isaaclab.utils import configclass
 from .compat import load_env_cfg_symbols
 from .motion import DEFAULT_EXPERIMENT_MOTION_FILES, resolve_motion_files
 
-
 _REF2ACT = load_env_cfg_symbols()
 ActionMod = _REF2ACT.ActionMod
 G1MotionTrackingEnvCfg = _REF2ACT.G1MotionTrackingEnvCfg

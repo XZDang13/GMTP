@@ -7,7 +7,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_REF2ACT_SRC = (PROJECT_ROOT.parent / "Ref2Act" / "src").resolve()
 
@@ -81,16 +80,16 @@ def load_env_cfg_symbols() -> EnvCfgSymbols:
     g1_module = _import_module("ref2act.robots.g1", "Ref2Act.config.env_cfg")
     sampling_module = _import_module("ref2act.motion", "Ref2Act.sampler")
     return EnvCfgSymbols(
-        ActionMod=getattr(action_module, "ActionMod"),
-        G1MotionTrackingEnvCfg=getattr(g1_module, "G1MotionTrackingEnvCfg"),
-        G1TrainingEventCfg=getattr(g1_module, "G1TrainingEventCfg"),
-        SamplingStrategy=getattr(sampling_module, "SamplingStrategy"),
+        ActionMod=action_module.ActionMod,
+        G1MotionTrackingEnvCfg=g1_module.G1MotionTrackingEnvCfg,
+        G1TrainingEventCfg=g1_module.G1TrainingEventCfg,
+        SamplingStrategy=sampling_module.SamplingStrategy,
     )
 
 
 def load_mujoco_symbols() -> MujocoSymbols:
     mujoco_module = _import_module("ref2act.bridges.mujoco.env", "Ref2Act.sim2sim")
     return MujocoSymbols(
-        MujocoEnv=getattr(mujoco_module, "MujocoEnv"),
-        quat_rotate_inverse=getattr(mujoco_module, "quat_rotate_inverse"),
+        MujocoEnv=mujoco_module.MujocoEnv,
+        quat_rotate_inverse=mujoco_module.quat_rotate_inverse,
     )

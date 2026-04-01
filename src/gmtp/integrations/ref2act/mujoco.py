@@ -6,7 +6,6 @@ import torch
 
 from .compat import load_mujoco_symbols
 
-
 DEFAULT_ROOT_NAME = "torso_link"
 DEFAULT_ANCHOR_BODY_NAME = "torso_link"
 

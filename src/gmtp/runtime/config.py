@@ -8,7 +8,7 @@ class RunConfig:
     actor_type: str = "vanila"
     adain_res_blocks: int = 3
     rollout_steps: int = 20
-    num_updates: int = 2000
+    num_updates: int = 1000
     checkpoint_interval: int = 4000
     output_root: str = "runs"
     run_name: str | None = None

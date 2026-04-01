@@ -7,3 +7,4 @@ src/gmtp.egg-info/
 runs/
 debug_logs/
 .pytest_cache/
+.ruff_cache/

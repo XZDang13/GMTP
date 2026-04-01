@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
-
-from RLAlg.normalizer import Normalizer
 from RLAlg.nn.layers import CriticHead, MLPLayer, NormPosition
 from RLAlg.nn.steps import ValueStep
+from RLAlg.normalizer import Normalizer
 
 
 class Critic(nn.Module):

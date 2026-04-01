@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MOTION_ASSET_DIR = PROJECT_ROOT / "env" / "assests"
 
 DEFAULT_EXPERIMENT_MOTION_FILES = (
-    "env/assests/115_06_stageii.npz",
+    "env/assests/05_05_stageii.npz",
+    #"env/assests/63_25_stageii.npz",
+    #"env/assests/115_06_stageii.npz",
     #"env/assests/115_02_stageii.npz",
     #"env/assests/120_01_stageii.npz",
 )

@@ -1,6 +1,4 @@
-import torch
 import torch.nn as nn
-
 from RLAlg.utils import weight_init
 
 

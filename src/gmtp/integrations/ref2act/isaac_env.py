@@ -5,7 +5,6 @@ import gymnasium
 from .env_cfg import G1MultiMotionEnv, G1MultiMotionTrainingEnv
 from .motion import resolve_motion_files
 
-
 ENV_NAME = "G1MotionTracking-v0"
 
 

@@ -4,17 +4,15 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-from tqdm import trange
-
 from RLAlg.alg.ppo import PPO
 from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
 from RLAlg.logger import MetricsTracker, WandbLogger
 from RLAlg.nn.steps import ValueStep
 from RLAlg.scheduler import KLAdaptiveLR
+from tqdm import trange
 
 from gmtp.integrations.ref2act.motion import motion_label, motion_names
 from gmtp.models import (
-    ActorType,
     Critic,
     RecurrentActor,
     build_actor,
@@ -31,7 +29,7 @@ from gmtp.models import (
 )
 from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
 from gmtp.runtime.config import RunConfig
-from gmtp.runtime.io import RunPaths, build_run_paths, write_json
+from gmtp.runtime.io import build_run_paths, write_json
 from gmtp.runtime.observations import infer_env_observation_dims
 
 
@@ -79,7 +77,7 @@ class OptimizerCollection(torch.optim.Optimizer):
         if len(optimizer_states) != len(self.optimizers):
             raise ValueError(f"Expected {len(self.optimizers)} optimizer states, got {len(optimizer_states)}.")
 
-        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
+        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states, strict=True):
             optimizer.load_state_dict(optimizer_state)
 
         self.param_groups = [group for optimizer in self.optimizers for group in optimizer.param_groups]

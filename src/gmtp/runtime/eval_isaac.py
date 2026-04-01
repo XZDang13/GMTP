@@ -7,8 +7,8 @@ from pathlib import Path
 import torch
 
 from gmtp.integrations.ref2act import DEFAULT_EXPERIMENT_MOTION_FILES, infer_motion_files_from_checkpoint
-from gmtp.models import RecurrentActor, get_actor_observation, is_recurrent_actor, unpack_actor_output
-from gmtp.runtime.checkpoints import CheckpointV2, load_checkpoint_v2
+from gmtp.models import get_actor_observation, is_recurrent_actor, unpack_actor_output
+from gmtp.runtime.checkpoints import load_checkpoint_v2
 from gmtp.runtime.config import IsaacEvalConfig
 from gmtp.runtime.debug import RolloutDebugLogger
 from gmtp.runtime.io import build_run_paths, write_json
@@ -31,7 +31,11 @@ class IsaacEvalRunner:
             self.checkpoint.env,
             self.checkpoint.motion_files or DEFAULT_EXPERIMENT_MOTION_FILES,
         )
-        self.run_paths = build_run_paths(config.output_root, "eval-isaac", resolve_checkpoint_stem(self.checkpoint_path))
+        self.run_paths = build_run_paths(
+            config.output_root,
+            "eval-isaac",
+            resolve_checkpoint_stem(self.checkpoint_path),
+        )
         write_json(self.run_paths.config_path, {"command": "eval isaac", "config": self.config})
 
         from gmtp.integrations.ref2act.isaac_env import make_eval_env

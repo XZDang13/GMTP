@@ -1,9 +1,8 @@
 import torch
-
 from RLAlg.alg.ppo import PPO
 from RLAlg.buffer.replay_buffer import ReplayBuffer
 
-from gmtp.models import RecurrentActor, policy_state_from_storage, policy_state_for_storage
+from gmtp.models import RecurrentActor, policy_state_for_storage, policy_state_from_storage
 
 
 def test_recurrent_actor_forward_single_step_returns_step_and_state():

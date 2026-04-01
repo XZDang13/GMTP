@@ -5,10 +5,9 @@ from enum import StrEnum
 
 import torch
 import torch.nn as nn
-
-from RLAlg.normalizer import Normalizer
-from RLAlg.nn.layers import GRULayer, GaussianHead, MLPLayer, NormPosition
+from RLAlg.nn.layers import GaussianHead, GRULayer, MLPLayer, NormPosition
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
+from RLAlg.normalizer import Normalizer
 
 from .adain import AdaINBlock, AdaINResBlock
 

@@ -36,7 +36,6 @@ from gmtp.runtime.observations import (
 )
 from gmtp.runtime.policy import load_actor_from_checkpoint, resolve_checkpoint_stem
 
-
 DEFAULT_VIDEO_HEIGHT = 720
 DEFAULT_VIDEO_WIDTH = 1280
 
@@ -168,7 +167,11 @@ class Sim2SimEvalRunner:
         self.checkpoint = load_checkpoint_v2(self.checkpoint_path)
         self.motion_files = self._resolve_motion_files()
         self.motion_name = motion_label(self.motion_files)
-        self.run_paths = build_run_paths(config.output_root, "eval-sim2sim", resolve_checkpoint_stem(self.checkpoint_path))
+        self.run_paths = build_run_paths(
+            config.output_root,
+            "eval-sim2sim",
+            resolve_checkpoint_stem(self.checkpoint_path),
+        )
         write_json(self.run_paths.config_path, {"command": "eval sim2sim", "config": self.config})
 
         checkpoint_env = self.checkpoint.env
@@ -409,7 +412,13 @@ class Sim2SimEvalRunner:
         for motion_index, motion_file in enumerate(self.motion_files):
             env = self._build_env(motion_file)
             try:
-                motion_summaries.append(self._rollout_motion(env=env, motion_index=motion_index, motion_file=motion_file))
+                motion_summaries.append(
+                    self._rollout_motion(
+                        env=env,
+                        motion_index=motion_index,
+                        motion_file=motion_file,
+                    )
+                )
             finally:
                 env.close()
 
