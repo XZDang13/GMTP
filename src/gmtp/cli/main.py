@@ -5,13 +5,28 @@ import argparse
 from gmtp.runtime.config import IsaacEvalConfig, RunConfig, Sim2SimEvalConfig
 
 
+def _add_film_res_blocks_argument(parser: argparse.ArgumentParser, *, default) -> None:
+    parser.add_argument("--film-res-blocks", dest="film_res_blocks", type=int, default=default)
+    parser.add_argument("--adain-res-blocks", dest="film_res_blocks", type=int, help=argparse.SUPPRESS)
+
+
+def _add_film_attn_res_block_size_argument(parser: argparse.ArgumentParser, *, default) -> None:
+    parser.add_argument(
+        "--film-attn-res-block-size",
+        dest="film_attn_res_block_size",
+        type=int,
+        default=default,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gmtp", description="GMTP training and evaluation CLI.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     train_parser = subparsers.add_parser("train", help="Train a policy in Isaac Lab.")
     train_parser.add_argument("--actor-type", default="vanila")
-    train_parser.add_argument("--adain-res-blocks", type=int, default=3)
+    _add_film_res_blocks_argument(train_parser, default=3)
+    _add_film_attn_res_block_size_argument(train_parser, default=4)
     train_parser.add_argument("--rollout-steps", type=int, default=20)
     train_parser.add_argument("--num-updates", type=int, default=1000)
     train_parser.add_argument("--checkpoint-interval", type=int, default=4000)
@@ -26,7 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     isaac_parser = eval_subparsers.add_parser("isaac", help="Evaluate a checkpoint in Isaac Lab.")
     isaac_parser.add_argument("--checkpoint", required=True)
     isaac_parser.add_argument("--actor-type", default=None)
-    isaac_parser.add_argument("--adain-res-blocks", type=int, default=None)
+    _add_film_res_blocks_argument(isaac_parser, default=None)
+    _add_film_attn_res_block_size_argument(isaac_parser, default=None)
     isaac_parser.add_argument("--num-steps", type=int, default=1000)
     isaac_parser.add_argument("--progress-interval", type=int, default=50)
     isaac_parser.add_argument("--show-reference-motion", action="store_true")
@@ -37,7 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     sim2sim_parser.add_argument("--checkpoint", required=True)
     sim2sim_parser.add_argument("--motion-files", nargs="+", default=None)
     sim2sim_parser.add_argument("--actor-type", default=None)
-    sim2sim_parser.add_argument("--adain-res-blocks", type=int, default=None)
+    _add_film_res_blocks_argument(sim2sim_parser, default=None)
+    _add_film_attn_res_block_size_argument(sim2sim_parser, default=None)
     sim2sim_parser.add_argument("--num-steps", type=int, default=2000)
     sim2sim_parser.add_argument("--simulation-dt", type=float, default=1 / 200)
     sim2sim_parser.add_argument("--decimation", type=int, default=4)
@@ -63,7 +80,8 @@ def _run_train(args) -> int:
         TrainRunner(
             RunConfig(
                 actor_type=args.actor_type,
-                adain_res_blocks=args.adain_res_blocks,
+                film_res_blocks=args.film_res_blocks,
+                film_attn_res_block_size=args.film_attn_res_block_size,
                 rollout_steps=args.rollout_steps,
                 num_updates=args.num_updates,
                 checkpoint_interval=args.checkpoint_interval,
@@ -89,7 +107,8 @@ def _run_eval_isaac(args) -> int:
             IsaacEvalConfig(
                 checkpoint_path=args.checkpoint,
                 actor_type=args.actor_type,
-                adain_res_blocks=args.adain_res_blocks,
+                film_res_blocks=args.film_res_blocks,
+                film_attn_res_block_size=args.film_attn_res_block_size,
                 num_steps=args.num_steps,
                 progress_interval=args.progress_interval,
                 show_reference_motion=args.show_reference_motion,
@@ -109,7 +128,8 @@ def _run_eval_sim2sim(args) -> int:
             checkpoint_path=args.checkpoint,
             motion_files=args.motion_files,
             actor_type=args.actor_type,
-            adain_res_blocks=args.adain_res_blocks,
+            film_res_blocks=args.film_res_blocks,
+            film_attn_res_block_size=args.film_attn_res_block_size,
             num_steps=args.num_steps,
             simulation_dt=args.simulation_dt,
             decimation=args.decimation,

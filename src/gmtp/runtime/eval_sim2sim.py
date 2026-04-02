@@ -207,7 +207,8 @@ class Sim2SimEvalRunner:
             action_dim=self.action_dim,
             device=self.device,
             actor_type_override=config.actor_type,
-            adain_res_blocks=config.adain_res_blocks,
+            film_res_blocks=config.film_res_blocks,
+            film_attn_res_block_size=config.film_attn_res_block_size,
         )
         self.is_recurrent_actor = is_recurrent_actor(self.actor_type)
         self.actor_state: torch.Tensor | None = None

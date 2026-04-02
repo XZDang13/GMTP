@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from gmtp.cli.main import build_parser
-from gmtp.models import Critic, VanilaActor
+from gmtp.models import Critic, FiLMAttnResActor, VanilaActor
 from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
 from gmtp.runtime.config import IsaacEvalConfig, RunConfig, Sim2SimEvalConfig
 from gmtp.runtime.eval_isaac import IsaacEvalRunner
@@ -109,6 +109,14 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.command == "train"
     assert args.actor_type == "recurrent"
     assert args.num_updates == 5
+    assert args.film_res_blocks == 3
+    assert args.film_attn_res_block_size == 4
+
+    args = parser.parse_args(["train", "--adain-res-blocks", "6"])
+    assert args.film_res_blocks == 6
+
+    args = parser.parse_args(["train", "--film-attn-res-block-size", "5"])
+    assert args.film_attn_res_block_size == 5
 
     args = parser.parse_args(
         [
@@ -131,6 +139,7 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.action_mode == "residual"
     assert args.num_steps == 12
     assert args.save_video is False
+    assert args.film_attn_res_block_size is None
 
     args = parser.parse_args(["eval", "sim2sim", "--checkpoint", "foo.pth", "--save-video"])
     assert args.save_video is True
@@ -147,6 +156,22 @@ def test_train_runner_dry_construction(monkeypatch):
     runner = TrainRunner(RunConfig(use_wandb=False))
     assert runner.actor_type.value == "vanila"
     assert runner.motion_files[0].endswith("115_06_stageii.npz")
+    runner.env.close()
+
+
+def test_train_runner_constructs_film_attn_res_actor(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+    runner = TrainRunner(
+        RunConfig(
+            actor_type="film_attn_res",
+            film_res_blocks=4,
+            film_attn_res_block_size=2,
+            use_wandb=False,
+        )
+    )
+    assert runner.actor_type.value == "film_attn_res"
+    assert runner.actor_kwargs == {"num_blocks": 4, "attn_block_size": 2}
+    assert isinstance(runner.actor, FiLMAttnResActor)
     runner.env.close()
 
 

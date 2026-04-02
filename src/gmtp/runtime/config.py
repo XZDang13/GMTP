@@ -6,7 +6,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class RunConfig:
     actor_type: str = "vanila"
-    adain_res_blocks: int = 3
+    film_res_blocks: int = 3
+    film_attn_res_block_size: int = 3
     rollout_steps: int = 20
     num_updates: int = 1000
     checkpoint_interval: int = 4000
@@ -19,7 +20,8 @@ class RunConfig:
 class IsaacEvalConfig:
     checkpoint_path: str
     actor_type: str | None = None
-    adain_res_blocks: int | None = None
+    film_res_blocks: int | None = None
+    film_attn_res_block_size: int | None = None
     num_steps: int = 1000
     progress_interval: int = 50
     show_reference_motion: bool = False
@@ -31,7 +33,8 @@ class Sim2SimEvalConfig:
     checkpoint_path: str
     actor_type: str | None = None
     motion_files: list[str] | None = None
-    adain_res_blocks: int | None = None
+    film_res_blocks: int | None = None
+    film_attn_res_block_size: int | None = None
     num_steps: int = 2000
     simulation_dt: float = 1 / 200
     decimation: int = 4

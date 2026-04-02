@@ -8,3 +8,4 @@ runs/
 debug_logs/
 .pytest_cache/
 .ruff_cache/
+.codex

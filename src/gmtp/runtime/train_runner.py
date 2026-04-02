@@ -13,6 +13,7 @@ from tqdm import trange
 
 from gmtp.integrations.ref2act.motion import motion_label, motion_names
 from gmtp.models import (
+    ActorType,
     Critic,
     RecurrentActor,
     build_actor,
@@ -111,14 +112,7 @@ class TrainRunner:
             self.obs_dims,
             self.actor_type,
             self.cfg.action_space,
-            actor_kwargs=(
-                {
-                    "hidden_size": RecurrentActor.DEFAULT_HIDDEN_SIZE,
-                    "num_layers": RecurrentActor.DEFAULT_NUM_LAYERS,
-                }
-                if self.is_recurrent_actor
-                else None
-            ),
+            actor_kwargs=self._build_actor_kwargs(),
         ).to(self.device)
         self.actor_kwargs = get_actor_kwargs(self.actor, self.actor_type)
         self.critic = Critic(self.obs_dims["critic"]).to(self.device)
@@ -190,6 +184,21 @@ class TrainRunner:
             f"Muon={optimizer_stats['muon_tensors']} tensors / {optimizer_stats['muon_numel']} params,",
             f"AdamW={optimizer_stats['adamw_tensors']} tensors / {optimizer_stats['adamw_numel']} params",
         )
+
+    def _build_actor_kwargs(self) -> dict[str, int] | None:
+        if self.is_recurrent_actor:
+            return {
+                "hidden_size": RecurrentActor.DEFAULT_HIDDEN_SIZE,
+                "num_layers": RecurrentActor.DEFAULT_NUM_LAYERS,
+            }
+        if self.actor_type == ActorType.FILM_RES:
+            return {"num_blocks": self.config.film_res_blocks}
+        if self.actor_type == ActorType.FILM_ATTN_RES:
+            return {
+                "num_blocks": self.config.film_res_blocks,
+                "attn_block_size": self.config.film_attn_res_block_size,
+            }
+        return None
 
     @staticmethod
     def _split_optimizer_param_groups(

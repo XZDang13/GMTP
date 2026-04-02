@@ -9,7 +9,7 @@ from RLAlg.nn.layers import GaussianHead, GRULayer, MLPLayer, NormPosition
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
 from RLAlg.normalizer import Normalizer
 
-from .adain import AdaINBlock, AdaINResBlock
+from .adain import AdaINBlock, BlockAttnResFiLMStack, FiLMResBlock
 
 
 def _normalize_observation(
@@ -31,7 +31,8 @@ class ActorType(StrEnum):
     RECURRENT = "recurrent"
     SPLIT_ENCODER = "split_encoder"
     ADAIN = "adain"
-    ADAIN_RES = "adain_res"
+    FILM_RES = "film_res"
+    FILM_ATTN_RES = "film_attn_res"
 
 
 def normalize_actor_type(actor_type: str | None) -> ActorType:
@@ -46,8 +47,14 @@ def normalize_actor_type(actor_type: str | None) -> ActorType:
         "split": ActorType.SPLIT_ENCODER,
         "split_encoder": ActorType.SPLIT_ENCODER,
         "adain": ActorType.ADAIN,
-        "adain_res": ActorType.ADAIN_RES,
-        "adainres": ActorType.ADAIN_RES,
+        "adain_res": ActorType.FILM_RES,
+        "adainres": ActorType.FILM_RES,
+        "film": ActorType.FILM_RES,
+        "film_res": ActorType.FILM_RES,
+        "filmres": ActorType.FILM_RES,
+        "film_attn_res": ActorType.FILM_ATTN_RES,
+        "film_attnres": ActorType.FILM_ATTN_RES,
+        "filmattnres": ActorType.FILM_ATTN_RES,
     }
     try:
         return alias_map[normalized]
@@ -82,12 +89,21 @@ def policy_state_from_storage(policy_state: torch.Tensor, device: torch.device) 
     return policy_state.to(device).transpose(0, 1).contiguous()
 
 
-def infer_adain_res_blocks(actor_weights: dict[str, torch.Tensor]) -> int:
-    block_pattern = re.compile(r"^block_(\d+)\.")
+def infer_film_res_blocks(actor_weights: dict[str, torch.Tensor]) -> int:
+    block_pattern = re.compile(r"^(?:stack\.)?blocks\.(\d+)\.")
+    legacy_block_pattern = re.compile(r"^block_(\d+)\.")
+    block_ids = [
+        int(match.group(1)) + 1
+        for key in actor_weights
+        if (match := block_pattern.match(key)) is not None
+    ]
+    if block_ids:
+        return max(block_ids)
+
     block_ids = [
         int(match.group(1))
         for key in actor_weights
-        if (match := block_pattern.match(key)) is not None
+        if (match := legacy_block_pattern.match(key)) is not None
     ]
     return max(block_ids, default=3)
 
@@ -252,7 +268,7 @@ class AdaINActor(nn.Module):
         return self.head(x, action)
 
 
-class AdaINResActor(nn.Module):
+class FiLMResActor(nn.Module):
     def __init__(
         self,
         robot_obs_dim: int,
@@ -278,15 +294,8 @@ class AdaINResActor(nn.Module):
             MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
             MLPLayer(512, 512, nn.Identity()),
         )
-
-        for block_idx in range(self.num_blocks):
-            setattr(self, f"block_{block_idx + 1}", AdaINResBlock(512, 512))
-
+        self.blocks = nn.ModuleList([FiLMResBlock(512, 512) for _ in range(num_blocks)])
         self.head = GaussianHead(512, action_dim)
-
-    def _iter_blocks(self):
-        for block_idx in range(self.num_blocks):
-            yield getattr(self, f"block_{block_idx + 1}")
 
     def forward(
         self,
@@ -299,8 +308,70 @@ class AdaINResActor(nn.Module):
         x_robot = self.robot_encoder(robot_obs)
         x_motion = self.motion_encoder(motion_obs)
         x = x_robot
-        for block in self._iter_blocks():
-            x = block(x, x_motion)
+        for block in self.blocks:
+            dx = block(x, x_motion)
+            x = x + block.res_scale * dx
+        return self.head(x, action)
+
+
+class FiLMAttnResActor(nn.Module):
+    DEFAULT_ATTN_BLOCK_SIZE = BlockAttnResFiLMStack.DEFAULT_BLOCK_SIZE
+
+    def __init__(
+        self,
+        robot_obs_dim: int,
+        motion_obs_dim: int,
+        action_dim: int,
+        num_blocks: int = 3,
+        attn_block_size: int = DEFAULT_ATTN_BLOCK_SIZE,
+    ):
+        super().__init__()
+
+        if num_blocks < 1:
+            raise ValueError(f"num_blocks must be positive, got {num_blocks}.")
+        if attn_block_size < 1:
+            raise ValueError(f"attn_block_size must be positive, got {attn_block_size}.")
+
+        self.robot_obs_normlizer = Normalizer((robot_obs_dim,))
+        self.motion_obs_normlizer = Normalizer((motion_obs_dim,))
+        self.num_blocks = num_blocks
+        self.attn_block_size = attn_block_size
+        self.robot_encoder = nn.Sequential(
+            MLPLayer(robot_obs_dim, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.Identity()),
+        )
+        self.motion_encoder = nn.Sequential(
+            MLPLayer(motion_obs_dim, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(512, 512, nn.Identity()),
+        )
+        self.stack = BlockAttnResFiLMStack(512, 512, num_layers=num_blocks, block_size=attn_block_size)
+        self.head = GaussianHead(512, action_dim)
+
+    @property
+    def blocks(self) -> nn.ModuleList:
+        return self.stack.blocks
+
+    @property
+    def query_projs(self) -> nn.ModuleList:
+        return self.stack.query_projs
+
+    @property
+    def attn_res(self):
+        return self.stack.attn_res
+
+    def forward(
+        self,
+        obs_dict: dict[str, torch.Tensor],
+        action: torch.Tensor | None = None,
+        update_normlizer: bool = False,
+    ) -> StochasticContinuousPolicyStep:
+        robot_obs = self.robot_obs_normlizer(obs_dict["robot_obs"], update_normlizer)
+        motion_obs = self.motion_obs_normlizer(obs_dict["motion_obs"], update_normlizer)
+        x_robot = self.robot_encoder(robot_obs)
+        x_motion = self.motion_encoder(motion_obs)
+        x = self.stack(x_robot, x_motion)
         return self.head(x, action)
 
 
@@ -325,12 +396,20 @@ def build_actor(
         return SplitEncoderActor(obs_dims["robot"], obs_dims["motion"], action_dim)
     if normalized == ActorType.ADAIN:
         return AdaINActor(obs_dims["robot"], obs_dims["motion"], action_dim)
-    if normalized == ActorType.ADAIN_RES:
-        return AdaINResActor(
+    if normalized == ActorType.FILM_RES:
+        return FiLMResActor(
             obs_dims["robot"],
             obs_dims["motion"],
             action_dim,
             num_blocks=int(actor_kwargs.get("num_blocks", 3)),
+        )
+    if normalized == ActorType.FILM_ATTN_RES:
+        return FiLMAttnResActor(
+            obs_dims["robot"],
+            obs_dims["motion"],
+            action_dim,
+            num_blocks=int(actor_kwargs.get("num_blocks", 3)),
+            attn_block_size=int(actor_kwargs.get("attn_block_size", FiLMAttnResActor.DEFAULT_ATTN_BLOCK_SIZE)),
         )
     raise ValueError(f"Unsupported actor type '{actor_type}'.")
 
@@ -340,8 +419,13 @@ def get_actor_kwargs(
     actor_type: ActorType | str,
 ) -> dict[str, int]:
     normalized = normalize_actor_type(str(actor_type))
-    if normalized == ActorType.ADAIN_RES:
+    if normalized == ActorType.FILM_RES:
         return {"num_blocks": int(actor.num_blocks)}
+    if normalized == ActorType.FILM_ATTN_RES:
+        return {
+            "num_blocks": int(actor.num_blocks),
+            "attn_block_size": int(actor.attn_block_size),
+        }
     if normalized == ActorType.RECURRENT:
         return {
             "hidden_size": int(actor.hidden_size),
