@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from gmtp.cli.main import build_parser
-from gmtp.models import Critic, FiLMAttnResActor, VanilaActor
+from gmtp.models import Critic, FiLMAttnResActor
 from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
 from gmtp.runtime.config import IsaacEvalConfig, RunConfig, Sim2SimEvalConfig
 from gmtp.runtime.eval_isaac import IsaacEvalRunner
@@ -34,6 +34,7 @@ class _DummyTrainEnv:
             "joint_damping": torch.full((2,), 0.1),
             "action_offset": torch.zeros(2),
             "action_scale": torch.ones(2),
+            "action_mode": "offset",
         }
 
     def close(self):
@@ -45,6 +46,7 @@ def _fake_train_module():
         scene=types.SimpleNamespace(num_envs=2),
         action_space=2,
         expert_motion_file=["env/assests/115_06_stageii.npz"],
+        action=types.SimpleNamespace(mode="offset"),
         action_mod="Offset",
         root_link_name="torso_link",
         anchor_body_name="torso_link",
@@ -69,13 +71,19 @@ def _fake_eval_module():
 def _write_checkpoint(
     tmp_path,
     *,
-    actor_obs_dim: int,
+    motion_obs_dim: int,
+    robot_obs_dim: int,
     motion_files: list[str] | None = None,
 ):
-    actor = VanilaActor(obs_dim=actor_obs_dim, action_dim=2)
+    actor = FiLMAttnResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        num_blocks=4,
+        attn_block_size=2,
+    )
     critic = Critic(obs_dim=5)
     checkpoint = build_training_checkpoint(
-        actor_type="vanila",
         actor=actor,
         critic=critic,
         motion_files=motion_files or ["env/assests/115_06_stageii.npz"],
@@ -96,27 +104,26 @@ def _write_checkpoint(
 
 
 def _write_isaac_checkpoint(tmp_path):
-    return _write_checkpoint(tmp_path, actor_obs_dim=7)
+    return _write_checkpoint(tmp_path, motion_obs_dim=3, robot_obs_dim=4)
 
 
 def _write_sim2sim_checkpoint(tmp_path):
-    return _write_checkpoint(tmp_path, actor_obs_dim=19)
+    return _write_checkpoint(tmp_path, motion_obs_dim=7, robot_obs_dim=12)
 
 
 def test_cli_parser_builds_train_and_eval_commands():
     parser = build_parser()
-    args = parser.parse_args(["train", "--actor-type", "recurrent", "--num-updates", "5"])
+    args = parser.parse_args(["train", "--num-updates", "5"])
     assert args.command == "train"
-    assert args.actor_type == "recurrent"
     assert args.num_updates == 5
-    assert args.film_res_blocks == 3
-    assert args.film_attn_res_block_size == 4
+    assert args.num_blocks == 6
+    assert args.attn_block_size == 4
 
-    args = parser.parse_args(["train", "--adain-res-blocks", "6"])
-    assert args.film_res_blocks == 6
+    args = parser.parse_args(["train", "--adain-res-blocks", "7"])
+    assert args.num_blocks == 7
 
-    args = parser.parse_args(["train", "--film-attn-res-block-size", "5"])
-    assert args.film_attn_res_block_size == 5
+    args = parser.parse_args(["train", "--attn-block-size", "5"])
+    assert args.attn_block_size == 5
 
     args = parser.parse_args(
         [
@@ -139,7 +146,7 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.action_mode == "residual"
     assert args.num_steps == 12
     assert args.save_video is False
-    assert args.film_attn_res_block_size is None
+    assert args.attn_block_size is None
 
     args = parser.parse_args(["eval", "sim2sim", "--checkpoint", "foo.pth", "--save-video"])
     assert args.save_video is True
@@ -154,7 +161,7 @@ def test_cli_parser_rejects_removed_migrate_checkpoint_command():
 def test_train_runner_dry_construction(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
     runner = TrainRunner(RunConfig(use_wandb=False))
-    assert runner.actor_type.value == "vanila"
+    assert runner.actor_type.value == "film_attn_res"
     assert runner.motion_files[0].endswith("115_06_stageii.npz")
     runner.env.close()
 
@@ -163,9 +170,8 @@ def test_train_runner_constructs_film_attn_res_actor(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
     runner = TrainRunner(
         RunConfig(
-            actor_type="film_attn_res",
-            film_res_blocks=4,
-            film_attn_res_block_size=2,
+            num_blocks=4,
+            attn_block_size=2,
             use_wandb=False,
         )
     )

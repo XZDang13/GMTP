@@ -1,7 +1,7 @@
 import torch
 
 from gmtp.integrations.ref2act.mujoco import normalize_action_mode, resolve_action_mode
-from gmtp.models import ActorType, RecurrentActor
+from gmtp.models import ActorType, FiLMAttnResActor
 from gmtp.runtime.observations import (
     extract_sim2sim_metrics,
     infer_actor_observation_dims_from_state_dict,
@@ -20,10 +20,10 @@ def test_infer_env_observation_dims_requires_expected_keys():
     assert infer_env_observation_dims(obs) == {"motion": 5, "robot": 7, "critic": 3, "policy": 12}
 
 
-def test_infer_actor_observation_dims_from_state_dict_for_recurrent_actor():
-    actor = RecurrentActor(obs_dim=5, action_dim=2, hidden_size=8, num_layers=2)
-    dims = infer_actor_observation_dims_from_state_dict(actor.state_dict(), ActorType.RECURRENT)
-    assert dims == {"policy": 5}
+def test_infer_actor_observation_dims_from_state_dict_for_film_attn_res_actor():
+    actor = FiLMAttnResActor(robot_obs_dim=7, motion_obs_dim=5, action_dim=2, num_blocks=3, attn_block_size=2)
+    dims = infer_actor_observation_dims_from_state_dict(actor.state_dict(), ActorType.FILM_ATTN_RES)
+    assert dims == {"motion": 5, "robot": 7, "policy": 12}
 
 
 def test_parse_sim2sim_obs_and_extract_metrics():

@@ -22,6 +22,7 @@ class EnvCfgSymbols:
 @dataclass(frozen=True)
 class MujocoSymbols:
     MujocoEnv: type
+    IsaacLabMujocoObservation: type | None
     quat_rotate_inverse: object
 
 
@@ -89,7 +90,15 @@ def load_env_cfg_symbols() -> EnvCfgSymbols:
 
 def load_mujoco_symbols() -> MujocoSymbols:
     mujoco_module = _import_module("ref2act.bridges.mujoco.env", "Ref2Act.sim2sim")
+    observation_module = None
+    try:
+        observation_module = _import_module("ref2act.bridges.mujoco.observation")
+    except ModuleNotFoundError:
+        observation_module = None
     return MujocoSymbols(
         MujocoEnv=mujoco_module.MujocoEnv,
+        IsaacLabMujocoObservation=(
+            observation_module.IsaacLabMujocoObservation if observation_module is not None else None
+        ),
         quat_rotate_inverse=mujoco_module.quat_rotate_inverse,
     )

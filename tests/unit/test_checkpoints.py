@@ -1,6 +1,6 @@
 import torch
 
-from gmtp.models import Critic, RecurrentActor
+from gmtp.models import Critic, FiLMAttnResActor
 from gmtp.runtime.checkpoints import (
     CHECKPOINT_VERSION,
     build_training_checkpoint,
@@ -22,10 +22,9 @@ def _joint_params(action_dim: int = 2):
 
 
 def test_checkpoint_v2_roundtrip(tmp_path):
-    actor = RecurrentActor(obs_dim=5, action_dim=2, hidden_size=8, num_layers=2)
+    actor = FiLMAttnResActor(robot_obs_dim=7, motion_obs_dim=5, action_dim=2, num_blocks=4, attn_block_size=2)
     critic = Critic(obs_dim=3)
     checkpoint = build_training_checkpoint(
-        actor_type="recurrent",
         actor=actor,
         critic=critic,
         motion_files=["env/assests/115_06_stageii.npz"],
@@ -40,7 +39,7 @@ def test_checkpoint_v2_roundtrip(tmp_path):
     loaded = load_checkpoint_v2(path)
 
     assert loaded.checkpoint_version == CHECKPOINT_VERSION
-    assert loaded.meta["actor_type"] == "recurrent"
+    assert loaded.meta["actor_type"] == "film_attn_res"
     assert loaded.env["action_mode"] == "offset"
     assert loaded.env["root_name"] == "torso_link"
     assert loaded.env["anchor_body_name"] == "torso_link"
@@ -49,7 +48,7 @@ def test_checkpoint_v2_roundtrip(tmp_path):
 
 def test_load_checkpoint_v2_rejects_non_v2_payload(tmp_path):
     legacy_path = tmp_path / "legacy.pth"
-    torch.save({"actor_type": "recurrent"}, legacy_path)
+    torch.save({"actor_type": "film_attn_res"}, legacy_path)
 
     try:
         load_checkpoint_v2(legacy_path)

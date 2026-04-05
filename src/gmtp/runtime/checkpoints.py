@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from gmtp.integrations.ref2act.motion import motion_label, motion_names, resolve_motion_files
-from gmtp.models import get_actor_kwargs, normalize_actor_type
+from gmtp.models import ActorType, get_actor_kwargs
 
 CHECKPOINT_VERSION = 2
 
@@ -78,7 +78,6 @@ def save_checkpoint_v2(checkpoint: CheckpointV2, path: str | Path) -> Path:
 
 def build_training_checkpoint(
     *,
-    actor_type: str,
     actor: torch.nn.Module,
     critic: torch.nn.Module,
     motion_files: list[str],
@@ -89,13 +88,12 @@ def build_training_checkpoint(
     artifacts: dict[str, Any] | None = None,
     created_at: str | None = None,
 ) -> CheckpointV2:
-    normalized_actor_type = normalize_actor_type(actor_type)
     resolved_motion_files = resolve_motion_files(motion_files)
     return CheckpointV2(
         meta={
             "created_at": created_at or datetime.now().isoformat(timespec="seconds"),
-            "actor_type": normalized_actor_type.value,
-            "actor_kwargs": get_actor_kwargs(actor, normalized_actor_type),
+            "actor_type": ActorType.FILM_ATTN_RES.value,
+            "actor_kwargs": get_actor_kwargs(actor, ActorType.FILM_ATTN_RES),
             "motion_label": motion_label(resolved_motion_files),
         },
         model={

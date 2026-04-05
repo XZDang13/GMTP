@@ -22,7 +22,8 @@ from gmtp.integrations.ref2act.mujoco import (
     resolve_action_mode,
     resolve_name_override,
 )
-from gmtp.models import get_actor_observation, is_recurrent_actor, unpack_actor_output
+from gmtp.integrations.ref2act.observation_history import build_gmtp_observation_spec
+from gmtp.models import get_actor_observation
 from gmtp.runtime.checkpoints import load_checkpoint_v2
 from gmtp.runtime.observations import infer_actor_observation_dims_from_state_dict, parse_sim2sim_obs
 from gmtp.runtime.policy import load_actor_from_checkpoint
@@ -32,8 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Standalone MuJoCo smoke-test runner for a GMTP checkpoint.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--motion-file", default=None)
-    parser.add_argument("--actor-type", default=None)
-    parser.add_argument("--adain-res-blocks", type=int, default=None)
+    parser.add_argument("--num-blocks", type=int, default=None)
+    parser.add_argument("--attn-block-size", type=int, default=None)
     parser.add_argument("--num-steps", type=int, default=2000)
     parser.add_argument("--simulation-dt", type=float, default=1 / 200)
     parser.add_argument("--decimation", type=int, default=4)
@@ -72,16 +73,14 @@ def _resolve_motion_file(
     *,
     checkpoint_path: Path,
     checkpoint_env: dict[str, Any],
-    checkpoint_actor_type: str,
     explicit_motion_file: str | None,
-    actor_type_override: str | None,
 ) -> str:
     if explicit_motion_file is not None:
         return resolve_motion_files([explicit_motion_file])[0]
 
     motion_files = infer_motion_files_from_checkpoint(
         checkpoint_path,
-        actor_type_override or checkpoint_actor_type,
+        "film_attn_res",
         checkpoint_env,
         default_motion_files=DEFAULT_EXPERIMENT_MOTION_FILES,
     )
@@ -256,21 +255,30 @@ def _build_env(
     render: bool,
 ) -> Any:
     symbols = get_mujoco_symbols()
-    return symbols.MujocoEnv(
-        simulation_dt=simulation_dt,
-        decimation=decimation,
-        kp=torch.as_tensor(checkpoint_env["joint_stiffness"], dtype=torch.float32),
-        kd=torch.as_tensor(checkpoint_env["joint_damping"], dtype=torch.float32),
-        effort_limits=torch.as_tensor(checkpoint_env["joint_effort_limits"], dtype=torch.float32),
-        joint_pos_limits=torch.as_tensor(checkpoint_env["joint_pos_limits"], dtype=torch.float32),
-        action_offset=torch.as_tensor(checkpoint_env["action_offset"], dtype=torch.float32),
-        action_scale=torch.as_tensor(checkpoint_env["action_scale"], dtype=torch.float32),
-        expert_motion_file=motion_file,
-        root_link_name=root_name,
-        anchor_body_name=anchor_body_name,
-        render=render,
-        action_mode=action_mode,
-    )
+    env_kwargs = {
+        "simulation_dt": simulation_dt,
+        "decimation": decimation,
+        "kp": torch.as_tensor(checkpoint_env["joint_stiffness"], dtype=torch.float32),
+        "kd": torch.as_tensor(checkpoint_env["joint_damping"], dtype=torch.float32),
+        "effort_limits": torch.as_tensor(checkpoint_env["joint_effort_limits"], dtype=torch.float32),
+        "joint_pos_limits": torch.as_tensor(checkpoint_env["joint_pos_limits"], dtype=torch.float32),
+        "action_offset": torch.as_tensor(checkpoint_env["action_offset"], dtype=torch.float32),
+        "action_scale": torch.as_tensor(checkpoint_env["action_scale"], dtype=torch.float32),
+        "expert_motion_file": motion_file,
+        "root_link_name": root_name,
+        "anchor_body_name": anchor_body_name,
+        "render": render,
+        "action_mode": action_mode,
+    }
+    observation_builder_cls = getattr(symbols, "IsaacLabMujocoObservation", None)
+    if observation_builder_cls is not None:
+        try:
+            init_parameters = inspect.signature(symbols.MujocoEnv).parameters
+        except (TypeError, ValueError):
+            init_parameters = {}
+        if "observation_builder" in init_parameters:
+            env_kwargs["observation_builder"] = observation_builder_cls(spec=build_gmtp_observation_spec(add_noise=False))
+    return symbols.MujocoEnv(**env_kwargs)
 
 
 @torch.no_grad()
@@ -286,13 +294,10 @@ def run(args: argparse.Namespace) -> int:
     checkpoint = load_checkpoint_v2(checkpoint_path)
     checkpoint_env = checkpoint.env
     action_dim = _infer_action_dim(checkpoint_env)
-    actor_type_override = args.actor_type
     motion_file = _resolve_motion_file(
         checkpoint_path=checkpoint_path,
         checkpoint_env=checkpoint_env,
-        checkpoint_actor_type=checkpoint.actor_type,
         explicit_motion_file=args.motion_file,
-        actor_type_override=actor_type_override,
     )
     action_mode, action_mode_source = resolve_action_mode(
         checkpoint_env,
@@ -316,15 +321,15 @@ def run(args: argparse.Namespace) -> int:
 
     obs_dims = infer_actor_observation_dims_from_state_dict(
         checkpoint.model["actor"],
-        actor_type_override or checkpoint.actor_type,
+        checkpoint.actor_type,
     )
     actor, actor_type, actor_kwargs = load_actor_from_checkpoint(
         checkpoint,
         obs_dims=obs_dims,
         action_dim=action_dim,
         device=torch.device("cpu"),
-        actor_type_override=actor_type_override,
-        adain_res_blocks=args.adain_res_blocks,
+        num_blocks=args.num_blocks,
+        attn_block_size=args.attn_block_size,
     )
     render = not args.headless
     env = _build_env(
@@ -345,38 +350,18 @@ def run(args: argparse.Namespace) -> int:
     )
 
     steps_executed = 0
-    actor_state: torch.Tensor | None = None
-    actor_episode_starts: torch.Tensor | None = None
-    if is_recurrent_actor(actor_type):
-        actor_state = actor.get_initial_state(1, device=torch.device("cpu"))
-        actor_episode_starts = torch.ones(1, dtype=torch.bool)
-
     try:
         obs_parts = _extract_obs_parts(env, env.reset(), action_dim)
         while steps_executed < args.num_steps and _viewer_is_running(env, render=render):
             actor_env_obs = _tensor_dict_to_batch(obs_parts)
             actor_obs = get_actor_observation(actor_env_obs, actor_type)
-            if is_recurrent_actor(actor_type):
-                actor_output = actor(
-                    actor_obs,
-                    initial_state=actor_state,
-                    episode_starts=actor_episode_starts,
-                )
-            else:
-                actor_output = actor(actor_obs)
-
-            actor_step, next_state = unpack_actor_output(actor_output)
+            actor_step = actor(actor_obs)
             action = actor_step.mean.squeeze(0).detach().to(device="cpu", dtype=torch.float32)
             if not torch.isfinite(action).all():
                 raise RuntimeError(
                     f"Non-finite action detected: min={float(action.min().item()):.6f} "
                     f"max={float(action.max().item()):.6f}"
                 )
-
-            if is_recurrent_actor(actor_type):
-                actor_state = next_state
-                assert actor_episode_starts is not None
-                actor_episode_starts.zero_()
 
             obs_parts = _extract_obs_parts(env, env.step(action), action_dim)
             steps_executed += 1

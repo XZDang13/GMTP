@@ -7,7 +7,7 @@ import pytest
 import torch
 
 import gmtp.runtime.eval_sim2sim as eval_sim2sim
-from gmtp.models import Critic, VanilaActor
+from gmtp.models import Critic, FiLMAttnResActor
 from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
 from gmtp.runtime.config import Sim2SimEvalConfig
 
@@ -20,10 +20,9 @@ def _write_sim2sim_checkpoint(
     root_name: str = "torso_link",
     anchor_body_name: str = "torso_link",
 ) -> Path:
-    actor = VanilaActor(obs_dim=19, action_dim=2)
+    actor = FiLMAttnResActor(robot_obs_dim=12, motion_obs_dim=7, action_dim=2, num_blocks=4, attn_block_size=2)
     critic = Critic(obs_dim=5)
     checkpoint = build_training_checkpoint(
-        actor_type="vanila",
         actor=actor,
         critic=critic,
         motion_files=motion_files or ["env/assests/115_06_stageii.npz"],
@@ -149,6 +148,44 @@ class _FakeMujocoEnv:
 class _BadObsMujocoEnv(_FakeMujocoEnv):
     def reset(self):
         return torch.zeros(18, dtype=torch.float32)
+
+
+class _StructuredObsMujocoEnv(_FakeMujocoEnv):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.get_obs_dict_calls: list[bool] = []
+
+    def _build_obs_parts(self) -> dict[str, torch.Tensor]:
+        return eval_sim2sim.parse_sim2sim_obs(_make_flat_obs(step=self.step_count, bias=self.bias), action_dim=self.action_dim)
+
+    def _build_observation_context(self, advance_time: bool = False):
+        parts = self._build_obs_parts()
+        return types.SimpleNamespace(
+            target_projected_gravity=parts["target_projected_gravity"],
+            target_joint_pos=parts["target_joint_pos"],
+            target_joint_vel=parts["target_joint_vel"],
+            projected_gravity=parts["robot_projected_gravity"],
+            anchor_ang_vel_b=parts["anchor_ang_vel"],
+            joint_pos=parts["robot_joint_pos"],
+            joint_vel=parts["robot_joint_vel"],
+            previous_action=parts["previous_action"],
+        )
+
+    def get_obs_dict(self, advance_time: bool = False):
+        self.get_obs_dict_calls.append(advance_time)
+        parts = self._build_obs_parts()
+        return {
+            "motion": parts["motion"],
+            "robot": parts["robot"],
+        }
+
+    def reset(self):
+        super().reset()
+        return torch.tensor([123.0], dtype=torch.float32)
+
+    def step(self, action):
+        super().step(action)
+        return torch.tensor([456.0], dtype=torch.float32)
 
 
 class _FakeVideoRecorder:
@@ -293,3 +330,25 @@ def test_sim2sim_runner_rejects_unexpected_obs_dim(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="Expected sim2sim observation dim"):
         runner.evaluate()
+
+
+def test_sim2sim_runner_prefers_structured_obs_dict_when_available(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        eval_sim2sim,
+        "get_mujoco_symbols",
+        lambda: types.SimpleNamespace(MujocoEnv=_StructuredObsMujocoEnv),
+    )
+    checkpoint_path = _write_sim2sim_checkpoint(tmp_path)
+    runner = eval_sim2sim.Sim2SimEvalRunner(
+        Sim2SimEvalConfig(
+            checkpoint_path=str(checkpoint_path),
+            num_steps=2,
+            output_root=str(tmp_path / "runs"),
+        )
+    )
+
+    summary = runner.evaluate()
+
+    env = _StructuredObsMujocoEnv.instances[-1]
+    assert env.get_obs_dict_calls == [False, False, False]
+    assert summary["aggregate_steps"] == 2

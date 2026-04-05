@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from gmtp.models import Critic, VanilaActor
+from gmtp.models import Critic, FiLMAttnResActor
 from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
 from gmtp.runtime.observations import parse_sim2sim_obs
 
@@ -30,10 +30,9 @@ def _write_sim2sim_checkpoint(
     root_name: str = "torso_link",
     anchor_body_name: str = "torso_link",
 ) -> Path:
-    actor = VanilaActor(obs_dim=19, action_dim=2)
+    actor = FiLMAttnResActor(robot_obs_dim=12, motion_obs_dim=7, action_dim=2, num_blocks=4, attn_block_size=2)
     critic = Critic(obs_dim=5)
     checkpoint = build_training_checkpoint(
-        actor_type="vanila",
         actor=actor,
         critic=critic,
         motion_files=motion_files or ["env/assests/115_06_stageii.npz"],

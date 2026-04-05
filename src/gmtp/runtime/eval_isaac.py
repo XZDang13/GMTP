@@ -7,14 +7,13 @@ from pathlib import Path
 import torch
 
 from gmtp.integrations.ref2act import DEFAULT_EXPERIMENT_MOTION_FILES, infer_motion_files_from_checkpoint
-from gmtp.models import get_actor_observation, is_recurrent_actor, unpack_actor_output
+from gmtp.models import get_actor_observation
 from gmtp.runtime.checkpoints import load_checkpoint_v2
 from gmtp.runtime.config import IsaacEvalConfig
 from gmtp.runtime.debug import RolloutDebugLogger
 from gmtp.runtime.io import build_run_paths, write_json
 from gmtp.runtime.observations import (
     build_actor_obs_log_fields,
-    get_actor_state_log_fields,
     infer_env_observation_dims,
 )
 from gmtp.runtime.policy import load_actor_from_checkpoint, resolve_checkpoint_stem
@@ -27,7 +26,7 @@ class IsaacEvalRunner:
         self.checkpoint = load_checkpoint_v2(self.checkpoint_path)
         self.motion_files = infer_motion_files_from_checkpoint(
             self.checkpoint_path,
-            config.actor_type or self.checkpoint.actor_type,
+            self.checkpoint.actor_type,
             self.checkpoint.env,
             self.checkpoint.motion_files or DEFAULT_EXPERIMENT_MOTION_FILES,
         )
@@ -52,17 +51,9 @@ class IsaacEvalRunner:
             obs_dims=self.obs_dims,
             action_dim=self.cfg.action_space,
             device=self.device,
-            actor_type_override=config.actor_type,
-            film_res_blocks=config.film_res_blocks,
-            film_attn_res_block_size=config.film_attn_res_block_size,
+            num_blocks=config.num_blocks,
+            attn_block_size=config.attn_block_size,
         )
-        self.is_recurrent_actor = is_recurrent_actor(self.actor_type)
-        self.actor_state = (
-            self.actor.get_initial_state(self.cfg.scene.num_envs, device=self.device)
-            if self.is_recurrent_actor
-            else None
-        )
-        self.actor_episode_starts = torch.ones(self.cfg.scene.num_envs, dtype=torch.bool, device=self.device)
 
     def _build_log_prefix(self) -> Path:
         return self.run_paths.debug_dir / resolve_checkpoint_stem(self.checkpoint_path)
@@ -115,7 +106,6 @@ class IsaacEvalRunner:
         terminate: torch.Tensor,
         timeout: torch.Tensor,
         info: dict,
-        actor_state: torch.Tensor | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         done = terminate | timeout
         payload: dict[str, object] = {
@@ -129,26 +119,14 @@ class IsaacEvalRunner:
             "done": done,
         }
         payload.update(build_actor_obs_log_fields(actor_obs))
-        payload.update(get_actor_state_log_fields(actor_state))
         info_fields, info_metadata = cls._extract_info_log_fields(info)
         payload.update(info_fields)
         return payload, info_metadata
 
     @torch.no_grad()
     def get_action(self, obs_batch: dict[str, torch.Tensor], determine: bool = False):
-        if self.is_recurrent_actor:
-            actor_output = self.actor(
-                obs_batch,
-                initial_state=self.actor_state,
-                episode_starts=self.actor_episode_starts,
-            )
-        else:
-            actor_output = self.actor(obs_batch)
-
-        actor_step, next_state = unpack_actor_output(actor_output)
+        actor_step = self.actor(obs_batch)
         action = actor_step.mean if determine else actor_step.action
-        if self.is_recurrent_actor:
-            self.actor_state = next_state
         return action
 
     def rollout(self, obs):
@@ -160,14 +138,9 @@ class IsaacEvalRunner:
         error_message: str | None = None
         step_count = 0
 
-        if self.is_recurrent_actor:
-            self.actor_state = self.actor.get_initial_state(self.cfg.scene.num_envs, device=self.device)
-            self.actor_episode_starts = torch.ones(self.cfg.scene.num_envs, dtype=torch.bool, device=self.device)
-
         try:
             for step_idx in range(self.config.num_steps):
                 actor_obs = get_actor_observation(obs, self.actor_type)
-                actor_state_before_step = self.actor_state if self.is_recurrent_actor else None
                 action = self.get_action(actor_obs, True)
                 if not torch.isfinite(action).all():
                     raise RuntimeError(
@@ -192,16 +165,12 @@ class IsaacEvalRunner:
                     terminate,
                     timeout,
                     info,
-                    actor_state=actor_state_before_step,
                 )
                 logger.log_step(step_idx, step_payload)
                 info_metadata.update(step_info_metadata)
                 reward_history.append(float(reward.mean().item()))
                 if first_done_step is None and bool(done.any().item()):
                     first_done_step = step_idx + 1
-
-                if self.is_recurrent_actor:
-                    self.actor_episode_starts = done.to(dtype=torch.bool, device=self.device)
 
                 if self.config.progress_interval and (
                     (step_idx + 1) % self.config.progress_interval == 0 or step_idx + 1 == self.config.num_steps
