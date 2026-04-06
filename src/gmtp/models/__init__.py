@@ -1,6 +1,6 @@
 from .actor import (
     ActorType,
-    FiLMAttnResActor,
+    FiLMResActor,
     build_actor,
     get_actor_kwargs,
     get_actor_observation,
@@ -15,7 +15,7 @@ from .critic import Critic
 __all__ = [
     "ActorType",
     "Critic",
-    "FiLMAttnResActor",
+    "FiLMResActor",
     "build_actor",
     "get_actor_kwargs",
     "get_actor_observation",

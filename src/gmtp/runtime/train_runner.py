@@ -12,6 +12,7 @@ from RLAlg.scheduler import KLAdaptiveLR
 from tqdm import trange
 
 from gmtp.integrations.ref2act.motion import motion_label, motion_names
+from gmtp.integrations.ref2act.observation_history import resolve_observation_window_lengths
 from gmtp.models import (
     ActorType,
     Critic,
@@ -26,6 +27,7 @@ from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_
 from gmtp.runtime.config import RunConfig
 from gmtp.runtime.io import build_run_paths, write_json
 from gmtp.runtime.observations import infer_env_observation_dims
+from gmtp.runtime.policy import build_motion_latent_adapter
 
 
 class OptimizerCollection(torch.optim.Optimizer):
@@ -83,11 +85,21 @@ class TrainRunner:
         self.config = config
         from gmtp.integrations.ref2act.isaac_env import make_training_env
 
-        self.env, self.cfg = make_training_env()
+        self.observation_window_lengths = resolve_observation_window_lengths(
+            robot_window_length=config.robot_window_length
+        )
+        self.env, self.cfg = make_training_env(window_lengths=self.observation_window_lengths)
         self.device = self.env.unwrapped.device
-        self.actor_type = ActorType.FILM_ATTN_RES
+        self.actor_type = ActorType.FILM_RES
         self.motion_files = list(self.cfg.expert_motion_file)
         self.motion_name = motion_label(self.motion_files)
+        self.motion_latent_adapter = build_motion_latent_adapter(
+            config.motion_encoder_checkpoint,
+            device=self.device,
+        )
+        self.motion_encoder_checkpoint = (
+            self.motion_latent_adapter.checkpoint_path if self.motion_latent_adapter is not None else None
+        )
         self.run_date = datetime.now().strftime("%Y%m%d")
         self.checkpoint_date = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_name = config.run_name or f"G1_{len(self.motion_files)}_{self.run_date}"
@@ -99,7 +111,14 @@ class TrainRunner:
         write_json(self.run_paths.config_path, {"command": "train", "config": self.config})
 
         self.initial_obs, _ = self.env.reset()
-        self.obs_dims = infer_env_observation_dims(self.initial_obs)
+        if self.motion_latent_adapter is not None:
+            self.motion_latent_adapter.initialize_history(self.env)
+        self.raw_obs_dims = infer_env_observation_dims(self.initial_obs)
+        self.obs_dims = (
+            self.motion_latent_adapter.augment_observation_dims(self.raw_obs_dims)
+            if self.motion_latent_adapter is not None
+            else self.raw_obs_dims
+        )
         self.actor = build_actor(
             self.obs_dims,
             self.actor_type,
@@ -163,7 +182,7 @@ class TrainRunner:
     def _build_actor_kwargs(self) -> dict[str, int]:
         return {
             "num_blocks": self.config.num_blocks,
-            "attn_block_size": self.config.attn_block_size,
+            "robot_window_length": self.config.robot_window_length,
         }
 
     @staticmethod
@@ -239,6 +258,8 @@ class TrainRunner:
         for _ in range(self.steps):
             self.global_step += 1
             actor_obs = get_actor_observation(obs, self.actor_type)
+            if self.motion_latent_adapter is not None:
+                actor_obs = self.motion_latent_adapter.augment_actor_observation(actor_obs)
             critic_obs = self._get_critic_observation(obs)
             action, log_prob, value = self.get_action(actor_obs, critic_obs)
             next_obs, task_reward, terminate, timeout, _info = self.env.step(action)
@@ -247,6 +268,8 @@ class TrainRunner:
             self.tracker.add_values("episode_return", reward)
             self.tracker.add_values("episode_length", 1)
             done = terminate | timeout
+            if self.motion_latent_adapter is not None:
+                self.motion_latent_adapter.update_history(self.env, done=done)
 
             if done.any():
                 self._log_metrics(
@@ -272,6 +295,8 @@ class TrainRunner:
             obs = next_obs
 
         actor_obs = get_actor_observation(obs, self.actor_type)
+        if self.motion_latent_adapter is not None:
+            actor_obs = self.motion_latent_adapter.augment_actor_observation(actor_obs)
         critic_obs = self._get_critic_observation(obs)
         self._update_actor_statistics(actor_obs)
         last_value = self.get_value(critic_obs, update_normlizer=True)
@@ -371,6 +396,8 @@ class TrainRunner:
             action_mode=action_mode,
             root_name=getattr(self.cfg, "root_link_name", None),
             anchor_body_name=getattr(self.cfg, "anchor_body_name", None),
+            motion_encoder_checkpoint=self.motion_encoder_checkpoint,
+            observation_window_lengths=self.observation_window_lengths,
             artifacts={"run_dir": str(self.run_paths.root)},
         )
         return save_checkpoint_v2(checkpoint, self.run_paths.checkpoints_dir / f"{checkpoint_name}.pth")
@@ -397,6 +424,11 @@ class TrainRunner:
             "motion_files": self.motion_files,
             "motion_names": motion_names(self.motion_files),
             "motion_label": self.motion_name,
+            "motion_encoder_checkpoint": self.motion_encoder_checkpoint,
+            "motion_encoder_latent_dim": (
+                self.motion_latent_adapter.latent_dim if self.motion_latent_adapter is not None else None
+            ),
+            "observation_window_lengths": self.observation_window_lengths,
             "num_updates": self.config.num_updates,
             "rollout_steps": self.steps,
             "checkpoint_interval": self.checkpoint_interval,

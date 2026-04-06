@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from gmtp.integrations.ref2act import DEFAULT_EXPERIMENT_MOTION_FILES, infer_motion_files_from_checkpoint
+from gmtp.integrations.ref2act.observation_history import resolve_observation_window_lengths
 from gmtp.models import get_actor_observation
 from gmtp.runtime.checkpoints import load_checkpoint_v2
 from gmtp.runtime.config import IsaacEvalConfig
@@ -14,9 +15,15 @@ from gmtp.runtime.debug import RolloutDebugLogger
 from gmtp.runtime.io import build_run_paths, write_json
 from gmtp.runtime.observations import (
     build_actor_obs_log_fields,
+    infer_actor_observation_dims_from_state_dict,
     infer_env_observation_dims,
 )
-from gmtp.runtime.policy import load_actor_from_checkpoint, resolve_checkpoint_stem
+from gmtp.runtime.policy import (
+    build_motion_latent_adapter,
+    load_actor_from_checkpoint,
+    resolve_checkpoint_stem,
+    resolve_motion_encoder_checkpoint_path,
+)
 
 
 class IsaacEvalRunner:
@@ -30,6 +37,10 @@ class IsaacEvalRunner:
             self.checkpoint.env,
             self.checkpoint.motion_files or DEFAULT_EXPERIMENT_MOTION_FILES,
         )
+        self.observation_window_lengths = resolve_observation_window_lengths(
+            robot_window_length=config.robot_window_length,
+            checkpoint_env=self.checkpoint.env,
+        )
         self.run_paths = build_run_paths(
             config.output_root,
             "eval-isaac",
@@ -42,17 +53,44 @@ class IsaacEvalRunner:
         self.env, self.cfg = make_eval_env(
             self.motion_files,
             show_reference_motion=config.show_reference_motion,
+            window_lengths=self.observation_window_lengths,
         )
         self.device = self.env.unwrapped.device
+        resolved_motion_encoder_checkpoint = resolve_motion_encoder_checkpoint_path(
+            self.checkpoint,
+            override=config.motion_encoder_checkpoint,
+        )
+        self.motion_encoder_checkpoint = (
+            None if resolved_motion_encoder_checkpoint is None else str(resolved_motion_encoder_checkpoint)
+        )
+        self.motion_latent_adapter = build_motion_latent_adapter(
+            self.motion_encoder_checkpoint,
+            device=self.device,
+        )
         self.initial_obs, _ = self.env.reset()
-        self.obs_dims = infer_env_observation_dims(self.initial_obs)
+        if self.motion_latent_adapter is not None:
+            self.motion_latent_adapter.initialize_history(self.env)
+        self.raw_obs_dims = infer_env_observation_dims(self.initial_obs)
+        self.obs_dims = (
+            self.motion_latent_adapter.augment_observation_dims(self.raw_obs_dims)
+            if self.motion_latent_adapter is not None
+            else self.raw_obs_dims
+        )
+        checkpoint_obs_dims = infer_actor_observation_dims_from_state_dict(
+            self.checkpoint.model["actor"],
+            self.checkpoint.actor_type,
+        )
+        if checkpoint_obs_dims["motion"] != self.obs_dims["motion"] or checkpoint_obs_dims["robot"] != self.obs_dims["robot"]:
+            raise ValueError(
+                "Checkpoint actor observation dims do not match runtime env dims: "
+                f"checkpoint={checkpoint_obs_dims}, runtime={self.obs_dims}."
+            )
         self.actor, self.actor_type, self.actor_kwargs = load_actor_from_checkpoint(
             self.checkpoint,
             obs_dims=self.obs_dims,
             action_dim=self.cfg.action_space,
             device=self.device,
             num_blocks=config.num_blocks,
-            attn_block_size=config.attn_block_size,
         )
 
     def _build_log_prefix(self) -> Path:
@@ -141,6 +179,8 @@ class IsaacEvalRunner:
         try:
             for step_idx in range(self.config.num_steps):
                 actor_obs = get_actor_observation(obs, self.actor_type)
+                if self.motion_latent_adapter is not None:
+                    actor_obs = self.motion_latent_adapter.augment_actor_observation(actor_obs)
                 action = self.get_action(actor_obs, True)
                 if not torch.isfinite(action).all():
                     raise RuntimeError(
@@ -156,6 +196,8 @@ class IsaacEvalRunner:
                         f"min={reward.min().item():.6f} max={reward.max().item():.6f}"
                     )
                 done = terminate | timeout
+                if self.motion_latent_adapter is not None:
+                    self.motion_latent_adapter.update_history(self.env, done=done)
 
                 step_payload, step_info_metadata = self._build_debug_step_payload(
                     obs,
@@ -194,6 +236,8 @@ class IsaacEvalRunner:
                     "actor_type": self.actor_type.value,
                     "actor_kwargs": self.actor_kwargs,
                     "motion_files": list(self.motion_files),
+                    "motion_encoder_checkpoint": self.motion_encoder_checkpoint,
+                    "observation_window_lengths": self.observation_window_lengths,
                     "num_steps_requested": self.config.num_steps,
                     "num_steps_executed": step_count,
                     "first_done_step": first_done_step,
@@ -211,6 +255,8 @@ class IsaacEvalRunner:
             "actor_type": self.actor_type.value,
             "actor_kwargs": self.actor_kwargs,
             "motion_files": list(self.motion_files),
+            "motion_encoder_checkpoint": self.motion_encoder_checkpoint,
+            "observation_window_lengths": self.observation_window_lengths,
             "num_steps": self.config.num_steps,
             "num_steps_executed": step_count,
             "first_done_step": first_done_step,

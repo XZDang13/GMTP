@@ -1,11 +1,32 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import Any
 
 import torch
 
+from gmtp.integrations.ref2act.compat import _import_module
+from gmtp.integrations.ref2act.observation_history import (
+    build_gmtp_policy_observation_spec,
+    normalize_observation_window_lengths,
+)
 from gmtp.models import ActorType, normalize_actor_type
+
+_OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")
+DEFAULT_OBSERVATION_TERM_REGISTRY = _OBSERVATION_SPEC.DEFAULT_OBSERVATION_TERM_REGISTRY
+ObservationLayout = _OBSERVATION_SPEC.ObservationLayout
+
+_SIM2SIM_TERM_OUTPUT_NAMES = {
+    "target_projected_gravity": "target_projected_gravity",
+    "target_joint_pos": "target_joint_pos",
+    "target_joint_vel": "target_joint_vel",
+    "projected_gravity": "robot_projected_gravity",
+    "anchor_ang_vel_b": "anchor_ang_vel",
+    "joint_pos": "robot_joint_pos",
+    "joint_vel": "robot_joint_vel",
+    "previous_action": "previous_action",
+}
 
 
 def infer_env_observation_dims(obs: dict[str, torch.Tensor]) -> dict[str, int]:
@@ -39,64 +60,53 @@ def infer_actor_observation_dims_from_state_dict(
     }
 
 
-def infer_sim2sim_observation_dims(action_dim: int) -> dict[str, int]:
-    return {
-        "motion": action_dim * 2 + 3,
-        "robot": action_dim * 3 + 6,
-        "policy": action_dim * 5 + 9,
-    }
+def _window_lengths_cache_key(
+    observation_window_lengths: Mapping[str, int] | None,
+) -> tuple[tuple[str, int], ...]:
+    return tuple(sorted(normalize_observation_window_lengths(observation_window_lengths).items()))
 
 
-def parse_sim2sim_obs(flat_obs: torch.Tensor, action_dim: int) -> dict[str, torch.Tensor]:
-    expected_dim = infer_sim2sim_observation_dims(action_dim)["policy"]
-    if flat_obs.ndim != 1:
-        raise ValueError(f"Expected a flat sim2sim observation, got shape {tuple(flat_obs.shape)}.")
-    if flat_obs.numel() != expected_dim:
-        raise ValueError(f"Expected sim2sim observation dim {expected_dim}, got {flat_obs.numel()}.")
-
-    offset = 0
-    target_projected_gravity = flat_obs[offset : offset + 3]
-    offset += 3
-    target_joint_pos = flat_obs[offset : offset + action_dim]
-    offset += action_dim
-    target_joint_vel = flat_obs[offset : offset + action_dim]
-    offset += action_dim
-    robot_projected_gravity = flat_obs[offset : offset + 3]
-    offset += 3
-    anchor_ang_vel = flat_obs[offset : offset + 3]
-    offset += 3
-    robot_joint_pos = flat_obs[offset : offset + action_dim]
-    offset += action_dim
-    robot_joint_vel = flat_obs[offset : offset + action_dim]
-    offset += action_dim
-    previous_action = flat_obs[offset : offset + action_dim]
-
-    motion_obs = torch.cat((target_projected_gravity, target_joint_pos, target_joint_vel), dim=-1)
-    robot_obs = torch.cat(
-        (
-            robot_projected_gravity,
-            anchor_ang_vel,
-            robot_joint_pos,
-            robot_joint_vel,
-            previous_action,
-        ),
-        dim=-1,
+@lru_cache(maxsize=None)
+def _get_sim2sim_policy_spec_details(
+    action_dim: int,
+    window_lengths_key: tuple[tuple[str, int], ...],
+) -> tuple[Any, Any, dict[str, Any], dict[str, int]]:
+    observation_window_lengths = dict(window_lengths_key)
+    spec = build_gmtp_policy_observation_spec(
+        add_noise=False,
+        window_lengths=observation_window_lengths or None,
     )
+    layout = ObservationLayout(joint_dim=action_dim, action_dim=action_dim, key_body_count=0)
+    group_specs = {group.name: group for group in spec.enabled_groups()}
+    group_dims = {name: int(dim) for name, dim in spec.describe(layout).group_dims.items()}
+    return spec, layout, group_specs, group_dims
 
+
+def _term_dim(term_spec: Any, layout: Any) -> int:
+    return int(DEFAULT_OBSERVATION_TERM_REGISTRY[term_spec.type].dimension(layout, term_spec))
+
+
+def infer_sim2sim_observation_dims(
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    _, _, _, group_dims = _get_sim2sim_policy_spec_details(
+        action_dim,
+        _window_lengths_cache_key(observation_window_lengths),
+    )
+    motion_dim = int(group_dims.get("motion", 0))
+    robot_dim = int(group_dims.get("robot", 0))
     return {
-        "motion": motion_obs,
-        "robot": robot_obs,
-        "motion_obs": motion_obs,
-        "robot_obs": robot_obs,
-        "target_projected_gravity": target_projected_gravity,
-        "target_joint_pos": target_joint_pos,
-        "target_joint_vel": target_joint_vel,
-        "robot_projected_gravity": robot_projected_gravity,
-        "anchor_ang_vel": anchor_ang_vel,
-        "robot_joint_pos": robot_joint_pos,
-        "robot_joint_vel": robot_joint_vel,
-        "previous_action": previous_action,
+        "motion": motion_dim,
+        "robot": robot_dim,
+        "policy": motion_dim + robot_dim,
     }
+
+
+def _extract_latest_term_value(term_flat: torch.Tensor, *, term_spec: Any, term_dim: int) -> torch.Tensor:
+    if term_spec.window_length > 1 and term_spec.flatten:
+        return term_flat.reshape(term_spec.window_length, term_dim)[-1]
+    return term_flat
 
 
 def _coerce_sim2sim_vector(value: Any, *, name: str) -> torch.Tensor:
@@ -104,6 +114,102 @@ def _coerce_sim2sim_vector(value: Any, *, name: str) -> torch.Tensor:
     if tensor.ndim != 1:
         raise ValueError(f"Expected sim2sim {name} rank 1, got shape {tuple(tensor.shape)}.")
     return tensor
+
+
+def _split_group_observation(
+    group_name: str,
+    group_obs: torch.Tensor,
+    *,
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None = None,
+) -> dict[str, torch.Tensor]:
+    _, layout, group_specs, group_dims = _get_sim2sim_policy_spec_details(
+        action_dim,
+        _window_lengths_cache_key(observation_window_lengths),
+    )
+    group_spec = group_specs[group_name]
+    expected_dim = int(group_dims[group_name])
+    if group_obs.numel() != expected_dim:
+        raise ValueError(f"Expected structured sim2sim {group_name} dim {expected_dim}, got {group_obs.numel()}.")
+
+    offset = 0
+    parsed_terms: dict[str, torch.Tensor] = {}
+    for term_spec in group_spec.terms:
+        if not term_spec.enabled:
+            continue
+        term_dim = _term_dim(term_spec, layout)
+        flattened_dim = term_dim * term_spec.window_length if term_spec.flatten else term_dim
+        term_flat = group_obs[offset : offset + flattened_dim]
+        parsed_terms[_SIM2SIM_TERM_OUTPUT_NAMES[term_spec.id]] = _extract_latest_term_value(
+            term_flat,
+            term_spec=term_spec,
+            term_dim=term_dim,
+        )
+        offset += flattened_dim
+
+    return parsed_terms
+
+
+def replace_sim2sim_group_latest_terms(
+    group_obs: torch.Tensor,
+    *,
+    group_name: str,
+    action_dim: int,
+    latest_terms: Mapping[str, Any],
+    observation_window_lengths: Mapping[str, int] | None = None,
+) -> torch.Tensor:
+    group_obs = _coerce_sim2sim_vector(group_obs, name=group_name).clone()
+    _, layout, group_specs, group_dims = _get_sim2sim_policy_spec_details(
+        action_dim,
+        _window_lengths_cache_key(observation_window_lengths),
+    )
+    group_spec = group_specs[group_name]
+    expected_dim = int(group_dims[group_name])
+    if group_obs.numel() != expected_dim:
+        raise ValueError(f"Expected structured sim2sim {group_name} dim {expected_dim}, got {group_obs.numel()}.")
+
+    offset = 0
+    for term_spec in group_spec.terms:
+        if not term_spec.enabled:
+            continue
+        term_dim = _term_dim(term_spec, layout)
+        flattened_dim = term_dim * term_spec.window_length if term_spec.flatten else term_dim
+        if term_spec.id in latest_terms:
+            replacement = _coerce_sim2sim_vector(latest_terms[term_spec.id], name=f"{group_name}.{term_spec.id}")
+            if replacement.numel() != term_dim:
+                raise ValueError(
+                    f"Expected replacement for {group_name}.{term_spec.id} dim {term_dim}, got {replacement.numel()}."
+                )
+            if term_spec.window_length > 1 and term_spec.flatten:
+                group_obs[offset + flattened_dim - term_dim : offset + flattened_dim] = replacement
+            else:
+                group_obs[offset : offset + flattened_dim] = replacement
+        offset += flattened_dim
+
+    return group_obs
+
+
+def parse_sim2sim_obs(
+    flat_obs: torch.Tensor,
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None = None,
+) -> dict[str, torch.Tensor]:
+    expected_dims = infer_sim2sim_observation_dims(action_dim, observation_window_lengths)
+    expected_dim = expected_dims["policy"]
+    if flat_obs.ndim != 1:
+        raise ValueError(f"Expected a flat sim2sim observation, got shape {tuple(flat_obs.shape)}.")
+    if flat_obs.numel() != expected_dim:
+        raise ValueError(f"Expected sim2sim observation dim {expected_dim}, got {flat_obs.numel()}.")
+
+    motion_dim = expected_dims["motion"]
+    motion_obs = flat_obs[:motion_dim]
+    robot_obs = flat_obs[motion_dim:]
+    return split_sim2sim_group_observations(
+        motion_obs,
+        robot_obs,
+        action_dim,
+        observation_window_lengths=observation_window_lengths,
+    )
 
 
 def extract_sim2sim_actor_obs_from_mapping(obs: Mapping[str, Any]) -> dict[str, torch.Tensor] | None:
@@ -126,46 +232,40 @@ def split_sim2sim_group_observations(
     motion_obs: torch.Tensor,
     robot_obs: torch.Tensor,
     action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
     motion_obs = _coerce_sim2sim_vector(motion_obs, name="motion")
     robot_obs = _coerce_sim2sim_vector(robot_obs, name="robot")
-    expected_dims = infer_sim2sim_observation_dims(action_dim)
+    expected_dims = infer_sim2sim_observation_dims(action_dim, observation_window_lengths)
     if motion_obs.numel() != expected_dims["motion"]:
         raise ValueError(f"Expected structured sim2sim motion dim {expected_dims['motion']}, got {motion_obs.numel()}.")
     if robot_obs.numel() != expected_dims["robot"]:
         raise ValueError(f"Expected structured sim2sim robot dim {expected_dims['robot']}, got {robot_obs.numel()}.")
 
-    motion_offset = 0
-    target_projected_gravity = motion_obs[motion_offset : motion_offset + 3]
-    motion_offset += 3
-    target_joint_pos = motion_obs[motion_offset : motion_offset + action_dim]
-    motion_offset += action_dim
-    target_joint_vel = motion_obs[motion_offset : motion_offset + action_dim]
-
-    robot_offset = 0
-    robot_projected_gravity = robot_obs[robot_offset : robot_offset + 3]
-    robot_offset += 3
-    anchor_ang_vel = robot_obs[robot_offset : robot_offset + 3]
-    robot_offset += 3
-    robot_joint_pos = robot_obs[robot_offset : robot_offset + action_dim]
-    robot_offset += action_dim
-    robot_joint_vel = robot_obs[robot_offset : robot_offset + action_dim]
-    robot_offset += action_dim
-    previous_action = robot_obs[robot_offset : robot_offset + action_dim]
+    parsed_terms = {}
+    parsed_terms.update(
+        _split_group_observation(
+            "motion",
+            motion_obs,
+            action_dim=action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
+    )
+    parsed_terms.update(
+        _split_group_observation(
+            "robot",
+            robot_obs,
+            action_dim=action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
+    )
 
     return {
         "motion": motion_obs,
         "robot": robot_obs,
         "motion_obs": motion_obs,
         "robot_obs": robot_obs,
-        "target_projected_gravity": target_projected_gravity,
-        "target_joint_pos": target_joint_pos,
-        "target_joint_vel": target_joint_vel,
-        "robot_projected_gravity": robot_projected_gravity,
-        "anchor_ang_vel": anchor_ang_vel,
-        "robot_joint_pos": robot_joint_pos,
-        "robot_joint_vel": robot_joint_vel,
-        "previous_action": previous_action,
+        **parsed_terms,
     }
 
 
@@ -228,8 +328,18 @@ def extract_sim2sim_metrics_from_parts(obs_parts: Mapping[str, torch.Tensor]) ->
     }
 
 
-def extract_sim2sim_metrics(flat_obs: torch.Tensor, action_dim: int) -> dict[str, float]:
-    return extract_sim2sim_metrics_from_parts(parse_sim2sim_obs(flat_obs, action_dim))
+def extract_sim2sim_metrics(
+    flat_obs: torch.Tensor,
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None = None,
+) -> dict[str, float]:
+    return extract_sim2sim_metrics_from_parts(
+        parse_sim2sim_obs(
+            flat_obs,
+            action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
+    )
 
 
 def build_actor_obs_log_fields(actor_obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

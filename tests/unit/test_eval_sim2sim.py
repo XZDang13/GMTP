@@ -7,7 +7,8 @@ import pytest
 import torch
 
 import gmtp.runtime.eval_sim2sim as eval_sim2sim
-from gmtp.models import Critic, FiLMAttnResActor
+from gmtp.integrations.ref2act.observation_history import build_robot_policy_window_lengths
+from gmtp.models import Critic, FiLMResActor
 from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
 from gmtp.runtime.config import Sim2SimEvalConfig
 
@@ -19,8 +20,15 @@ def _write_sim2sim_checkpoint(
     action_mode: str = "offset",
     root_name: str = "torso_link",
     anchor_body_name: str = "torso_link",
+    robot_window_length: int = 1,
 ) -> Path:
-    actor = FiLMAttnResActor(robot_obs_dim=12, motion_obs_dim=7, action_dim=2, num_blocks=4, attn_block_size=2)
+    actor = FiLMResActor(
+        robot_obs_dim=12 * robot_window_length,
+        motion_obs_dim=7,
+        action_dim=2,
+        num_blocks=4,
+        robot_window_length=robot_window_length,
+    )
     critic = Critic(obs_dim=5)
     checkpoint = build_training_checkpoint(
         actor=actor,
@@ -38,6 +46,9 @@ def _write_sim2sim_checkpoint(
         action_mode=action_mode,
         root_name=root_name,
         anchor_body_name=anchor_body_name,
+        observation_window_lengths=(
+            build_robot_policy_window_lengths(robot_window_length) if robot_window_length > 1 else None
+        ),
     )
     return save_checkpoint_v2(checkpoint, tmp_path / "model_v2.pth")
 
@@ -72,6 +83,30 @@ def _make_flat_obs(step: int, bias: float) -> torch.Tensor:
             previous_action,
         ]
     )
+
+
+def _robot_history_steps(step: int, window_length: int) -> list[int]:
+    prefix_count = max(window_length - (step + 1), 0)
+    start = max(step - window_length + 1, 0)
+    return [0] * prefix_count + list(range(start, step + 1))
+
+
+def _make_windowed_flat_obs(step: int, bias: float, window_length: int) -> torch.Tensor:
+    latest_parts = eval_sim2sim.parse_sim2sim_obs(_make_flat_obs(step=step, bias=bias), action_dim=2)
+    history_parts = [
+        eval_sim2sim.parse_sim2sim_obs(_make_flat_obs(step=history_step, bias=bias), action_dim=2)
+        for history_step in _robot_history_steps(step, window_length)
+    ]
+    robot_obs = torch.cat(
+        [
+            torch.cat([parts["robot_projected_gravity"] for parts in history_parts]),
+            torch.cat([parts["anchor_ang_vel"] for parts in history_parts]),
+            torch.cat([parts["robot_joint_pos"] for parts in history_parts]),
+            torch.cat([parts["robot_joint_vel"] for parts in history_parts]),
+            torch.cat([parts["previous_action"] for parts in history_parts]),
+        ]
+    )
+    return torch.cat([latest_parts["motion"], robot_obs])
 
 
 class _FakeMujocoEnv:
@@ -188,6 +223,39 @@ class _StructuredObsMujocoEnv(_FakeMujocoEnv):
         return torch.tensor([456.0], dtype=torch.float32)
 
 
+class _WindowedMujocoEnv(_FakeMujocoEnv):
+    robot_window_length = 4
+
+    def reset(self):
+        super().reset()
+        return _make_windowed_flat_obs(step=0, bias=self.bias, window_length=self.robot_window_length)
+
+    def step(self, action):
+        super().step(action)
+        return _make_windowed_flat_obs(
+            step=self.step_count,
+            bias=self.bias,
+            window_length=self.robot_window_length,
+        )
+
+
+class _WindowedStructuredObsMujocoEnv(_StructuredObsMujocoEnv):
+    robot_window_length = 4
+
+    def _build_obs_parts(self) -> dict[str, torch.Tensor]:
+        return eval_sim2sim.parse_sim2sim_obs(
+            _make_windowed_flat_obs(step=self.step_count, bias=self.bias, window_length=self.robot_window_length),
+            action_dim=self.action_dim,
+            observation_window_lengths=build_robot_policy_window_lengths(self.robot_window_length),
+        )
+
+
+class _ObservationBuilderMujocoEnv(_FakeMujocoEnv):
+    def __init__(self, *, observation_builder=None, **kwargs):
+        super().__init__(**kwargs)
+        self.observation_builder = observation_builder
+
+
 class _FakeVideoRecorder:
     instances: list["_FakeVideoRecorder"] = []
 
@@ -254,6 +322,57 @@ def test_sim2sim_runner_uses_checkpoint_defaults_until_overridden(tmp_path, monk
     assert env.action_mode == "residual"
     assert env.root_link_name == "pelvis"
     assert env.anchor_body_name == "pelvis"
+    assert summary["motions"][0]["steps"] == 1
+
+
+def test_sim2sim_runner_passes_policy_only_observation_spec_to_mujoco_builder(tmp_path, monkeypatch):
+    class _FakeIsaacLabMujocoObservation:
+        def __init__(self, spec=None):
+            self.spec = spec
+
+    monkeypatch.setattr(
+        eval_sim2sim,
+        "get_mujoco_symbols",
+        lambda: types.SimpleNamespace(
+            MujocoEnv=_ObservationBuilderMujocoEnv,
+            IsaacLabMujocoObservation=_FakeIsaacLabMujocoObservation,
+        ),
+    )
+    checkpoint_path = _write_sim2sim_checkpoint(tmp_path)
+    runner = eval_sim2sim.Sim2SimEvalRunner(
+        Sim2SimEvalConfig(
+            checkpoint_path=str(checkpoint_path),
+            num_steps=0,
+            output_root=str(tmp_path / "runs-builder"),
+        )
+    )
+
+    runner.evaluate()
+
+    env = _ObservationBuilderMujocoEnv.instances[-1]
+    assert env.observation_builder is not None
+    assert tuple(group.name for group in env.observation_builder.spec.enabled_groups()) == ("motion", "robot")
+
+
+def test_sim2sim_runner_restores_windowed_robot_obs_from_checkpoint_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        eval_sim2sim,
+        "get_mujoco_symbols",
+        lambda: types.SimpleNamespace(MujocoEnv=_WindowedMujocoEnv),
+    )
+    checkpoint_path = _write_sim2sim_checkpoint(tmp_path, robot_window_length=4)
+
+    runner = eval_sim2sim.Sim2SimEvalRunner(
+        Sim2SimEvalConfig(
+            checkpoint_path=str(checkpoint_path),
+            num_steps=1,
+            output_root=str(tmp_path / "runs-windowed"),
+        )
+    )
+    summary = runner.evaluate()
+
+    assert runner.observation_window_lengths == build_robot_policy_window_lengths(4)
+    assert runner.obs_dims == {"motion": 7, "robot": 48, "policy": 55}
     assert summary["motions"][0]["steps"] == 1
 
 
@@ -350,5 +469,27 @@ def test_sim2sim_runner_prefers_structured_obs_dict_when_available(tmp_path, mon
     summary = runner.evaluate()
 
     env = _StructuredObsMujocoEnv.instances[-1]
+    assert env.get_obs_dict_calls == [False, False, False]
+    assert summary["aggregate_steps"] == 2
+
+
+def test_sim2sim_runner_prefers_structured_windowed_obs_dict_when_available(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        eval_sim2sim,
+        "get_mujoco_symbols",
+        lambda: types.SimpleNamespace(MujocoEnv=_WindowedStructuredObsMujocoEnv),
+    )
+    checkpoint_path = _write_sim2sim_checkpoint(tmp_path, robot_window_length=4)
+    runner = eval_sim2sim.Sim2SimEvalRunner(
+        Sim2SimEvalConfig(
+            checkpoint_path=str(checkpoint_path),
+            num_steps=2,
+            output_root=str(tmp_path / "runs-windowed-structured"),
+        )
+    )
+
+    summary = runner.evaluate()
+
+    env = _WindowedStructuredObsMujocoEnv.instances[-1]
     assert env.get_obs_dict_calls == [False, False, False]
     assert summary["aggregate_steps"] == 2

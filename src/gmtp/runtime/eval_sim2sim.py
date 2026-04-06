@@ -22,7 +22,10 @@ from gmtp.integrations.ref2act.mujoco import (
     resolve_action_mode,
     resolve_name_override,
 )
-from gmtp.integrations.ref2act.observation_history import build_gmtp_observation_spec
+from gmtp.integrations.ref2act.observation_history import (
+    build_gmtp_policy_observation_spec,
+    resolve_observation_window_lengths,
+)
 from gmtp.models import get_actor_observation
 from gmtp.runtime.checkpoints import load_checkpoint_v2
 from gmtp.runtime.config import Sim2SimEvalConfig
@@ -40,6 +43,10 @@ from gmtp.runtime.observations import (
     split_sim2sim_group_observations,
 )
 from gmtp.runtime.policy import load_actor_from_checkpoint, resolve_checkpoint_stem
+from gmtp.runtime.policy import (
+    build_motion_latent_adapter,
+    resolve_motion_encoder_checkpoint_path,
+)
 
 DEFAULT_VIDEO_HEIGHT = 720
 DEFAULT_VIDEO_WIDTH = 1280
@@ -197,7 +204,26 @@ class Sim2SimEvalRunner:
 
         checkpoint_env = self.checkpoint.env
         self.action_dim = _infer_action_dim(checkpoint_env)
-        self.sim2sim_obs_dims = infer_sim2sim_observation_dims(self.action_dim)
+        self.observation_window_lengths = resolve_observation_window_lengths(
+            robot_window_length=config.robot_window_length,
+            checkpoint_env=checkpoint_env,
+        )
+        resolved_motion_encoder_checkpoint = resolve_motion_encoder_checkpoint_path(
+            self.checkpoint,
+            override=config.motion_encoder_checkpoint,
+        )
+        self.motion_encoder_checkpoint = (
+            None if resolved_motion_encoder_checkpoint is None else str(resolved_motion_encoder_checkpoint)
+        )
+        self.motion_latent_adapter = build_motion_latent_adapter(
+            self.motion_encoder_checkpoint,
+            device=self.device,
+        )
+        self.sim2sim_obs_dims = infer_sim2sim_observation_dims(
+            self.action_dim,
+            observation_window_lengths=self.observation_window_lengths,
+        )
+        self.raw_obs_dims = dict(self.sim2sim_obs_dims)
         self.action_mode, self.action_mode_source = resolve_action_mode(
             checkpoint_env,
             config.action_mode,
@@ -218,17 +244,26 @@ class Sim2SimEvalRunner:
             DEFAULT_ANCHOR_BODY_NAME,
         )
 
-        self.obs_dims = infer_actor_observation_dims_from_state_dict(
+        self.obs_dims = (
+            self.motion_latent_adapter.augment_observation_dims(self.raw_obs_dims)
+            if self.motion_latent_adapter is not None
+            else self.raw_obs_dims
+        )
+        checkpoint_obs_dims = infer_actor_observation_dims_from_state_dict(
             self.checkpoint.model["actor"],
             self.checkpoint.actor_type,
         )
+        if checkpoint_obs_dims["motion"] != self.obs_dims["motion"] or checkpoint_obs_dims["robot"] != self.obs_dims["robot"]:
+            raise ValueError(
+                "Checkpoint actor observation dims do not match runtime env dims: "
+                f"checkpoint={checkpoint_obs_dims}, runtime={self.obs_dims}."
+            )
         self.actor, self.actor_type, self.actor_kwargs = load_actor_from_checkpoint(
             self.checkpoint,
             obs_dims=self.obs_dims,
             action_dim=self.action_dim,
             device=self.device,
             num_blocks=config.num_blocks,
-            attn_block_size=config.attn_block_size,
         )
         self._print_actor_weight_details()
 
@@ -245,8 +280,11 @@ class Sim2SimEvalRunner:
                 "actor_kwargs="
                 + ",".join(f"{key}={value}" for key, value in sorted(self.actor_kwargs.items()))
             )
-        if "num_blocks" in self.actor_kwargs:
-            details.append(f"num_blocks={self.actor_kwargs['num_blocks']}")
+        if self.observation_window_lengths:
+            details.append(
+                "observation_window_lengths="
+                + ",".join(f"{key}={value}" for key, value in sorted(self.observation_window_lengths.items()))
+            )
 
         details.extend(
             [
@@ -267,8 +305,8 @@ class Sim2SimEvalRunner:
         )
 
     def _validate_obs_dims(self, obs_parts: dict[str, torch.Tensor]) -> None:
-        expected_motion_dim = int(self.obs_dims["motion"])
-        expected_robot_dim = int(self.obs_dims["robot"])
+        expected_motion_dim = int(self.raw_obs_dims["motion"])
+        expected_robot_dim = int(self.raw_obs_dims["robot"])
         actual_motion_dim = int(obs_parts["motion"].numel())
         actual_robot_dim = int(obs_parts["robot"].numel())
         if actual_motion_dim != expected_motion_dim or actual_robot_dim != expected_robot_dim:
@@ -303,7 +341,10 @@ class Sim2SimEvalRunner:
                 init_parameters = {}
             if "observation_builder" in init_parameters:
                 env_kwargs["observation_builder"] = observation_builder_cls(
-                    spec=build_gmtp_observation_spec(add_noise=False)
+                    spec=build_gmtp_policy_observation_spec(
+                        add_noise=False,
+                        window_lengths=self.observation_window_lengths or None,
+                    )
                 )
         return symbols.MujocoEnv(**env_kwargs)
 
@@ -332,6 +373,7 @@ class Sim2SimEvalRunner:
                     structured_actor_obs["motion"],
                     structured_actor_obs["robot"],
                     self.action_dim,
+                    observation_window_lengths=self.observation_window_lengths,
                 )
 
             context_parts["motion"] = structured_actor_obs["motion"]
@@ -340,7 +382,11 @@ class Sim2SimEvalRunner:
             context_parts["robot_obs"] = structured_actor_obs["robot_obs"]
             return context_parts
 
-        return parse_sim2sim_obs(_coerce_flat_obs(obs), self.action_dim)
+        return parse_sim2sim_obs(
+            _coerce_flat_obs(obs),
+            self.action_dim,
+            observation_window_lengths=self.observation_window_lengths,
+        )
 
     def _build_video_path(self, motion_index: int, motion_file: str) -> Path:
         return self.run_paths.videos_dir / (
@@ -399,15 +445,21 @@ class Sim2SimEvalRunner:
         try:
             obs_parts = self._extract_obs_parts(env, env.reset())
             self._validate_obs_dims(obs_parts)
+            if self.motion_latent_adapter is not None:
+                self.motion_latent_adapter.initialize_history(env)
             if video_recorder is not None:
                 video_recorder.capture_frame()
 
             for step_idx in range(self.config.num_steps):
                 actor_env_obs = _tensor_dict_to_batch(obs_parts)
                 actor_obs = get_actor_observation(actor_env_obs, self.actor_type)
+                if self.motion_latent_adapter is not None:
+                    actor_obs = self.motion_latent_adapter.augment_actor_observation(actor_obs)
                 action, actor_log_fields = self._get_action(actor_obs)
 
                 next_obs_parts = self._extract_obs_parts(env, env.step(action))
+                if self.motion_latent_adapter is not None:
+                    self.motion_latent_adapter.update_history(env)
                 metrics = extract_sim2sim_metrics_from_parts(next_obs_parts)
                 metric_records.append(metrics)
 
@@ -441,6 +493,8 @@ class Sim2SimEvalRunner:
                 "metrics": _mean_metrics(metric_records),
                 "actor_type": self.actor_type.value,
                 "actor_kwargs": self.actor_kwargs,
+                "motion_encoder_checkpoint": self.motion_encoder_checkpoint,
+                "observation_window_lengths": self.observation_window_lengths,
                 "action_mode": self.action_mode,
                 "action_mode_source": self.action_mode_source,
                 "root_name": self.root_name,
@@ -480,6 +534,8 @@ class Sim2SimEvalRunner:
             "checkpoint": str(self.checkpoint_path),
             "actor_type": self.actor_type.value,
             "actor_kwargs": self.actor_kwargs,
+            "motion_encoder_checkpoint": self.motion_encoder_checkpoint,
+            "observation_window_lengths": self.observation_window_lengths,
             "action_mode": self.action_mode,
             "action_mode_source": self.action_mode_source,
             "root_name": self.root_name,

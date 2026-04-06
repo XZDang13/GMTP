@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from gmtp.integrations.ref2act.motion import resolve_motion_files
+
+from .config import MotionVAEFeatureConfig
+from .schema import FeatureSliceSpec, MotionFeatureSchema
+
+
+@dataclass(frozen=True)
+class MotionFeatureSequence:
+    motion_file: str
+    motion_name: str
+    full_features: torch.Tensor
+    reference_features: torch.Tensor
+    target_features: torch.Tensor
+
+    @property
+    def length(self) -> int:
+        return int(self.full_features.shape[0])
+
+
+@dataclass(frozen=True)
+class MotionFeatureBundle:
+    sequences: tuple[MotionFeatureSequence, ...]
+    schema: MotionFeatureSchema
+
+
+def quat_conjugate(q: torch.Tensor) -> torch.Tensor:
+    return torch.cat((q[..., :1], -q[..., 1:]), dim=-1)
+
+
+def quat_inv(q: torch.Tensor) -> torch.Tensor:
+    return quat_conjugate(q) / torch.sum(q * q, dim=-1, keepdim=True).clamp_min(1.0e-8)
+
+
+def quat_apply(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    q_xyz = q[..., 1:]
+    t = 2.0 * torch.cross(q_xyz, v, dim=-1)
+    return v + q[..., :1] * t + torch.cross(q_xyz, t, dim=-1)
+
+
+def quat_apply_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return quat_apply(quat_inv(q), v)
+
+
+def _build_named_slices(
+    names: tuple[str, ...],
+    base_slice_map: dict[str, FeatureSliceSpec],
+    *,
+    weights: dict[str, float] | None = None,
+) -> tuple[FeatureSliceSpec, ...]:
+    slices = []
+    offset = 0
+    for name in names:
+        try:
+            base_slice = base_slice_map[name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown feature block '{name}'.") from exc
+        next_offset = offset + base_slice.dim
+        slices.append(
+            FeatureSliceSpec(
+                name=name,
+                start=offset,
+                end=next_offset,
+                weight=float((weights or {}).get(name, 1.0)),
+            )
+        )
+        offset = next_offset
+    return tuple(slices)
+
+
+def _select_feature_blocks(
+    full_feature: torch.Tensor,
+    names: tuple[str, ...],
+    base_slice_map: dict[str, FeatureSliceSpec],
+) -> torch.Tensor:
+    parts = [full_feature[:, base_slice_map[name].start : base_slice_map[name].end] for name in names]
+    return torch.cat(parts, dim=-1)
+
+
+def _load_motion_asset(motion_file: str) -> dict[str, np.ndarray]:
+    with np.load(motion_file, allow_pickle=True) as payload:
+        return {key: payload[key] for key in payload.files}
+
+
+def build_motion_feature_bundle(
+    motion_files: list[str] | tuple[str, ...] | None,
+    *,
+    feature_config: MotionVAEFeatureConfig,
+    slice_weights: dict[str, float] | None = None,
+) -> MotionFeatureBundle:
+    resolved_motion_files = resolve_motion_files(motion_files)
+    sequences: list[MotionFeatureSequence] = []
+    joint_names_ref: tuple[str, ...] | None = None
+    body_names_ref: tuple[str, ...] | None = None
+    schema: MotionFeatureSchema | None = None
+
+    for motion_file in resolved_motion_files:
+        payload = _load_motion_asset(motion_file)
+        joint_names = tuple(str(item) for item in payload["joint_names"].tolist())
+        body_names = tuple(str(item) for item in payload["body_names"].tolist())
+        if joint_names_ref is None:
+            joint_names_ref = joint_names
+            body_names_ref = body_names
+        else:
+            if joint_names != joint_names_ref:
+                raise ValueError("All motion assets must share the same joint_names ordering.")
+            if body_names != body_names_ref:
+                raise ValueError("All motion assets must share the same body_names ordering.")
+
+        try:
+            anchor_body_index = body_names.index(feature_config.anchor_body_name)
+        except ValueError as exc:
+            raise ValueError(f"Anchor body '{feature_config.anchor_body_name}' was not found in {motion_file}.") from exc
+
+        try:
+            end_effector_body_indices = [body_names.index(name) for name in feature_config.end_effector_body_names]
+        except ValueError as exc:
+            raise ValueError(
+                f"One or more end-effector bodies {feature_config.end_effector_body_names} were not found in {motion_file}."
+            ) from exc
+
+        joint_pos = torch.as_tensor(payload["joint_pos"], dtype=torch.float32)
+        joint_vel = torch.as_tensor(payload["joint_vel"], dtype=torch.float32)
+        body_pos_w = torch.as_tensor(payload["body_pos_w"], dtype=torch.float32)
+        body_quat_w = torch.as_tensor(payload["body_quat_w"], dtype=torch.float32)
+
+        anchor_pos_w = body_pos_w[:, anchor_body_index]
+        anchor_quat_w = body_quat_w[:, anchor_body_index]
+        gravity = torch.as_tensor(feature_config.gravity_vector, dtype=torch.float32).reshape(1, 3).expand(
+            joint_pos.shape[0], 3
+        )
+        root_features = quat_apply_inverse(anchor_quat_w, gravity)
+
+        joint_features = torch.cat((joint_pos, joint_vel), dim=-1)
+
+        end_effector_pos_w = body_pos_w[:, end_effector_body_indices]
+        rel_end_effector_pos = quat_apply_inverse(
+            anchor_quat_w[:, None, :].expand_as(body_quat_w[:, end_effector_body_indices]),
+            end_effector_pos_w - anchor_pos_w[:, None, :],
+        ).reshape(joint_pos.shape[0], -1)
+
+        base_slices = (
+            FeatureSliceSpec(name="root", start=0, end=root_features.shape[-1]),
+            FeatureSliceSpec(
+                name="joint",
+                start=root_features.shape[-1],
+                end=root_features.shape[-1] + joint_features.shape[-1],
+            ),
+            FeatureSliceSpec(
+                name="end_effector",
+                start=root_features.shape[-1] + joint_features.shape[-1],
+                end=root_features.shape[-1] + joint_features.shape[-1] + rel_end_effector_pos.shape[-1],
+            ),
+        )
+        base_slice_map = {item.name: item for item in base_slices}
+
+        full_features = torch.cat((root_features, joint_features, rel_end_effector_pos), dim=-1)
+        reference_features = _select_feature_blocks(full_features, feature_config.reference_feature_names, base_slice_map)
+        target_features = _select_feature_blocks(full_features, feature_config.target_feature_names, base_slice_map)
+
+        if schema is None:
+            target_slices = _build_named_slices(
+                feature_config.target_feature_names,
+                base_slice_map,
+                weights=slice_weights,
+            )
+            policy_prefix_dim = sum(
+                next(item.dim for item in target_slices if item.name == feature_name)
+                for feature_name in feature_config.policy_feature_names
+            )
+            schema = MotionFeatureSchema(
+                d_ref=int(reference_features.shape[-1]),
+                d_target=int(target_features.shape[-1]),
+                full_feature_dim=int(full_features.shape[-1]),
+                base_slices=base_slices,
+                reference_slices=_build_named_slices(feature_config.reference_feature_names, base_slice_map),
+                target_slices=target_slices,
+                policy_motion_slice=FeatureSliceSpec(
+                    name="policy_motion",
+                    start=0,
+                    end=policy_prefix_dim,
+                ),
+                anchor_body_name=feature_config.anchor_body_name,
+                end_effector_body_names=feature_config.end_effector_body_names,
+                reference_feature_names=feature_config.reference_feature_names,
+                target_feature_names=feature_config.target_feature_names,
+                policy_feature_names=feature_config.policy_feature_names,
+                gravity_vector=feature_config.gravity_vector,
+                joint_names=joint_names,
+                body_names=body_names,
+            )
+
+        sequences.append(
+            MotionFeatureSequence(
+                motion_file=str(Path(motion_file).resolve()),
+                motion_name=Path(motion_file).stem,
+                full_features=full_features,
+                reference_features=reference_features,
+                target_features=target_features,
+            )
+        )
+
+    if not sequences or schema is None:
+        raise ValueError("No motion sequences were loaded for motion VAE pretraining.")
+
+    return MotionFeatureBundle(sequences=tuple(sequences), schema=schema)

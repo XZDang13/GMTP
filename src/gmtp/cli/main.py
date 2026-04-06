@@ -8,22 +8,10 @@ from gmtp.runtime.config import IsaacEvalConfig, RunConfig, Sim2SimEvalConfig
 def _add_num_blocks_argument(parser: argparse.ArgumentParser, *, default) -> None:
     parser.add_argument("--num-blocks", dest="num_blocks", type=int, default=default)
     parser.add_argument("--film-res-blocks", dest="num_blocks", type=int, help=argparse.SUPPRESS)
-    parser.add_argument("--adain-res-blocks", dest="num_blocks", type=int, help=argparse.SUPPRESS)
 
 
-def _add_attn_block_size_argument(parser: argparse.ArgumentParser, *, default) -> None:
-    parser.add_argument(
-        "--attn-block-size",
-        dest="attn_block_size",
-        type=int,
-        default=default,
-    )
-    parser.add_argument(
-        "--film-attn-res-block-size",
-        dest="attn_block_size",
-        type=int,
-        help=argparse.SUPPRESS,
-    )
+def _add_robot_window_length_argument(parser: argparse.ArgumentParser, *, default) -> None:
+    parser.add_argument("--robot-window-length", type=int, default=default)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,7 +20,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     train_parser = subparsers.add_parser("train", help="Train a policy in Isaac Lab.")
     _add_num_blocks_argument(train_parser, default=6)
-    _add_attn_block_size_argument(train_parser, default=4)
+    _add_robot_window_length_argument(train_parser, default=4)
+    train_parser.add_argument("--motion-encoder-checkpoint", default=None)
     train_parser.add_argument("--rollout-steps", type=int, default=20)
     train_parser.add_argument("--num-updates", type=int, default=1000)
     train_parser.add_argument("--checkpoint-interval", type=int, default=4000)
@@ -41,13 +30,23 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--disable-wandb", action="store_true")
     train_parser.add_argument("--headless", action="store_true")
 
+    pretrain_parser = subparsers.add_parser("pretrain", help="Offline pretraining utilities.")
+    pretrain_subparsers = pretrain_parser.add_subparsers(dest="pretrain_target", required=True)
+    motion_vae_parser = pretrain_subparsers.add_parser("motion-vae", help="Pretrain the reference motion VAE.")
+    motion_vae_parser.add_argument("--config", required=True)
+    motion_vae_parser.add_argument("--motion-files", nargs="+", default=None)
+    motion_vae_parser.add_argument("--output-root", default=None)
+    motion_vae_parser.add_argument("--run-name", default=None)
+    motion_vae_parser.add_argument("--device", default=None)
+
     eval_parser = subparsers.add_parser("eval", help="Evaluate a policy.")
     eval_subparsers = eval_parser.add_subparsers(dest="eval_target", required=True)
 
     isaac_parser = eval_subparsers.add_parser("isaac", help="Evaluate a checkpoint in Isaac Lab.")
     isaac_parser.add_argument("--checkpoint", required=True)
     _add_num_blocks_argument(isaac_parser, default=None)
-    _add_attn_block_size_argument(isaac_parser, default=None)
+    _add_robot_window_length_argument(isaac_parser, default=None)
+    isaac_parser.add_argument("--motion-encoder-checkpoint", default=None)
     isaac_parser.add_argument("--num-steps", type=int, default=1000)
     isaac_parser.add_argument("--progress-interval", type=int, default=50)
     isaac_parser.add_argument("--show-reference-motion", action="store_true")
@@ -58,7 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     sim2sim_parser.add_argument("--checkpoint", required=True)
     sim2sim_parser.add_argument("--motion-files", nargs="+", default=None)
     _add_num_blocks_argument(sim2sim_parser, default=None)
-    _add_attn_block_size_argument(sim2sim_parser, default=None)
+    _add_robot_window_length_argument(sim2sim_parser, default=None)
+    sim2sim_parser.add_argument("--motion-encoder-checkpoint", default=None)
     sim2sim_parser.add_argument("--num-steps", type=int, default=2000)
     sim2sim_parser.add_argument("--simulation-dt", type=float, default=1 / 200)
     sim2sim_parser.add_argument("--decimation", type=int, default=4)
@@ -84,7 +84,8 @@ def _run_train(args) -> int:
         TrainRunner(
             RunConfig(
                 num_blocks=args.num_blocks,
-                attn_block_size=args.attn_block_size,
+                robot_window_length=args.robot_window_length,
+                motion_encoder_checkpoint=args.motion_encoder_checkpoint,
                 rollout_steps=args.rollout_steps,
                 num_updates=args.num_updates,
                 checkpoint_interval=args.checkpoint_interval,
@@ -110,7 +111,8 @@ def _run_eval_isaac(args) -> int:
             IsaacEvalConfig(
                 checkpoint_path=args.checkpoint,
                 num_blocks=args.num_blocks,
-                attn_block_size=args.attn_block_size,
+                robot_window_length=args.robot_window_length,
+                motion_encoder_checkpoint=args.motion_encoder_checkpoint,
                 num_steps=args.num_steps,
                 progress_interval=args.progress_interval,
                 show_reference_motion=args.show_reference_motion,
@@ -130,7 +132,8 @@ def _run_eval_sim2sim(args) -> int:
             checkpoint_path=args.checkpoint,
             motion_files=args.motion_files,
             num_blocks=args.num_blocks,
-            attn_block_size=args.attn_block_size,
+            robot_window_length=args.robot_window_length,
+            motion_encoder_checkpoint=args.motion_encoder_checkpoint,
             num_steps=args.num_steps,
             simulation_dt=args.simulation_dt,
             decimation=args.decimation,
@@ -146,11 +149,29 @@ def _run_eval_sim2sim(args) -> int:
     return 0
 
 
+def _run_pretrain_motion_vae(args) -> int:
+    from gmtp.motion_vae import apply_motion_vae_cli_overrides, load_motion_vae_pretrain_config
+    from gmtp.runtime.motion_vae_pretrain import MotionVAEPretrainRunner
+
+    config = load_motion_vae_pretrain_config(args.config)
+    config = apply_motion_vae_cli_overrides(
+        config,
+        motion_files=args.motion_files,
+        output_root=args.output_root,
+        run_name=args.run_name,
+        device=args.device,
+    )
+    MotionVAEPretrainRunner(config).train()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "train":
         return _run_train(args)
+    if args.command == "pretrain" and args.pretrain_target == "motion-vae":
+        return _run_pretrain_motion_vae(args)
     if args.command == "eval" and args.eval_target == "isaac":
         return _run_eval_isaac(args)
     if args.command == "eval" and args.eval_target == "sim2sim":

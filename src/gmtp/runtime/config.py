@@ -6,7 +6,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class RunConfig:
     num_blocks: int = 6
-    attn_block_size: int = 4
+    robot_window_length: int = 4
+    motion_encoder_checkpoint: str | None = None
     rollout_steps: int = 20
     num_updates: int = 1000
     checkpoint_interval: int = 4000
@@ -19,7 +20,8 @@ class RunConfig:
 class IsaacEvalConfig:
     checkpoint_path: str
     num_blocks: int | None = None
-    attn_block_size: int | None = None
+    robot_window_length: int | None = None
+    motion_encoder_checkpoint: str | None = None
     num_steps: int = 1000
     progress_interval: int = 50
     show_reference_motion: bool = False
@@ -31,7 +33,8 @@ class Sim2SimEvalConfig:
     checkpoint_path: str
     motion_files: list[str] | None = None
     num_blocks: int | None = None
-    attn_block_size: int | None = None
+    robot_window_length: int | None = None
+    motion_encoder_checkpoint: str | None = None
     num_steps: int = 2000
     simulation_dt: float = 1 / 200
     decimation: int = 4

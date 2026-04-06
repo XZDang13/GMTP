@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from gmtp.models import Critic, FiLMAttnResActor
+from gmtp.integrations.ref2act.observation_history import build_robot_policy_window_lengths
+from gmtp.models import Critic, FiLMResActor
 from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
 from gmtp.runtime.observations import parse_sim2sim_obs
 
@@ -29,8 +30,15 @@ def _write_sim2sim_checkpoint(
     action_mode: str = "offset",
     root_name: str = "torso_link",
     anchor_body_name: str = "torso_link",
+    robot_window_length: int = 1,
 ) -> Path:
-    actor = FiLMAttnResActor(robot_obs_dim=12, motion_obs_dim=7, action_dim=2, num_blocks=4, attn_block_size=2)
+    actor = FiLMResActor(
+        robot_obs_dim=12 * robot_window_length,
+        motion_obs_dim=7,
+        action_dim=2,
+        num_blocks=4,
+        robot_window_length=robot_window_length,
+    )
     critic = Critic(obs_dim=5)
     checkpoint = build_training_checkpoint(
         actor=actor,
@@ -48,6 +56,9 @@ def _write_sim2sim_checkpoint(
         action_mode=action_mode,
         root_name=root_name,
         anchor_body_name=anchor_body_name,
+        observation_window_lengths=(
+            build_robot_policy_window_lengths(robot_window_length) if robot_window_length > 1 else None
+        ),
     )
     return save_checkpoint_v2(checkpoint, tmp_path / "model_v2.pth")
 
@@ -82,6 +93,30 @@ def _make_flat_obs(step: int, bias: float) -> torch.Tensor:
             previous_action,
         ]
     )
+
+
+def _robot_history_steps(step: int, window_length: int) -> list[int]:
+    prefix_count = max(window_length - (step + 1), 0)
+    start = max(step - window_length + 1, 0)
+    return [0] * prefix_count + list(range(start, step + 1))
+
+
+def _make_windowed_flat_obs(step: int, bias: float, window_length: int) -> torch.Tensor:
+    latest_parts = parse_sim2sim_obs(_make_flat_obs(step=step, bias=bias), action_dim=2)
+    history_parts = [
+        parse_sim2sim_obs(_make_flat_obs(step=history_step, bias=bias), action_dim=2)
+        for history_step in _robot_history_steps(step, window_length)
+    ]
+    robot_obs = torch.cat(
+        [
+            torch.cat([parts["robot_projected_gravity"] for parts in history_parts]),
+            torch.cat([parts["anchor_ang_vel"] for parts in history_parts]),
+            torch.cat([parts["robot_joint_pos"] for parts in history_parts]),
+            torch.cat([parts["robot_joint_vel"] for parts in history_parts]),
+            torch.cat([parts["previous_action"] for parts in history_parts]),
+        ]
+    )
+    return torch.cat([latest_parts["motion"], robot_obs])
 
 
 class _FakeMujocoEnv:
@@ -177,6 +212,37 @@ class _StructuredObsMujocoEnv(_FakeMujocoEnv):
         return torch.tensor([456.0], dtype=torch.float32)
 
 
+class _WindowedMujocoEnv(_FakeMujocoEnv):
+    robot_window_length = 4
+
+    def reset(self):
+        super().reset()
+        return _make_windowed_flat_obs(step=0, bias=self.bias, window_length=self.robot_window_length)
+
+    def step(self, action):
+        super().step(action)
+        return _make_windowed_flat_obs(
+            step=self.step_count,
+            bias=self.bias,
+            window_length=self.robot_window_length,
+        )
+
+
+class _WindowedStructuredObsMujocoEnv(_StructuredObsMujocoEnv):
+    robot_window_length = 4
+
+    def _build_obs_dict(self) -> dict[str, torch.Tensor]:
+        parts = parse_sim2sim_obs(
+            _make_windowed_flat_obs(step=self.step_count, bias=self.bias, window_length=self.robot_window_length),
+            action_dim=self.action_dim,
+            observation_window_lengths=build_robot_policy_window_lengths(self.robot_window_length),
+        )
+        return {
+            "motion": parts["motion"],
+            "robot": parts["robot"],
+        }
+
+
 class _ExplodingEvalModule:
     def __getattr__(self, name):
         raise AssertionError(f"deploy_mujoco.py should not depend on gmtp.runtime.eval_sim2sim ({name}).")
@@ -263,6 +329,47 @@ def test_script_prefers_structured_obs_dict_when_available(tmp_path, monkeypatch
     assert env.get_obs_dict_calls == [False, False, False]
 
 
+def test_script_restores_windowed_robot_obs_from_checkpoint_metadata(tmp_path, monkeypatch):
+    checkpoint_path = _write_sim2sim_checkpoint(tmp_path, robot_window_length=4)
+    module = _load_script_module("deploy_mujoco_windowed")
+    monkeypatch.setattr(module, "get_mujoco_symbols", lambda: types.SimpleNamespace(MujocoEnv=_WindowedMujocoEnv))
+
+    result = module.main(
+        [
+            "--checkpoint",
+            str(checkpoint_path),
+            "--num-steps",
+            "2",
+            "--headless",
+        ]
+    )
+
+    assert result == 0
+    env = _FakeMujocoEnv.instances[-1]
+    assert env.step_count == 2
+
+
+def test_script_prefers_structured_windowed_obs_dict_when_available(tmp_path, monkeypatch):
+    checkpoint_path = _write_sim2sim_checkpoint(tmp_path, robot_window_length=4)
+    module = _load_script_module("deploy_mujoco_windowed_structured")
+    monkeypatch.setattr(module, "get_mujoco_symbols", lambda: types.SimpleNamespace(MujocoEnv=_WindowedStructuredObsMujocoEnv))
+
+    result = module.main(
+        [
+            "--checkpoint",
+            str(checkpoint_path),
+            "--num-steps",
+            "2",
+            "--headless",
+        ]
+    )
+
+    assert result == 0
+    env = _FakeMujocoEnv.instances[-1]
+    assert env.step_count == 2
+    assert env.get_obs_dict_calls == [False, False, False]
+
+
 def test_script_stops_after_requested_number_of_steps(tmp_path, monkeypatch):
     checkpoint_path = _write_sim2sim_checkpoint(tmp_path)
     module = _load_script_module("deploy_mujoco_num_steps")
@@ -300,7 +407,7 @@ def test_extract_obs_parts_uses_mujoco_free_joint_gravity_and_base_ang_vel(tmp_p
     )
     env = _FakeMujocoEnv.instances[-1]
     initial_obs = env.get_obs_dict(advance_time=False)
-    obs_parts = module._extract_obs_parts(env, initial_obs, action_dim=2)
+    obs_parts = module._extract_obs_parts(env, initial_obs, action_dim=2, observation_window_lengths={})
 
     assert obs_parts["robot_projected_gravity"] == pytest.approx(torch.tensor([0.0, -0.0, -1.0]))
     assert obs_parts["anchor_ang_vel"] == pytest.approx(torch.tensor([0.1, 0.2, 0.3]))

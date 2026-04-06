@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from gmtp.integrations.ref2act.motion import motion_label, motion_names, resolve_motion_files
+from gmtp.integrations.ref2act.observation_history import normalize_observation_window_lengths
 from gmtp.models import ActorType, get_actor_kwargs
 
 CHECKPOINT_VERSION = 2
@@ -58,6 +59,15 @@ class CheckpointV2:
     def motion_files(self) -> list[str]:
         return list(self.env.get("motion_files", []))
 
+    @property
+    def observation_window_lengths(self) -> dict[str, int]:
+        return normalize_observation_window_lengths(self.env.get("observation_window_lengths"))
+
+    @property
+    def motion_encoder_checkpoint(self) -> str | None:
+        value = self.artifacts.get("motion_encoder_checkpoint")
+        return None if value is None else str(value)
+
 
 def load_checkpoint_v2(path: str | Path) -> CheckpointV2:
     checkpoint_path = Path(path).expanduser().resolve()
@@ -85,34 +95,45 @@ def build_training_checkpoint(
     action_mode: str | None,
     root_name: str | None,
     anchor_body_name: str | None,
+    motion_encoder_checkpoint: str | None = None,
+    observation_window_lengths: dict[str, int] | None = None,
     artifacts: dict[str, Any] | None = None,
     created_at: str | None = None,
 ) -> CheckpointV2:
     resolved_motion_files = resolve_motion_files(motion_files)
+    resolved_window_lengths = normalize_observation_window_lengths(observation_window_lengths)
+    env_payload = {
+        "motion_files": resolved_motion_files,
+        "motion_names": motion_names(resolved_motion_files),
+        "joint_names": joint_params["joint_names"],
+        "joint_effort_limits": joint_params["joint_effort_limits"],
+        "joint_pos_limits": joint_params["joint_pos_limits"],
+        "joint_stiffness": joint_params["joint_stiffness"],
+        "joint_damping": joint_params["joint_damping"],
+        "action_offset": joint_params["action_offset"],
+        "action_scale": joint_params["action_scale"],
+        "action_mode": action_mode,
+        "root_name": root_name,
+        "anchor_body_name": anchor_body_name,
+    }
+    if observation_window_lengths is not None:
+        env_payload["observation_window_lengths"] = resolved_window_lengths
+
+    artifact_payload = dict(artifacts or {})
+    if motion_encoder_checkpoint is not None:
+        artifact_payload["motion_encoder_checkpoint"] = str(Path(motion_encoder_checkpoint).expanduser().resolve())
+
     return CheckpointV2(
         meta={
             "created_at": created_at or datetime.now().isoformat(timespec="seconds"),
-            "actor_type": ActorType.FILM_ATTN_RES.value,
-            "actor_kwargs": get_actor_kwargs(actor, ActorType.FILM_ATTN_RES),
+            "actor_type": ActorType.FILM_RES.value,
+            "actor_kwargs": get_actor_kwargs(actor, ActorType.FILM_RES),
             "motion_label": motion_label(resolved_motion_files),
         },
         model={
             "actor": actor.state_dict(),
             "critic": critic.state_dict(),
         },
-        env={
-            "motion_files": resolved_motion_files,
-            "motion_names": motion_names(resolved_motion_files),
-            "joint_names": joint_params["joint_names"],
-            "joint_effort_limits": joint_params["joint_effort_limits"],
-            "joint_pos_limits": joint_params["joint_pos_limits"],
-            "joint_stiffness": joint_params["joint_stiffness"],
-            "joint_damping": joint_params["joint_damping"],
-            "action_offset": joint_params["action_offset"],
-            "action_scale": joint_params["action_scale"],
-            "action_mode": action_mode,
-            "root_name": root_name,
-            "anchor_body_name": anchor_body_name,
-        },
-        artifacts=artifacts or {},
+        env=env_payload,
+        artifacts=artifact_payload,
     )

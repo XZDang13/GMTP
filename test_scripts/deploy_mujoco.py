@@ -22,11 +22,25 @@ from gmtp.integrations.ref2act.mujoco import (
     resolve_action_mode,
     resolve_name_override,
 )
-from gmtp.integrations.ref2act.observation_history import build_gmtp_observation_spec
+from gmtp.integrations.ref2act.observation_history import (
+    build_gmtp_policy_observation_spec,
+    resolve_observation_window_lengths,
+)
 from gmtp.models import get_actor_observation
 from gmtp.runtime.checkpoints import load_checkpoint_v2
-from gmtp.runtime.observations import infer_actor_observation_dims_from_state_dict, parse_sim2sim_obs
-from gmtp.runtime.policy import load_actor_from_checkpoint
+from gmtp.runtime.observations import (
+    extract_sim2sim_actor_obs_from_mapping,
+    infer_actor_observation_dims_from_state_dict,
+    infer_sim2sim_observation_dims,
+    parse_sim2sim_obs,
+    replace_sim2sim_group_latest_terms,
+    split_sim2sim_group_observations,
+)
+from gmtp.runtime.policy import (
+    build_motion_latent_adapter,
+    load_actor_from_checkpoint,
+    resolve_motion_encoder_checkpoint_path,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,7 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--motion-file", default=None)
     parser.add_argument("--num-blocks", type=int, default=None)
-    parser.add_argument("--attn-block-size", type=int, default=None)
+    parser.add_argument("--robot-window-length", type=int, default=None)
+    parser.add_argument("--motion-encoder-checkpoint", default=None)
     parser.add_argument("--num-steps", type=int, default=2000)
     parser.add_argument("--simulation-dt", type=float, default=1 / 200)
     parser.add_argument("--decimation", type=int, default=4)
@@ -72,6 +87,7 @@ def _infer_action_dim(checkpoint_env: Mapping[str, Any]) -> int:
 def _resolve_motion_file(
     *,
     checkpoint_path: Path,
+    checkpoint_actor_type: str,
     checkpoint_env: dict[str, Any],
     explicit_motion_file: str | None,
 ) -> str:
@@ -80,7 +96,7 @@ def _resolve_motion_file(
 
     motion_files = infer_motion_files_from_checkpoint(
         checkpoint_path,
-        "film_attn_res",
+        checkpoint_actor_type,
         checkpoint_env,
         default_motion_files=DEFAULT_EXPERIMENT_MOTION_FILES,
     )
@@ -118,7 +134,13 @@ def _get_gravity_orientation(quaternion: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _override_robot_terms_from_mujoco_state(env: Any, obs_parts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _override_robot_terms_from_mujoco_state(
+    env: Any,
+    obs_parts: dict[str, torch.Tensor],
+    *,
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None,
+) -> dict[str, torch.Tensor]:
     mj_data = getattr(env, "mj_data", None)
     if mj_data is None:
         return obs_parts
@@ -139,68 +161,18 @@ def _override_robot_terms_from_mujoco_state(env: Any, obs_parts: dict[str, torch
     obs_parts = dict(obs_parts)
     obs_parts["robot_projected_gravity"] = robot_projected_gravity
     obs_parts["anchor_ang_vel"] = anchor_ang_vel
-    obs_parts["robot"] = torch.cat(
-        (
-            robot_projected_gravity,
-            anchor_ang_vel,
-            obs_parts["robot_joint_pos"],
-            obs_parts["robot_joint_vel"],
-            obs_parts["previous_action"],
-        ),
-        dim=-1,
+    obs_parts["robot"] = replace_sim2sim_group_latest_terms(
+        obs_parts["robot"],
+        group_name="robot",
+        action_dim=action_dim,
+        latest_terms={
+            "projected_gravity": robot_projected_gravity,
+            "anchor_ang_vel_b": anchor_ang_vel,
+        },
+        observation_window_lengths=observation_window_lengths,
     )
     obs_parts["robot_obs"] = obs_parts["robot"]
     return obs_parts
-
-
-def _coerce_obs_vector(value: Any, *, name: str, expected_dim: int) -> torch.Tensor:
-    tensor = torch.as_tensor(value, dtype=torch.float32).reshape(-1)
-    if tensor.numel() != expected_dim:
-        raise ValueError(f"Expected structured sim2sim {name} dim {expected_dim}, got {tensor.numel()}.")
-    return tensor
-
-
-def _parse_structured_obs(obs: Mapping[str, Any], action_dim: int) -> dict[str, torch.Tensor] | None:
-    motion_value = obs.get("motion", obs.get("motion_obs"))
-    robot_value = obs.get("robot", obs.get("robot_obs"))
-    if motion_value is None or robot_value is None:
-        return None
-
-    motion = _coerce_obs_vector(motion_value, name="motion", expected_dim=action_dim * 2 + 3)
-    robot = _coerce_obs_vector(robot_value, name="robot", expected_dim=action_dim * 3 + 6)
-
-    motion_offset = 0
-    target_projected_gravity = motion[motion_offset : motion_offset + 3]
-    motion_offset += 3
-    target_joint_pos = motion[motion_offset : motion_offset + action_dim]
-    motion_offset += action_dim
-    target_joint_vel = motion[motion_offset : motion_offset + action_dim]
-
-    robot_offset = 0
-    robot_projected_gravity = robot[robot_offset : robot_offset + 3]
-    robot_offset += 3
-    anchor_ang_vel = robot[robot_offset : robot_offset + 3]
-    robot_offset += 3
-    robot_joint_pos = robot[robot_offset : robot_offset + action_dim]
-    robot_offset += action_dim
-    robot_joint_vel = robot[robot_offset : robot_offset + action_dim]
-    robot_offset += action_dim
-    previous_action = robot[robot_offset : robot_offset + action_dim]
-
-    return {
-        "motion": motion,
-        "robot": robot,
-        "motion_obs": motion,
-        "robot_obs": robot,
-        "target_projected_gravity": target_projected_gravity,
-        "target_joint_pos": target_joint_pos,
-        "target_joint_vel": target_joint_vel,
-        "robot_projected_gravity": robot_projected_gravity,
-        "anchor_ang_vel": anchor_ang_vel,
-        "robot_joint_pos": robot_joint_pos,
-        "robot_joint_vel": robot_joint_vel,
-        "previous_action": previous_action,
-    }
 
 
 def _coerce_flat_obs(obs: Any) -> torch.Tensor:
@@ -208,7 +180,12 @@ def _coerce_flat_obs(obs: Any) -> torch.Tensor:
     return tensor
 
 
-def _extract_obs_parts(env: Any, obs: Any, action_dim: int) -> dict[str, torch.Tensor]:
+def _extract_obs_parts(
+    env: Any,
+    obs: Any,
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None,
+) -> dict[str, torch.Tensor]:
     structured_obs = None
     if isinstance(obs, Mapping):
         structured_obs = obs
@@ -219,12 +196,27 @@ def _extract_obs_parts(env: Any, obs: Any, action_dim: int) -> dict[str, torch.T
             structured_obs = None
 
     if structured_obs is not None:
-        obs_parts = _parse_structured_obs(structured_obs, action_dim)
-        if obs_parts is None:
+        structured_actor_obs = extract_sim2sim_actor_obs_from_mapping(structured_obs)
+        if structured_actor_obs is None:
             raise KeyError("Expected structured sim2sim observation mapping to include motion/robot entries.")
+        obs_parts = split_sim2sim_group_observations(
+            structured_actor_obs["motion"],
+            structured_actor_obs["robot"],
+            action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
     else:
-        obs_parts = parse_sim2sim_obs(_coerce_flat_obs(obs), action_dim)
-    return _override_robot_terms_from_mujoco_state(env, obs_parts)
+        obs_parts = parse_sim2sim_obs(
+            _coerce_flat_obs(obs),
+            action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
+    return _override_robot_terms_from_mujoco_state(
+        env,
+        obs_parts,
+        action_dim=action_dim,
+        observation_window_lengths=observation_window_lengths,
+    )
 
 
 def _tensor_dict_to_batch(obs_parts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -253,6 +245,7 @@ def _build_env(
     root_name: str,
     anchor_body_name: str,
     render: bool,
+    observation_window_lengths: Mapping[str, int] | None,
 ) -> Any:
     symbols = get_mujoco_symbols()
     env_kwargs = {
@@ -277,7 +270,12 @@ def _build_env(
         except (TypeError, ValueError):
             init_parameters = {}
         if "observation_builder" in init_parameters:
-            env_kwargs["observation_builder"] = observation_builder_cls(spec=build_gmtp_observation_spec(add_noise=False))
+            env_kwargs["observation_builder"] = observation_builder_cls(
+                spec=build_gmtp_policy_observation_spec(
+                    add_noise=False,
+                    window_lengths=observation_window_lengths or None,
+                )
+            )
     return symbols.MujocoEnv(**env_kwargs)
 
 
@@ -294,8 +292,13 @@ def run(args: argparse.Namespace) -> int:
     checkpoint = load_checkpoint_v2(checkpoint_path)
     checkpoint_env = checkpoint.env
     action_dim = _infer_action_dim(checkpoint_env)
+    observation_window_lengths = resolve_observation_window_lengths(
+        robot_window_length=args.robot_window_length,
+        checkpoint_env=checkpoint_env,
+    )
     motion_file = _resolve_motion_file(
         checkpoint_path=checkpoint_path,
+        checkpoint_actor_type=checkpoint.actor_type,
         checkpoint_env=checkpoint_env,
         explicit_motion_file=args.motion_file,
     )
@@ -319,17 +322,38 @@ def run(args: argparse.Namespace) -> int:
         DEFAULT_ANCHOR_BODY_NAME,
     )
 
-    obs_dims = infer_actor_observation_dims_from_state_dict(
+    motion_encoder_checkpoint = resolve_motion_encoder_checkpoint_path(
+        checkpoint,
+        override=args.motion_encoder_checkpoint,
+    )
+    motion_latent_adapter = build_motion_latent_adapter(
+        motion_encoder_checkpoint,
+        device=torch.device("cpu"),
+    )
+    raw_obs_dims = infer_sim2sim_observation_dims(
+        action_dim,
+        observation_window_lengths=observation_window_lengths,
+    )
+    obs_dims = (
+        motion_latent_adapter.augment_observation_dims(raw_obs_dims)
+        if motion_latent_adapter is not None
+        else raw_obs_dims
+    )
+    checkpoint_obs_dims = infer_actor_observation_dims_from_state_dict(
         checkpoint.model["actor"],
         checkpoint.actor_type,
     )
+    if checkpoint_obs_dims["motion"] != obs_dims["motion"] or checkpoint_obs_dims["robot"] != obs_dims["robot"]:
+        raise ValueError(
+            "Checkpoint actor observation dims do not match runtime env dims: "
+            f"checkpoint={checkpoint_obs_dims}, runtime={obs_dims}."
+        )
     actor, actor_type, actor_kwargs = load_actor_from_checkpoint(
         checkpoint,
         obs_dims=obs_dims,
         action_dim=action_dim,
         device=torch.device("cpu"),
         num_blocks=args.num_blocks,
-        attn_block_size=args.attn_block_size,
     )
     render = not args.headless
     env = _build_env(
@@ -341,6 +365,7 @@ def run(args: argparse.Namespace) -> int:
         root_name=root_name,
         anchor_body_name=anchor_body_name,
         render=render,
+        observation_window_lengths=observation_window_lengths,
     )
 
     print(
@@ -351,10 +376,19 @@ def run(args: argparse.Namespace) -> int:
 
     steps_executed = 0
     try:
-        obs_parts = _extract_obs_parts(env, env.reset(), action_dim)
+        obs_parts = _extract_obs_parts(
+            env,
+            env.reset(),
+            action_dim,
+            observation_window_lengths,
+        )
+        if motion_latent_adapter is not None:
+            motion_latent_adapter.initialize_history(env)
         while steps_executed < args.num_steps and _viewer_is_running(env, render=render):
             actor_env_obs = _tensor_dict_to_batch(obs_parts)
             actor_obs = get_actor_observation(actor_env_obs, actor_type)
+            if motion_latent_adapter is not None:
+                actor_obs = motion_latent_adapter.augment_actor_observation(actor_obs)
             actor_step = actor(actor_obs)
             action = actor_step.mean.squeeze(0).detach().to(device="cpu", dtype=torch.float32)
             if not torch.isfinite(action).all():
@@ -363,7 +397,14 @@ def run(args: argparse.Namespace) -> int:
                     f"max={float(action.max().item()):.6f}"
                 )
 
-            obs_parts = _extract_obs_parts(env, env.step(action), action_dim)
+            obs_parts = _extract_obs_parts(
+                env,
+                env.step(action),
+                action_dim,
+                observation_window_lengths,
+            )
+            if motion_latent_adapter is not None:
+                motion_latent_adapter.update_history(env)
             steps_executed += 1
     finally:
         env.close()

@@ -10,6 +10,15 @@ ObservationNoiseSpec = _OBSERVATION_SPEC.ObservationNoiseSpec
 ObservationSpec = _OBSERVATION_SPEC.ObservationSpec
 ObservationTermSpec = _OBSERVATION_SPEC.ObservationTermSpec
 
+DEFAULT_ROBOT_WINDOW_LENGTH = 4
+ROBOT_POLICY_OBSERVATION_TERM_IDS = (
+    "projected_gravity",
+    "anchor_ang_vel_b",
+    "joint_pos",
+    "joint_vel",
+    "previous_action",
+)
+
 # Keep Isaac and MuJoCo observation layouts aligned in one place.
 DEFAULT_OBSERVATION_WINDOW_LENGTHS: dict[str, int] = {
     "target_projected_gravity": 1,
@@ -40,6 +49,55 @@ def _window_length(term_id: str, overrides: Mapping[str, int] | None) -> int:
     if value < 1:
         raise ValueError(f"Observation window length for '{term_id}' must be positive, got {value}.")
     return value
+
+
+def build_robot_policy_window_lengths(robot_window_length: int) -> dict[str, int]:
+    value = int(robot_window_length)
+    if value < 1:
+        raise ValueError(f"Robot observation window length must be positive, got {value}.")
+    return {term_id: value for term_id in ROBOT_POLICY_OBSERVATION_TERM_IDS}
+
+
+def normalize_observation_window_lengths(window_lengths: Mapping[str, int] | None) -> dict[str, int]:
+    if window_lengths is None:
+        return {}
+
+    normalized = {}
+    for term_id, value in window_lengths.items():
+        normalized[str(term_id)] = _window_length(str(term_id), {str(term_id): int(value)})
+
+    robot_term_lengths = {term_id: normalized.get(term_id, 1) for term_id in ROBOT_POLICY_OBSERVATION_TERM_IDS}
+    if any(term_id in normalized for term_id in ROBOT_POLICY_OBSERVATION_TERM_IDS):
+        unique_lengths = set(robot_term_lengths.values())
+        if len(unique_lengths) != 1:
+            raise ValueError(
+                "Robot policy observation window lengths must match across "
+                f"{ROBOT_POLICY_OBSERVATION_TERM_IDS}, got {robot_term_lengths}."
+            )
+
+    return normalized
+
+
+def resolve_observation_window_lengths(
+    *,
+    robot_window_length: int | None = None,
+    checkpoint_env: Mapping[str, object] | None = None,
+) -> dict[str, int]:
+    if robot_window_length is not None:
+        return build_robot_policy_window_lengths(robot_window_length)
+
+    if checkpoint_env is None:
+        return {}
+
+    raw_window_lengths = checkpoint_env.get("observation_window_lengths")
+    if raw_window_lengths is None:
+        return {}
+    if not isinstance(raw_window_lengths, Mapping):
+        raise ValueError(
+            "Checkpoint observation_window_lengths must be a mapping, "
+            f"got {type(raw_window_lengths).__name__}."
+        )
+    return normalize_observation_window_lengths(raw_window_lengths)
 
 
 def build_gmtp_observation_spec(
@@ -165,7 +223,22 @@ def build_gmtp_observation_spec(
     )
 
 
+def build_gmtp_policy_observation_spec(
+    *,
+    add_noise: bool,
+    window_lengths: Mapping[str, int] | None = None,
+) -> ObservationSpec:
+    spec = build_gmtp_observation_spec(add_noise=add_noise, window_lengths=window_lengths)
+    return ObservationSpec(groups=tuple(group for group in spec.groups if group.name in {"motion", "robot"}))
+
+
 __all__ = [
+    "DEFAULT_ROBOT_WINDOW_LENGTH",
     "DEFAULT_OBSERVATION_WINDOW_LENGTHS",
+    "ROBOT_POLICY_OBSERVATION_TERM_IDS",
+    "build_robot_policy_window_lengths",
     "build_gmtp_observation_spec",
+    "build_gmtp_policy_observation_spec",
+    "normalize_observation_window_lengths",
+    "resolve_observation_window_lengths",
 ]

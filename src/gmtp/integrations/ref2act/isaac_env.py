@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 import gymnasium
@@ -11,9 +12,13 @@ from .observation_history import build_gmtp_observation_spec
 ENV_NAME = "G1MotionTracking-v0"
 
 
-def make_training_env():
+def make_training_env(
+    *,
+    window_lengths: Mapping[str, int] | None = None,
+):
     cfg = G1MultiMotionTrainingEnv()
     cfg.expert_motion_file = resolve_motion_files(cfg.expert_motion_file)
+    cfg.observation = build_gmtp_observation_spec(add_noise=True, window_lengths=window_lengths)
     env = gymnasium.make(ENV_NAME, cfg=cfg)
     return env, cfg
 
@@ -22,6 +27,7 @@ def make_eval_env(
     motion_files: list[str],
     *,
     show_reference_motion: bool = False,
+    window_lengths: Mapping[str, int] | None = None,
 ):
     cfg = G1MultiMotionEnv()
     cfg.expert_motion_file = resolve_motion_files(motion_files)
@@ -30,7 +36,7 @@ def make_eval_env(
     cfg.add_reset_noise = False
     cfg.random_start = False
     cfg.events = None
-    cfg.observation = build_gmtp_observation_spec(add_noise=False)
+    cfg.observation = build_gmtp_observation_spec(add_noise=False, window_lengths=window_lengths)
     cfg.action = replace(cfg.action, buffer_length=1, latency_range=None, noise_scale=0.0)
     cfg.reference_motion_viewer_enabled = show_reference_motion
     env = gymnasium.make(ENV_NAME, cfg=cfg)
