@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -26,10 +28,19 @@ def resolve_training_device(device: str) -> torch.device:
     return torch.device(normalized)
 
 
+def seed_motion_mae_training(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 class MotionMAEPretrainRunner:
     def __init__(self, config: MotionMAEPretrainConfig) -> None:
         self.config = config
         self.device = resolve_training_device(config.training.device)
+        seed_motion_mae_training(config.data.seed)
         self.data_bundle = build_motion_mae_datasets(
             config.data,
             feature_config=config.feature,

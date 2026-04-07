@@ -1,0 +1,84 @@
+{
+  "data": {
+    "motion_files": [
+      "env/assests/05_05_stageii.npz",
+      "env/assests/06_13_stageii.npz",
+      "env/assests/55_02_stageii.npz",
+      "env/assests/61_10_stageii.npz",
+      "env/assests/63_25_stageii.npz",
+      "env/assests/115_02_stageii.npz",
+      "env/assests/115_06_stageii.npz",
+      "env/assests/120_01_stageii.npz"
+    ],
+    "adapter_name": "stageii_npz",
+    "past_frames": 12,
+    "future_frames": 4,
+    "split_mode": "by_window",
+    "val_ratio": 0.25,
+    "batch_size": 96,
+    "num_workers": 0,
+    "pin_memory": true,
+    "seed": 0
+  },
+  "feature": {
+    "anchor_body_name": "pelvis",
+    "end_effector_body_names": [
+      "left_ankle_roll_link",
+      "right_ankle_roll_link",
+      "left_rubber_hand",
+      "right_rubber_hand"
+    ],
+    "reference_feature_names": [
+      "root",
+      "joint",
+      "end_effector"
+    ],
+    "target_feature_names": [
+      "root",
+      "joint",
+      "end_effector"
+    ],
+    "policy_feature_names": [
+      "root",
+      "joint"
+    ],
+    "gravity_vector": [
+      0.0,
+      0.0,
+      -1.0
+    ]
+  },
+  "model": {
+    "d_model": 384,
+    "latent_dim": 96,
+    "encoder_layers": 6,
+    "decoder_layers": 3,
+    "nhead": 8,
+    "dim_feedforward": 1024,
+    "dropout": 0.1,
+    "activation": "gelu"
+  },
+  "loss": {
+    "reconstruction_loss": "mse",
+    "slice_weights": {
+      "root": 1.0,
+      "joint": 1.0,
+      "end_effector": 1.0
+    }
+  },
+  "optimizer": {
+    "lr": 0.0002,
+    "weight_decay": 0.01
+  },
+  "training": {
+    "epochs": 120,
+    "device": "cuda",
+    "grad_clip_norm": 1.0,
+    "log_interval": 9999
+  },
+  "export": {
+    "save_optimizer_state": true
+  },
+  "output_root": "runs",
+  "run_name": "motion_mae_assets_best_by_window"
+}
