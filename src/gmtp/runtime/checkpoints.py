@@ -52,7 +52,7 @@ class CheckpointV2:
         return str(self.meta["actor_type"])
 
     @property
-    def actor_kwargs(self) -> dict[str, int]:
+    def actor_kwargs(self) -> dict[str, Any]:
         return dict(self.meta.get("actor_kwargs", {}))
 
     @property
@@ -64,9 +64,11 @@ class CheckpointV2:
         return normalize_observation_window_lengths(self.env.get("observation_window_lengths"))
 
     @property
-    def motion_encoder_checkpoint(self) -> str | None:
-        value = self.artifacts.get("motion_encoder_checkpoint")
-        return None if value is None else str(value)
+    def motion_mae_encoder_checkpoint(self) -> str | None:
+        value = self.artifacts.get("motion_mae_encoder_checkpoint")
+        if value is None:
+            return None
+        return str(Path(value).expanduser().resolve())
 
 
 def load_checkpoint_v2(path: str | Path) -> CheckpointV2:
@@ -95,7 +97,7 @@ def build_training_checkpoint(
     action_mode: str | None,
     root_name: str | None,
     anchor_body_name: str | None,
-    motion_encoder_checkpoint: str | None = None,
+    motion_mae_encoder_checkpoint: str | None = None,
     observation_window_lengths: dict[str, int] | None = None,
     artifacts: dict[str, Any] | None = None,
     created_at: str | None = None,
@@ -119,9 +121,11 @@ def build_training_checkpoint(
     if observation_window_lengths is not None:
         env_payload["observation_window_lengths"] = resolved_window_lengths
 
-    artifact_payload = dict(artifacts or {})
-    if motion_encoder_checkpoint is not None:
-        artifact_payload["motion_encoder_checkpoint"] = str(Path(motion_encoder_checkpoint).expanduser().resolve())
+    checkpoint_artifacts = dict(artifacts or {})
+    if motion_mae_encoder_checkpoint is not None:
+        checkpoint_artifacts["motion_mae_encoder_checkpoint"] = str(
+            Path(motion_mae_encoder_checkpoint).expanduser().resolve()
+        )
 
     return CheckpointV2(
         meta={
@@ -135,5 +139,5 @@ def build_training_checkpoint(
             "critic": critic.state_dict(),
         },
         env=env_payload,
-        artifacts=artifact_payload,
+        artifacts=checkpoint_artifacts,
     )

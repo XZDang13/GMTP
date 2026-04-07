@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 
@@ -37,6 +38,65 @@ class FeatureSliceSpec:
             end=int(payload["end"]),
             weight=float(payload.get("weight", 1.0)),
         )
+
+
+@dataclass(frozen=True)
+class MotionSegment:
+    start_frame: int
+    end_frame: int
+    segment_type: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.start_frame < 0:
+            raise ValueError(f"MotionSegment.start_frame must be non-negative, got {self.start_frame}.")
+        if self.end_frame <= self.start_frame:
+            raise ValueError(
+                "MotionSegment.end_frame must be greater than start_frame, "
+                f"got {self.start_frame}:{self.end_frame}."
+            )
+
+    @property
+    def num_frames(self) -> int:
+        return self.end_frame - self.start_frame
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start_frame": self.start_frame,
+            "end_frame": self.end_frame,
+            "segment_type": self.segment_type,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "MotionSegment":
+        return cls(
+            start_frame=int(payload["start_frame"]),
+            end_frame=int(payload["end_frame"]),
+            segment_type=int(payload["segment_type"]) if payload.get("segment_type") is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class CanonicalMotionSequence:
+    motion_file: str
+    motion_name: str
+    fps: float
+    joint_names: tuple[str, ...]
+    body_names: tuple[str, ...]
+    joint_pos: Any
+    joint_vel: Any
+    body_pos_w: Any
+    body_quat_w: Any
+    body_lin_vel_w: Any
+    body_ang_vel_w: Any
+    segments: tuple[MotionSegment, ...]
+
+    @property
+    def resolved_motion_file(self) -> str:
+        return str(Path(self.motion_file).expanduser().resolve())
+
+    @property
+    def length(self) -> int:
+        return int(self.joint_pos.shape[0])
 
 
 @dataclass(frozen=True)

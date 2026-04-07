@@ -8,10 +8,16 @@ import torch
 
 from gmtp.integrations.ref2act.compat import _import_module
 from gmtp.integrations.ref2act.observation_history import (
+    ROBOT_POLICY_OBSERVATION_TERM_IDS,
     build_gmtp_policy_observation_spec,
     normalize_observation_window_lengths,
 )
 from gmtp.models import ActorType, normalize_actor_type
+from gmtp.models.robot_encoder import (
+    build_robot_window_layout,
+    flatten_robot_history,
+    reshape_robot_history,
+)
 
 _OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")
 DEFAULT_OBSERVATION_TERM_REGISTRY = _OBSERVATION_SPEC.DEFAULT_OBSERVATION_TERM_REGISTRY
@@ -29,15 +35,83 @@ _SIM2SIM_TERM_OUTPUT_NAMES = {
 }
 
 
+def _trailing_numel(value: torch.Tensor) -> int:
+    if value.ndim < 1:
+        raise ValueError(f"Expected observation tensor rank >= 1, got shape {tuple(value.shape)}.")
+    if value.ndim == 1:
+        return int(value.numel())
+    return int(value[0].numel())
+
+
+def _resolve_robot_window_length(
+    observation_window_lengths: Mapping[str, int] | None,
+) -> int:
+    normalized = normalize_observation_window_lengths(observation_window_lengths)
+    lengths = {int(normalized.get(term_id, 1)) for term_id in ROBOT_POLICY_OBSERVATION_TERM_IDS}
+    if len(lengths) != 1:
+        raise ValueError(
+            "Robot policy observation window lengths must match across "
+            f"{ROBOT_POLICY_OBSERVATION_TERM_IDS}, got {sorted(lengths)}."
+        )
+    return lengths.pop()
+
+
+def structure_robot_observation(
+    robot_obs: Any,
+    *,
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None = None,
+) -> torch.Tensor:
+    tensor = torch.as_tensor(robot_obs)
+    robot_window_length = _resolve_robot_window_length(observation_window_lengths)
+    if robot_window_length == 1:
+        if tensor.ndim == 3 and tensor.shape[1] == 1:
+            tensor = tensor.squeeze(1)
+        if tensor.ndim not in {1, 2}:
+            raise ValueError(
+                f"Expected single-frame robot observation rank 1 or 2, got shape {tuple(tensor.shape)}."
+            )
+        return tensor
+
+    layout = build_robot_window_layout(action_dim, robot_window_length)
+    structured_shape = (layout.window_length, layout.robot_step_dim)
+    if tensor.ndim in {1, 2} and tensor.shape[-1] == layout.robot_obs_dim:
+        return reshape_robot_history(tensor, layout)
+    if tensor.ndim in {2, 3} and tuple(tensor.shape[-2:]) == structured_shape:
+        return tensor
+    raise ValueError(
+        "Expected windowed robot observation to be either flat with dim "
+        f"{layout.robot_obs_dim} or structured with trailing shape {structured_shape}, "
+        f"got {tuple(tensor.shape)}."
+    )
+
+
+def structure_env_observation(
+    obs: Mapping[str, Any],
+    *,
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None = None,
+) -> dict[str, torch.Tensor]:
+    structured_obs = dict(obs)
+    if "robot" not in structured_obs:
+        return structured_obs
+    structured_obs["robot"] = structure_robot_observation(
+        structured_obs["robot"],
+        action_dim=action_dim,
+        observation_window_lengths=observation_window_lengths,
+    )
+    return structured_obs
+
+
 def infer_env_observation_dims(obs: dict[str, torch.Tensor]) -> dict[str, int]:
     required_keys = ("motion", "robot", "privilege")
     missing_keys = [key for key in required_keys if key not in obs]
     if missing_keys:
         raise KeyError(f"Environment observation is missing required keys: {missing_keys}.")
 
-    motion_dim = obs["motion"].shape[-1]
-    robot_dim = obs["robot"].shape[-1]
-    critic_dim = obs["privilege"].shape[-1]
+    motion_dim = _trailing_numel(torch.as_tensor(obs["motion"]))
+    robot_dim = _trailing_numel(torch.as_tensor(obs["robot"]))
+    critic_dim = _trailing_numel(torch.as_tensor(obs["privilege"]))
     return {
         "motion": motion_dim,
         "robot": robot_dim,
@@ -51,8 +125,8 @@ def infer_actor_observation_dims_from_state_dict(
     actor_type: ActorType | str,
 ) -> dict[str, int]:
     normalize_actor_type(str(actor_type))
-    motion_dim = actor_weights["motion_obs_normlizer.mean"].shape[0]
-    robot_dim = actor_weights["robot_obs_normlizer.mean"].shape[0]
+    motion_dim = int(actor_weights["motion_obs_normlizer.mean"].numel())
+    robot_dim = int(actor_weights["robot_obs_normlizer.mean"].numel())
     return {
         "motion": motion_dim,
         "robot": robot_dim,
@@ -158,6 +232,34 @@ def replace_sim2sim_group_latest_terms(
     latest_terms: Mapping[str, Any],
     observation_window_lengths: Mapping[str, int] | None = None,
 ) -> torch.Tensor:
+    if group_name == "robot" and _resolve_robot_window_length(observation_window_lengths) > 1:
+        layout = build_robot_window_layout(action_dim, _resolve_robot_window_length(observation_window_lengths))
+        structured = structure_robot_observation(
+            group_obs,
+            action_dim=action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
+        if structured.ndim != 2:
+            raise ValueError(
+                f"Expected structured sim2sim robot observation rank 2, got shape {tuple(structured.shape)}."
+            )
+
+        updated = structured.clone()
+        term_map = {term_layout.term_id: term_layout for term_layout in layout.terms}
+        for term_id, replacement_value in latest_terms.items():
+            if term_id not in term_map:
+                continue
+            term_layout = term_map[term_id]
+            replacement = _coerce_sim2sim_vector(replacement_value, name=f"{group_name}.{term_id}")
+            if replacement.numel() != term_layout.term_dim:
+                raise ValueError(
+                    f"Expected replacement for {group_name}.{term_id} dim {term_layout.term_dim}, got {replacement.numel()}."
+                )
+            updated[-1, term_layout.step_slice] = replacement
+
+        input_tensor = torch.as_tensor(group_obs)
+        return flatten_robot_history(updated, layout) if input_tensor.ndim == 1 else updated
+
     group_obs = _coerce_sim2sim_vector(group_obs, name=group_name).clone()
     _, layout, group_specs, group_dims = _get_sim2sim_policy_spec_details(
         action_dim,
@@ -212,14 +314,23 @@ def parse_sim2sim_obs(
     )
 
 
-def extract_sim2sim_actor_obs_from_mapping(obs: Mapping[str, Any]) -> dict[str, torch.Tensor] | None:
+def extract_sim2sim_actor_obs_from_mapping(
+    obs: Mapping[str, Any],
+    *,
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None = None,
+) -> dict[str, torch.Tensor] | None:
     motion_value = obs.get("motion", obs.get("motion_obs"))
     robot_value = obs.get("robot", obs.get("robot_obs"))
     if motion_value is None or robot_value is None:
         return None
 
     motion_obs = _coerce_sim2sim_vector(motion_value, name="motion")
-    robot_obs = _coerce_sim2sim_vector(robot_value, name="robot")
+    robot_obs = structure_robot_observation(
+        robot_value,
+        action_dim=action_dim,
+        observation_window_lengths=observation_window_lengths,
+    )
     return {
         "motion": motion_obs,
         "robot": robot_obs,
@@ -235,11 +346,15 @@ def split_sim2sim_group_observations(
     observation_window_lengths: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
     motion_obs = _coerce_sim2sim_vector(motion_obs, name="motion")
-    robot_obs = _coerce_sim2sim_vector(robot_obs, name="robot")
+    robot_obs = structure_robot_observation(
+        robot_obs,
+        action_dim=action_dim,
+        observation_window_lengths=observation_window_lengths,
+    )
     expected_dims = infer_sim2sim_observation_dims(action_dim, observation_window_lengths)
     if motion_obs.numel() != expected_dims["motion"]:
         raise ValueError(f"Expected structured sim2sim motion dim {expected_dims['motion']}, got {motion_obs.numel()}.")
-    if robot_obs.numel() != expected_dims["robot"]:
+    if int(robot_obs.numel()) != expected_dims["robot"]:
         raise ValueError(f"Expected structured sim2sim robot dim {expected_dims['robot']}, got {robot_obs.numel()}.")
 
     parsed_terms = {}
@@ -254,7 +369,12 @@ def split_sim2sim_group_observations(
     parsed_terms.update(
         _split_group_observation(
             "robot",
-            robot_obs,
+            flatten_robot_history(
+                robot_obs,
+                build_robot_window_layout(action_dim, _resolve_robot_window_length(observation_window_lengths)),
+            )
+            if robot_obs.ndim == 2
+            else robot_obs,
             action_dim=action_dim,
             observation_window_lengths=observation_window_lengths,
         )

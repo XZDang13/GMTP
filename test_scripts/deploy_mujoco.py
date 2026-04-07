@@ -36,11 +36,7 @@ from gmtp.runtime.observations import (
     replace_sim2sim_group_latest_terms,
     split_sim2sim_group_observations,
 )
-from gmtp.runtime.policy import (
-    build_motion_latent_adapter,
-    load_actor_from_checkpoint,
-    resolve_motion_encoder_checkpoint_path,
-)
+from gmtp.runtime.policy import build_motion_mae_adapter, load_actor_from_checkpoint, resolve_motion_mae_checkpoint_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--motion-file", default=None)
     parser.add_argument("--num-blocks", type=int, default=None)
     parser.add_argument("--robot-window-length", type=int, default=None)
-    parser.add_argument("--motion-encoder-checkpoint", default=None)
+    parser.add_argument("--motion-mae-encoder-checkpoint", default=None)
     parser.add_argument("--num-steps", type=int, default=2000)
     parser.add_argument("--simulation-dt", type=float, default=1 / 200)
     parser.add_argument("--decimation", type=int, default=4)
@@ -196,7 +192,11 @@ def _extract_obs_parts(
             structured_obs = None
 
     if structured_obs is not None:
-        structured_actor_obs = extract_sim2sim_actor_obs_from_mapping(structured_obs)
+        structured_actor_obs = extract_sim2sim_actor_obs_from_mapping(
+            structured_obs,
+            action_dim=action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
         if structured_actor_obs is None:
             raise KeyError("Expected structured sim2sim observation mapping to include motion/robot entries.")
         obs_parts = split_sim2sim_group_observations(
@@ -321,24 +321,22 @@ def run(args: argparse.Namespace) -> int:
         ("anchor_body_name",),
         DEFAULT_ANCHOR_BODY_NAME,
     )
-
-    motion_encoder_checkpoint = resolve_motion_encoder_checkpoint_path(
+    resolved_motion_mae_checkpoint = resolve_motion_mae_checkpoint_path(
         checkpoint,
-        override=args.motion_encoder_checkpoint,
+        override=args.motion_mae_encoder_checkpoint,
     )
-    motion_latent_adapter = build_motion_latent_adapter(
-        motion_encoder_checkpoint,
+    motion_mae_encoder_checkpoint = (
+        None if resolved_motion_mae_checkpoint is None else str(resolved_motion_mae_checkpoint)
+    )
+    motion_mae_adapter = build_motion_mae_adapter(
+        motion_mae_encoder_checkpoint,
         device=torch.device("cpu"),
     )
     raw_obs_dims = infer_sim2sim_observation_dims(
         action_dim,
         observation_window_lengths=observation_window_lengths,
     )
-    obs_dims = (
-        motion_latent_adapter.augment_observation_dims(raw_obs_dims)
-        if motion_latent_adapter is not None
-        else raw_obs_dims
-    )
+    obs_dims = motion_mae_adapter.augment_observation_dims(raw_obs_dims) if motion_mae_adapter is not None else raw_obs_dims
     checkpoint_obs_dims = infer_actor_observation_dims_from_state_dict(
         checkpoint.model["actor"],
         checkpoint.actor_type,
@@ -382,13 +380,13 @@ def run(args: argparse.Namespace) -> int:
             action_dim,
             observation_window_lengths,
         )
-        if motion_latent_adapter is not None:
-            motion_latent_adapter.initialize_history(env)
+        if motion_mae_adapter is not None:
+            motion_mae_adapter.initialize_history(env)
         while steps_executed < args.num_steps and _viewer_is_running(env, render=render):
             actor_env_obs = _tensor_dict_to_batch(obs_parts)
             actor_obs = get_actor_observation(actor_env_obs, actor_type)
-            if motion_latent_adapter is not None:
-                actor_obs = motion_latent_adapter.augment_actor_observation(actor_obs)
+            if motion_mae_adapter is not None:
+                actor_obs = motion_mae_adapter.augment_actor_observation(actor_obs)
             actor_step = actor(actor_obs)
             action = actor_step.mean.squeeze(0).detach().to(device="cpu", dtype=torch.float32)
             if not torch.isfinite(action).all():
@@ -403,8 +401,8 @@ def run(args: argparse.Namespace) -> int:
                 action_dim,
                 observation_window_lengths,
             )
-            if motion_latent_adapter is not None:
-                motion_latent_adapter.update_history(env)
+            if motion_mae_adapter is not None:
+                motion_mae_adapter.update_history(env)
             steps_executed += 1
     finally:
         env.close()

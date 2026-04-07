@@ -4,6 +4,8 @@ from RLAlg.nn.layers import CriticHead, MLPLayer, NormPosition
 from RLAlg.nn.steps import ValueStep
 from RLAlg.normalizer import Normalizer
 
+CRITIC_HIDDEN_DIM = 256
+
 
 class Critic(nn.Module):
     def __init__(self, obs_dim: int):
@@ -11,11 +13,10 @@ class Critic(nn.Module):
 
         self.normlizer = Normalizer((obs_dim,))
         self.encoder = nn.Sequential(
-            MLPLayer(obs_dim, 512, nn.SiLU(), NormPosition.POST),
-            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
-            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
+            MLPLayer(obs_dim, CRITIC_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
+            MLPLayer(CRITIC_HIDDEN_DIM, CRITIC_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
         )
-        self.head = CriticHead(512)
+        self.head = CriticHead(CRITIC_HIDDEN_DIM)
 
     def forward(self, obs: torch.Tensor, update_normlizer: bool = False) -> ValueStep:
         obs = self.normlizer(obs, update=update_normlizer)

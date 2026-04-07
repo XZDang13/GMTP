@@ -24,10 +24,11 @@ from gmtp.models import (
     get_policy_storage_specs,
 )
 from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
+from gmtp.runtime.amp import AMP_DTYPE_NAME, autocast_context, build_grad_scaler, normalize_device, resolve_amp_enabled
 from gmtp.runtime.config import RunConfig
 from gmtp.runtime.io import build_run_paths, write_json
-from gmtp.runtime.observations import infer_env_observation_dims
-from gmtp.runtime.policy import build_motion_latent_adapter
+from gmtp.runtime.observations import infer_env_observation_dims, structure_env_observation
+from gmtp.runtime.policy import build_motion_mae_adapter
 
 
 class OptimizerCollection(torch.optim.Optimizer):
@@ -89,16 +90,19 @@ class TrainRunner:
             robot_window_length=config.robot_window_length
         )
         self.env, self.cfg = make_training_env(window_lengths=self.observation_window_lengths)
-        self.device = self.env.unwrapped.device
+        self.device = normalize_device(self.env.unwrapped.device)
+        self.requested_amp = bool(config.use_amp)
+        self.use_amp = resolve_amp_enabled(self.requested_amp, self.device)
+        self.amp_dtype = AMP_DTYPE_NAME
         self.actor_type = ActorType.FILM_RES
         self.motion_files = list(self.cfg.expert_motion_file)
         self.motion_name = motion_label(self.motion_files)
-        self.motion_latent_adapter = build_motion_latent_adapter(
-            config.motion_encoder_checkpoint,
+        self.motion_mae_adapter = build_motion_mae_adapter(
+            config.motion_mae_encoder_checkpoint,
             device=self.device,
         )
-        self.motion_encoder_checkpoint = (
-            self.motion_latent_adapter.checkpoint_path if self.motion_latent_adapter is not None else None
+        self.motion_mae_encoder_checkpoint = (
+            self.motion_mae_adapter.checkpoint_path if self.motion_mae_adapter is not None else None
         )
         self.run_date = datetime.now().strftime("%Y%m%d")
         self.checkpoint_date = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -111,12 +115,17 @@ class TrainRunner:
         write_json(self.run_paths.config_path, {"command": "train", "config": self.config})
 
         self.initial_obs, _ = self.env.reset()
-        if self.motion_latent_adapter is not None:
-            self.motion_latent_adapter.initialize_history(self.env)
+        self.initial_obs = structure_env_observation(
+            self.initial_obs,
+            action_dim=self.cfg.action_space,
+            observation_window_lengths=self.observation_window_lengths,
+        )
+        if self.motion_mae_adapter is not None:
+            self.motion_mae_adapter.initialize_history(self.env)
         self.raw_obs_dims = infer_env_observation_dims(self.initial_obs)
         self.obs_dims = (
-            self.motion_latent_adapter.augment_observation_dims(self.raw_obs_dims)
-            if self.motion_latent_adapter is not None
+            self.motion_mae_adapter.augment_observation_dims(self.raw_obs_dims)
+            if self.motion_mae_adapter is not None
             else self.raw_obs_dims
         )
         self.actor = build_actor(
@@ -129,7 +138,8 @@ class TrainRunner:
         self.critic = Critic(self.obs_dims["critic"]).to(self.device)
 
         muon_groups, adamw_groups, optimizer_stats = self._split_optimizer_param_groups(
-            {"actor": self.actor, "critic": self.critic}
+            {"actor": self.actor, "critic": self.critic},
+            prefer_muon=self.device.type == "cuda",
         )
         optimizers = []
         if muon_groups:
@@ -137,10 +147,15 @@ class TrainRunner:
         if adamw_groups:
             optimizers.append(torch.optim.AdamW(adamw_groups, lr=1e-3, weight_decay=0.0))
         self.ac_optimizer = OptimizerCollection(*optimizers)
+        self.grad_scaler = build_grad_scaler(self.use_amp)
         self.lr_scheduler = KLAdaptiveLR(self.ac_optimizer, 0.01)
 
         self.rollout_buffer = ReplayBuffer(self.cfg.scene.num_envs, self.steps)
-        self.policy_storage_specs = get_policy_storage_specs(self.obs_dims, self.actor_type)
+        self.policy_storage_specs = get_policy_storage_specs(
+            self.obs_dims,
+            self.actor_type,
+            actor_kwargs=self.actor_kwargs,
+        )
         self.policy_batch_keys = list(self.policy_storage_specs)
         self.batch_keys = [
             *self.policy_batch_keys,
@@ -179,15 +194,18 @@ class TrainRunner:
             f"AdamW={optimizer_stats['adamw_tensors']} tensors / {optimizer_stats['adamw_numel']} params",
         )
 
-    def _build_actor_kwargs(self) -> dict[str, int]:
+    def _build_actor_kwargs(self) -> dict[str, int | str]:
         return {
             "num_blocks": self.config.num_blocks,
             "robot_window_length": self.config.robot_window_length,
+            "robot_encoder_type": self.config.robot_encoder_type,
         }
 
     @staticmethod
     def _split_optimizer_param_groups(
         modules: dict[str, torch.nn.Module],
+        *,
+        prefer_muon: bool = True,
     ) -> tuple[list[dict], list[dict], dict[str, int]]:
         muon_groups = []
         adamw_groups = []
@@ -205,7 +223,7 @@ class TrainRunner:
             for _, param in module.named_parameters():
                 if not param.requires_grad:
                     continue
-                if param.ndim == 2:
+                if prefer_muon and param.ndim == 2:
                     muon_params.append(param)
                     stats["muon_tensors"] += 1
                     stats["muon_numel"] += param.numel()
@@ -258,18 +276,23 @@ class TrainRunner:
         for _ in range(self.steps):
             self.global_step += 1
             actor_obs = get_actor_observation(obs, self.actor_type)
-            if self.motion_latent_adapter is not None:
-                actor_obs = self.motion_latent_adapter.augment_actor_observation(actor_obs)
+            if self.motion_mae_adapter is not None:
+                actor_obs = self.motion_mae_adapter.augment_actor_observation(actor_obs)
             critic_obs = self._get_critic_observation(obs)
             action, log_prob, value = self.get_action(actor_obs, critic_obs)
             next_obs, task_reward, terminate, timeout, _info = self.env.step(action)
+            next_obs = structure_env_observation(
+                next_obs,
+                action_dim=self.cfg.action_space,
+                observation_window_lengths=self.observation_window_lengths,
+            )
             reward = task_reward
 
             self.tracker.add_values("episode_return", reward)
             self.tracker.add_values("episode_length", 1)
             done = terminate | timeout
-            if self.motion_latent_adapter is not None:
-                self.motion_latent_adapter.update_history(self.env, done=done)
+            if self.motion_mae_adapter is not None:
+                self.motion_mae_adapter.update_history(self.env, done=done)
 
             if done.any():
                 self._log_metrics(
@@ -295,8 +318,8 @@ class TrainRunner:
             obs = next_obs
 
         actor_obs = get_actor_observation(obs, self.actor_type)
-        if self.motion_latent_adapter is not None:
-            actor_obs = self.motion_latent_adapter.augment_actor_observation(actor_obs)
+        if self.motion_mae_adapter is not None:
+            actor_obs = self.motion_mae_adapter.augment_actor_observation(actor_obs)
         critic_obs = self._get_critic_observation(obs)
         self._update_actor_statistics(actor_obs)
         last_value = self.get_value(critic_obs, update_normlizer=True)
@@ -330,34 +353,43 @@ class TrainRunner:
                 return_batch = batch["returns"].to(self.device)
                 advantage_batch = batch["advantages"].to(self.device)
 
-                policy_loss_dict = PPO.compute_policy_loss(
-                    self.actor,
-                    log_prob_batch,
-                    policy_obs_batch,
-                    action_batch,
-                    advantage_batch,
-                    0.2,
-                    0.0,
-                )
-                value_loss_dict = PPO.compute_clipped_value_loss(
-                    self.critic,
-                    critic_obs_batch,
-                    value_batch,
-                    return_batch,
-                    0.2,
-                )
+                with autocast_context(self.device, self.use_amp):
+                    policy_loss_dict = PPO.compute_policy_loss(
+                        self.actor,
+                        log_prob_batch,
+                        policy_obs_batch,
+                        action_batch,
+                        advantage_batch,
+                        0.2,
+                        0.0,
+                    )
+                    value_loss_dict = PPO.compute_clipped_value_loss(
+                        self.critic,
+                        critic_obs_batch,
+                        value_batch,
+                        return_batch,
+                        0.2,
+                    )
 
-                policy_loss = policy_loss_dict["loss"]
-                entropy = policy_loss_dict["entropy"]
-                kl_divergence = policy_loss_dict["kl_divergence"]
-                value_loss = value_loss_dict["loss"]
-                ac_loss = policy_loss - entropy * 0.005 + value_loss
+                    policy_loss = policy_loss_dict["loss"]
+                    entropy = policy_loss_dict["entropy"]
+                    kl_divergence = policy_loss_dict["kl_divergence"]
+                    value_loss = value_loss_dict["loss"]
+                    ac_loss = policy_loss - entropy * 0.005 + value_loss
 
                 self.ac_optimizer.zero_grad(set_to_none=True)
-                ac_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                self.ac_optimizer.step()
+                if self.use_amp:
+                    self.grad_scaler.scale(ac_loss).backward()
+                    self.grad_scaler.unscale_(self.ac_optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+                    self.grad_scaler.step(self.ac_optimizer)
+                    self.grad_scaler.update()
+                else:
+                    ac_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+                    self.ac_optimizer.step()
                 self.lr_scheduler.set_kl(kl_divergence)
                 self.lr_scheduler.step()
 
@@ -396,7 +428,7 @@ class TrainRunner:
             action_mode=action_mode,
             root_name=getattr(self.cfg, "root_link_name", None),
             anchor_body_name=getattr(self.cfg, "anchor_body_name", None),
-            motion_encoder_checkpoint=self.motion_encoder_checkpoint,
+            motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
             observation_window_lengths=self.observation_window_lengths,
             artifacts={"run_dir": str(self.run_paths.root)},
         )
@@ -424,14 +456,17 @@ class TrainRunner:
             "motion_files": self.motion_files,
             "motion_names": motion_names(self.motion_files),
             "motion_label": self.motion_name,
-            "motion_encoder_checkpoint": self.motion_encoder_checkpoint,
-            "motion_encoder_latent_dim": (
-                self.motion_latent_adapter.latent_dim if self.motion_latent_adapter is not None else None
+            "motion_mae_encoder_checkpoint": self.motion_mae_encoder_checkpoint,
+            "motion_mae_latent_dim": (
+                self.motion_mae_adapter.latent_dim if self.motion_mae_adapter is not None else None
             ),
             "observation_window_lengths": self.observation_window_lengths,
             "num_updates": self.config.num_updates,
             "rollout_steps": self.steps,
             "checkpoint_interval": self.checkpoint_interval,
+            "amp_requested": self.requested_amp,
+            "amp_enabled": self.use_amp,
+            "amp_dtype": self.amp_dtype,
             "final_checkpoint": str(final_checkpoint_path) if final_checkpoint_path is not None else None,
             "run_dir": str(self.run_paths.root),
         }

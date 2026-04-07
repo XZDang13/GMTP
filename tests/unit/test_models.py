@@ -48,19 +48,41 @@ def test_film_res_actor_forward_returns_step():
     assert len(actor.blocks) == 5
 
 
+def test_film_res_actor_defaults_to_four_blocks_and_256_width():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=3)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=3,
+    )
+
+    assert actor.num_blocks == 4
+    assert len(actor.blocks) == 4
+    assert actor.motion_encoder[0].linear.out_features == 256
+    assert actor.motion_encoder[-1].linear.out_features == 256
+    assert actor.head.mu_layer.out_features == 3
+    assert actor.head.mu_layer.in_features == 256
+    assert actor.stack.blocks[0].fc1.in_features == 256
+    assert actor.stack.blocks[0].fc2.out_features == 256
+
+
 def test_build_actor_constructs_film_res_with_requested_depth():
     motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=3, robot_window_length=4)
     actor = build_actor(
         {"robot": robot_obs_dim, "motion": motion_obs_dim, "policy": motion_obs_dim + robot_obs_dim},
         "film_res",
         action_dim=3,
-        actor_kwargs={"num_blocks": 4, "robot_window_length": 4},
+        actor_kwargs={"num_blocks": 4, "robot_window_length": 4, "robot_encoder_type": "cnn"},
     )
 
     assert isinstance(actor, FiLMResActor)
     assert actor.num_blocks == 4
     assert len(actor.blocks) == 4
-    assert get_actor_kwargs(actor, "film_res") == {"num_blocks": 4, "robot_window_length": 4}
+    assert get_actor_kwargs(actor, "film_res") == {
+        "num_blocks": 4,
+        "robot_window_length": 4,
+        "robot_encoder_type": "cnn",
+    }
     assert infer_film_res_blocks(actor.state_dict()) == 4
 
 
@@ -92,25 +114,48 @@ def test_film_res_actor_reshapes_windowed_robot_obs_from_ref2act_layout():
     )
 
 
-def test_film_res_actor_robot_encoder_uses_temporal_conv1d():
+def test_film_res_actor_windowed_robot_encoder_supports_cnn_mode():
     motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, robot_window_length=4)
     actor = FiLMResActor(
         robot_obs_dim=robot_obs_dim,
         motion_obs_dim=motion_obs_dim,
         action_dim=2,
         robot_window_length=4,
+        robot_encoder_type="cnn",
     )
 
-    conv_layers = [module for module in actor.robot_encoder if isinstance(module, nn.Conv1d)]
+    conv_layers = [module for module in actor.robot_encoder.window_encoder.temporal_conv if isinstance(module, nn.Conv1d)]
 
     assert len(conv_layers) == 2
     assert conv_layers[0].in_channels == actor.robot_step_dim
     assert conv_layers[0].out_channels == 256
     assert conv_layers[1].in_channels == 256
     assert conv_layers[1].out_channels == 256
+    assert actor.robot_encoder.robot_encoder_type == "cnn"
+    assert actor.robot_encoder.window_encoder.output_proj.out_features == 256
+    assert not hasattr(actor.robot_encoder.window_encoder, "transformer")
+    assert actor.robot_obs_normlizer.mean.shape == (4, 12)
+    assert not hasattr(actor, "robot_window_fuser")
 
 
-def test_film_res_actor_forward_supports_windowed_robot_obs():
+def test_film_res_actor_windowed_robot_encoder_supports_transformer_mode():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, robot_window_length=4)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        robot_window_length=4,
+        robot_encoder_type="transformer",
+    )
+
+    assert actor.robot_encoder.robot_encoder_type == "transformer"
+    assert isinstance(actor.robot_encoder.window_encoder.transformer, nn.TransformerEncoder)
+    assert isinstance(actor.robot_encoder.window_encoder.input_proj, nn.Linear)
+    assert actor.robot_encoder.window_encoder.output_proj.out_features == 256
+    assert not hasattr(actor.robot_encoder.window_encoder, "temporal_conv")
+
+
+def test_film_res_actor_forward_supports_windowed_robot_obs_with_cnn_encoder():
     motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, robot_window_length=4)
     actor = FiLMResActor(
         robot_obs_dim=robot_obs_dim,
@@ -118,6 +163,51 @@ def test_film_res_actor_forward_supports_windowed_robot_obs():
         action_dim=2,
         num_blocks=3,
         robot_window_length=4,
+        robot_encoder_type="cnn",
+    )
+
+    step = actor(
+        {
+            "robot_obs": torch.randn(3, 4, 12),
+            "motion_obs": torch.randn(3, motion_obs_dim),
+        }
+    )
+
+    assert step.action.shape == (3, 2)
+    assert step.log_prob.shape == (3,)
+
+
+def test_film_res_actor_forward_supports_windowed_robot_obs_with_transformer_encoder():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, robot_window_length=4)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        num_blocks=3,
+        robot_window_length=4,
+        robot_encoder_type="transformer",
+    )
+
+    step = actor(
+        {
+            "robot_obs": torch.randn(3, 4, 12),
+            "motion_obs": torch.randn(3, motion_obs_dim),
+        }
+    )
+
+    assert step.action.shape == (3, 2)
+    assert step.log_prob.shape == (3,)
+
+
+def test_film_res_actor_forward_supports_single_frame_robot_obs():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        num_blocks=3,
+        robot_window_length=1,
+        robot_encoder_type="transformer",
     )
 
     step = actor(
@@ -129,6 +219,21 @@ def test_film_res_actor_forward_supports_windowed_robot_obs():
 
     assert step.action.shape == (3, 2)
     assert step.log_prob.shape == (3,)
+    assert actor.robot_encoder.robot_encoder_type == "mlp"
+    assert actor.robot_encoder.single_frame_encoder[-1].linear.out_features == 256
+    assert actor.robot_obs_normlizer.mean.shape == (robot_obs_dim,)
+
+
+def test_critic_uses_256_width_and_two_hidden_layers():
+    critic = Critic(obs_dim=5)
+    step = critic(torch.randn(4, 5))
+
+    assert len(critic.encoder) == 2
+    assert critic.encoder[0].linear.out_features == 256
+    assert critic.encoder[1].linear.in_features == 256
+    assert critic.encoder[1].linear.out_features == 256
+    assert critic.head.critic_layer.in_features == 256
+    assert step.value.shape == (4,)
 
 
 def test_film_res_stack_accumulates_residuals_layer_by_layer():
@@ -197,7 +302,7 @@ def test_checkpoint_spec_preserves_num_blocks():
     actor_type, actor_kwargs = resolve_checkpoint_actor_spec(checkpoint)
 
     assert actor_type.value == "film_res"
-    assert actor_kwargs == {"num_blocks": 4, "robot_window_length": 1}
+    assert actor_kwargs == {"num_blocks": 4, "robot_window_length": 1, "robot_encoder_type": "mlp"}
 
 
 def test_checkpoint_override_replaces_num_blocks():
@@ -217,7 +322,7 @@ def test_checkpoint_override_replaces_num_blocks():
     actor_type, actor_kwargs = resolve_checkpoint_actor_spec(checkpoint, num_blocks=5)
 
     assert actor_type.value == "film_res"
-    assert actor_kwargs == {"num_blocks": 5, "robot_window_length": 1}
+    assert actor_kwargs == {"num_blocks": 5, "robot_window_length": 1, "robot_encoder_type": "mlp"}
 
 
 def test_checkpoint_spec_defaults_robot_window_length_when_missing():
@@ -237,7 +342,7 @@ def test_checkpoint_spec_defaults_robot_window_length_when_missing():
     actor_type, actor_kwargs = resolve_checkpoint_actor_spec(checkpoint)
 
     assert actor_type.value == "film_res"
-    assert actor_kwargs == {"num_blocks": 2, "robot_window_length": 1}
+    assert actor_kwargs == {"num_blocks": 2, "robot_window_length": 1, "robot_encoder_type": "mlp"}
 
 
 def test_load_actor_from_checkpoint_restores_film_res_weights():
@@ -263,7 +368,7 @@ def test_load_actor_from_checkpoint_restores_film_res_weights():
 
     assert isinstance(loaded_actor, FiLMResActor)
     assert actor_type.value == "film_res"
-    assert actor_kwargs == {"num_blocks": 2, "robot_window_length": 1}
+    assert actor_kwargs == {"num_blocks": 2, "robot_window_length": 1, "robot_encoder_type": "mlp"}
     torch.testing.assert_close(
         loaded_actor.state_dict()["stack.blocks.0.res_scale"],
         actor.state_dict()["stack.blocks.0.res_scale"],

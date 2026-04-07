@@ -4,6 +4,7 @@ from gmtp.integrations.ref2act.observation_history import build_robot_policy_win
 from gmtp.integrations.ref2act.mujoco import normalize_action_mode, resolve_action_mode
 from gmtp.models import ActorType, FiLMResActor
 from gmtp.runtime.observations import (
+    extract_sim2sim_actor_obs_from_mapping,
     extract_sim2sim_metrics,
     infer_actor_observation_dims_from_state_dict,
     infer_env_observation_dims,
@@ -17,10 +18,10 @@ from gmtp.runtime.observations import (
 def test_infer_env_observation_dims_requires_expected_keys():
     obs = {
         "motion": torch.randn(2, 5),
-        "robot": torch.randn(2, 7),
+        "robot": torch.randn(2, 4, 7),
         "privilege": torch.randn(2, 3),
     }
-    assert infer_env_observation_dims(obs) == {"motion": 5, "robot": 7, "critic": 3, "policy": 12}
+    assert infer_env_observation_dims(obs) == {"motion": 5, "robot": 28, "critic": 3, "policy": 33}
 
 
 def test_infer_actor_observation_dims_from_state_dict_for_film_res_actor():
@@ -126,15 +127,37 @@ def test_parse_sim2sim_obs_supports_robot_window_lengths():
 
     assert infer_sim2sim_observation_dims(2, window_lengths) == {"motion": 7, "robot": 48, "policy": 55}
     assert obs_parts["motion"].shape == (7,)
-    assert obs_parts["robot"].shape == (48,)
+    assert obs_parts["robot"].shape == (4, 12)
+    assert obs_parts["robot_obs"].shape == (4, 12)
     torch.testing.assert_close(obs_parts["target_joint_pos"], base_parts["target_joint_pos"])
     torch.testing.assert_close(obs_parts["robot_joint_vel"], base_parts["robot_joint_vel"])
     assert set(("joint_pos_mae", "joint_vel_mae", "gravity_mae")).issubset(metrics)
 
 
+def test_extract_sim2sim_actor_obs_from_mapping_structures_windowed_robot_history():
+    window_lengths = build_robot_policy_window_lengths(4)
+    actor_obs = extract_sim2sim_actor_obs_from_mapping(
+        {
+            "motion": torch.zeros(7, dtype=torch.float32),
+            "robot": torch.arange(48, dtype=torch.float32),
+        },
+        action_dim=2,
+        observation_window_lengths=window_lengths,
+    )
+
+    assert actor_obs is not None
+    assert actor_obs["motion"].shape == (7,)
+    assert actor_obs["robot"].shape == (4, 12)
+    assert actor_obs["robot_obs"].shape == (4, 12)
+
+
 def test_replace_sim2sim_group_latest_terms_updates_latest_window_only():
     window_lengths = build_robot_policy_window_lengths(4)
-    robot_obs = torch.arange(48, dtype=torch.float32)
+    robot_obs = parse_sim2sim_obs(
+        torch.arange(55, dtype=torch.float32),
+        action_dim=2,
+        observation_window_lengths=window_lengths,
+    )["robot"]
 
     updated_robot_obs = replace_sim2sim_group_latest_terms(
         robot_obs,
@@ -155,6 +178,7 @@ def test_replace_sim2sim_group_latest_terms_updates_latest_window_only():
 
     torch.testing.assert_close(obs_parts["robot_projected_gravity"], torch.tensor([101.0, 102.0, 103.0]))
     torch.testing.assert_close(obs_parts["anchor_ang_vel"], torch.tensor([201.0, 202.0, 203.0]))
+    assert updated_robot_obs.shape == (4, 12)
 
 
 def test_resolve_action_mode_supports_current_residual():

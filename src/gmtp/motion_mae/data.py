@@ -7,18 +7,18 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
-from .config import MotionVAEDataConfig, MotionVAEFeatureConfig
+from .config import MotionMAEDataConfig, MotionMAEFeatureConfig
 from .features import MotionFeatureBundle, MotionFeatureSequence, build_motion_feature_bundle
-from .schema import MotionFeatureSchema
+from .schema import MotionFeatureSchema, MotionSegment
 
 
 WindowIndex = tuple[int, int]
 
 
 @dataclass(frozen=True)
-class MotionVAEDataBundle:
-    train_dataset: "ReferenceMotionVAEDataset"
-    val_dataset: "ReferenceMotionVAEDataset"
+class MotionMAEDataBundle:
+    train_dataset: "ReferenceMotionMAEDataset"
+    val_dataset: "ReferenceMotionMAEDataset"
     schema: MotionFeatureSchema
     train_motion_names: tuple[str, ...]
     val_motion_names: tuple[str, ...]
@@ -32,15 +32,38 @@ class MotionVAEDataBundle:
         return len(self.val_dataset)
 
 
-def build_valid_window_centers(sequence_length: int, past_frames: int, future_frames: int) -> list[int]:
-    start = int(past_frames) - 1
-    end = int(sequence_length) - int(future_frames)
+def build_segment_valid_window_centers(
+    segment: MotionSegment,
+    *,
+    past_frames: int,
+    future_frames: int,
+) -> list[int]:
+    start = int(segment.start_frame) + int(past_frames) - 1
+    end = int(segment.end_frame) - int(future_frames) - 1
     if end < start:
         return []
     return list(range(start, end + 1))
 
 
-class ReferenceMotionVAEDataset(Dataset):
+def build_valid_window_centers(
+    segments: tuple[MotionSegment, ...],
+    *,
+    past_frames: int,
+    future_frames: int,
+) -> list[int]:
+    centers: list[int] = []
+    for segment in segments:
+        centers.extend(
+            build_segment_valid_window_centers(
+                segment,
+                past_frames=past_frames,
+                future_frames=future_frames,
+            )
+        )
+    return centers
+
+
+class ReferenceMotionMAEDataset(Dataset):
     def __init__(
         self,
         sequences: tuple[MotionFeatureSequence, ...],
@@ -69,7 +92,7 @@ class ReferenceMotionVAEDataset(Dataset):
         sequence_index, center_t = self.window_indices[index]
         sequence = self.sequences[sequence_index]
         past = sequence.reference_features[center_t - self.past_frames + 1 : center_t + 1]
-        future = sequence.target_features[center_t : center_t + self.future_frames]
+        future = sequence.target_features[center_t + 1 : center_t + self.future_frames + 1]
         normalized_past = (past - self.reference_mean) / self.reference_std
         normalized_future = (future - self.target_mean) / self.target_std
         return {
@@ -89,7 +112,11 @@ def _all_window_indices(
 ) -> tuple[WindowIndex, ...]:
     window_indices: list[WindowIndex] = []
     for sequence_index, sequence in enumerate(sequences):
-        for center_t in build_valid_window_centers(sequence.length, past_frames, future_frames):
+        for center_t in build_valid_window_centers(
+            sequence.segments,
+            past_frames=past_frames,
+            future_frames=future_frames,
+        ):
             window_indices.append((sequence_index, center_t))
     return tuple(window_indices)
 
@@ -149,7 +176,7 @@ def _window_stats(
     for sequence_index, center_t in window_indices:
         sequence = sequences[sequence_index]
         past = sequence.reference_features[center_t - past_frames + 1 : center_t + 1].to(dtype=torch.float64)
-        future = sequence.target_features[center_t : center_t + future_frames].to(dtype=torch.float64)
+        future = sequence.target_features[center_t + 1 : center_t + future_frames + 1].to(dtype=torch.float64)
         ref_sum += past.sum(dim=0)
         ref_sq_sum += torch.square(past).sum(dim=0)
         ref_count += int(past.shape[0])
@@ -181,14 +208,21 @@ def _limit_windows(
     return tuple(window_indices[:max_windows])
 
 
-def build_motion_vae_datasets(
-    data_config: MotionVAEDataConfig,
+def _resolve_split_mode(data_config: MotionMAEDataConfig, *, sequence_count: int) -> str:
+    if data_config.split_mode != "auto":
+        return data_config.split_mode
+    return "by_motion" if sequence_count >= 2 else "by_window"
+
+
+def build_motion_mae_datasets(
+    data_config: MotionMAEDataConfig,
     *,
-    feature_config: MotionVAEFeatureConfig,
+    feature_config: MotionMAEFeatureConfig,
     slice_weights: dict[str, float] | None = None,
-) -> MotionVAEDataBundle:
+) -> MotionMAEDataBundle:
     feature_bundle: MotionFeatureBundle = build_motion_feature_bundle(
         data_config.motion_files,
+        data_config=data_config,
         feature_config=feature_config,
         slice_weights=slice_weights,
     )
@@ -201,7 +235,8 @@ def build_motion_vae_datasets(
     if not all_windows:
         raise ValueError("No legal motion windows were found for the requested past/future lengths.")
 
-    if data_config.split_mode == "by_motion":
+    split_mode = _resolve_split_mode(data_config, sequence_count=len(sequences))
+    if split_mode == "by_motion":
         train_sequence_indices, val_sequence_indices = _split_sequence_indices(
             len(sequences),
             val_ratio=data_config.val_ratio,
@@ -237,7 +272,7 @@ def build_motion_vae_datasets(
         target_mean=target_mean.tolist(),
         target_std=target_std.tolist(),
     )
-    train_dataset = ReferenceMotionVAEDataset(
+    train_dataset = ReferenceMotionMAEDataset(
         sequences,
         train_windows,
         past_frames=data_config.past_frames,
@@ -247,7 +282,7 @@ def build_motion_vae_datasets(
         target_mean=target_mean,
         target_std=target_std,
     )
-    val_dataset = ReferenceMotionVAEDataset(
+    val_dataset = ReferenceMotionMAEDataset(
         sequences,
         val_windows,
         past_frames=data_config.past_frames,
@@ -257,7 +292,7 @@ def build_motion_vae_datasets(
         target_mean=target_mean,
         target_std=target_std,
     )
-    return MotionVAEDataBundle(
+    return MotionMAEDataBundle(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         schema=schema,

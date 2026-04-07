@@ -12,9 +12,11 @@ DEFAULT_END_EFFECTOR_BODY_NAMES = (
     "left_rubber_hand",
     "right_rubber_hand",
 )
-_VALID_FEATURE_NAMES = {"root", "joint", "end_effector"}
-_VALID_SPLIT_MODES = {"by_motion", "by_window"}
-_VALID_RECONSTRUCTION_LOSSES = {"mse", "l1"}
+VALID_FEATURE_NAMES = {"root", "joint", "end_effector"}
+VALID_SPLIT_MODES = {"auto", "by_motion", "by_window"}
+VALID_RECONSTRUCTION_LOSSES = {"mse", "l1"}
+VALID_ADAPTER_NAMES = {"stageii_npz"}
+VALID_ACTIVATIONS = {"relu", "gelu"}
 
 
 def _to_str_tuple(value: Any, *, name: str) -> tuple[str, ...]:
@@ -46,7 +48,7 @@ def _normalize_slice_weights(value: Any) -> dict[str, float]:
 
 
 @dataclass(frozen=True)
-class MotionVAEFeatureConfig:
+class MotionMAEFeatureConfig:
     anchor_body_name: str = "pelvis"
     end_effector_body_names: tuple[str, ...] = DEFAULT_END_EFFECTOR_BODY_NAMES
     reference_feature_names: tuple[str, ...] = ("root", "joint", "end_effector")
@@ -62,7 +64,7 @@ class MotionVAEFeatureConfig:
         ):
             if not values:
                 raise ValueError(f"{name} must not be empty.")
-            unknown = [item for item in values if item not in _VALID_FEATURE_NAMES]
+            unknown = [item for item in values if item not in VALID_FEATURE_NAMES]
             if unknown:
                 raise ValueError(f"{name} contains unsupported features: {unknown}.")
         if tuple(self.target_feature_names[: len(self.policy_feature_names)]) != tuple(self.policy_feature_names):
@@ -81,7 +83,7 @@ class MotionVAEFeatureConfig:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionVAEFeatureConfig":
+    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionMAEFeatureConfig":
         payload = payload or {}
         gravity_vector = payload.get("gravity_vector", (0.0, 0.0, -1.0))
         return cls(
@@ -107,11 +109,12 @@ class MotionVAEFeatureConfig:
 
 
 @dataclass(frozen=True)
-class MotionVAEDataConfig:
+class MotionMAEDataConfig:
     motion_files: tuple[str, ...] | None = None
+    adapter_name: str = "stageii_npz"
     past_frames: int = 8
     future_frames: int = 4
-    split_mode: str = "by_motion"
+    split_mode: str = "auto"
     val_ratio: float = 0.2
     batch_size: int = 128
     num_workers: int = 0
@@ -121,9 +124,11 @@ class MotionVAEDataConfig:
     max_val_windows: int | None = None
 
     def __post_init__(self) -> None:
+        if self.adapter_name not in VALID_ADAPTER_NAMES:
+            raise ValueError(f"Unsupported adapter_name '{self.adapter_name}'.")
         if self.past_frames < 1 or self.future_frames < 1:
             raise ValueError("past_frames and future_frames must be positive.")
-        if self.split_mode not in _VALID_SPLIT_MODES:
+        if self.split_mode not in VALID_SPLIT_MODES:
             raise ValueError(f"Unsupported split_mode '{self.split_mode}'.")
         if not 0.0 < self.val_ratio < 1.0:
             raise ValueError(f"val_ratio must be in (0, 1), got {self.val_ratio}.")
@@ -139,6 +144,7 @@ class MotionVAEDataConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "motion_files": list(self.motion_files) if self.motion_files is not None else None,
+            "adapter_name": self.adapter_name,
             "past_frames": self.past_frames,
             "future_frames": self.future_frames,
             "split_mode": self.split_mode,
@@ -152,14 +158,15 @@ class MotionVAEDataConfig:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionVAEDataConfig":
+    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionMAEDataConfig":
         payload = payload or {}
         motion_files = payload.get("motion_files")
         return cls(
             motion_files=_to_str_tuple(motion_files, name="motion_files") if motion_files is not None else None,
+            adapter_name=str(payload.get("adapter_name", "stageii_npz")),
             past_frames=int(payload.get("past_frames", 8)),
             future_frames=int(payload.get("future_frames", 4)),
-            split_mode=str(payload.get("split_mode", "by_motion")),
+            split_mode=str(payload.get("split_mode", "auto")),
             val_ratio=float(payload.get("val_ratio", 0.2)),
             batch_size=int(payload.get("batch_size", 128)),
             num_workers=int(payload.get("num_workers", 0)),
@@ -173,62 +180,66 @@ class MotionVAEDataConfig:
 
 
 @dataclass(frozen=True)
-class MotionVAEModelConfig:
-    latent_dim: int = 32
-    encoder_channels: tuple[int, ...] = (128, 256)
-    kernel_size: int = 3
-    stride: int = 1
-    activation: str = "silu"
-    decoder_hidden_dims: tuple[int, ...] = (256, 256)
+class MotionMAEModelConfig:
+    d_model: int = 256
+    latent_dim: int = 64
+    encoder_layers: int = 4
+    decoder_layers: int = 2
+    nhead: int = 8
+    dim_feedforward: int = 512
+    dropout: float = 0.0
+    activation: str = "gelu"
 
     def __post_init__(self) -> None:
-        if self.latent_dim < 1:
-            raise ValueError("latent_dim must be positive.")
-        if not self.encoder_channels:
-            raise ValueError("encoder_channels must not be empty.")
-        if any(value < 1 for value in self.encoder_channels):
-            raise ValueError("encoder_channels must be positive.")
-        if self.kernel_size < 1 or self.stride < 1:
-            raise ValueError("kernel_size and stride must be positive.")
-        if any(value < 1 for value in self.decoder_hidden_dims):
-            raise ValueError("decoder_hidden_dims must be positive.")
+        if self.d_model < 1 or self.latent_dim < 1:
+            raise ValueError("d_model and latent_dim must be positive.")
+        if self.encoder_layers < 1 or self.decoder_layers < 1:
+            raise ValueError("encoder_layers and decoder_layers must be positive.")
+        if self.nhead < 1:
+            raise ValueError("nhead must be positive.")
+        if self.d_model % self.nhead != 0:
+            raise ValueError(f"d_model={self.d_model} must be divisible by nhead={self.nhead}.")
+        if self.dim_feedforward < self.d_model:
+            raise ValueError("dim_feedforward must be at least d_model.")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1).")
+        if self.activation not in VALID_ACTIVATIONS:
+            raise ValueError(f"Unsupported activation '{self.activation}'.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "d_model": self.d_model,
             "latent_dim": self.latent_dim,
-            "encoder_channels": list(self.encoder_channels),
-            "kernel_size": self.kernel_size,
-            "stride": self.stride,
+            "encoder_layers": self.encoder_layers,
+            "decoder_layers": self.decoder_layers,
+            "nhead": self.nhead,
+            "dim_feedforward": self.dim_feedforward,
+            "dropout": self.dropout,
             "activation": self.activation,
-            "decoder_hidden_dims": list(self.decoder_hidden_dims),
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionVAEModelConfig":
+    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionMAEModelConfig":
         payload = payload or {}
         return cls(
-            latent_dim=int(payload.get("latent_dim", 32)),
-            encoder_channels=_to_int_tuple(payload.get("encoder_channels", (128, 256)), name="encoder_channels"),
-            kernel_size=int(payload.get("kernel_size", 3)),
-            stride=int(payload.get("stride", 1)),
-            activation=str(payload.get("activation", "silu")),
-            decoder_hidden_dims=_to_int_tuple(
-                payload.get("decoder_hidden_dims", (256, 256)),
-                name="decoder_hidden_dims",
-            ),
+            d_model=int(payload.get("d_model", 256)),
+            latent_dim=int(payload.get("latent_dim", 64)),
+            encoder_layers=int(payload.get("encoder_layers", 4)),
+            decoder_layers=int(payload.get("decoder_layers", 2)),
+            nhead=int(payload.get("nhead", 8)),
+            dim_feedforward=int(payload.get("dim_feedforward", 512)),
+            dropout=float(payload.get("dropout", 0.0)),
+            activation=str(payload.get("activation", "gelu")),
         )
 
 
 @dataclass(frozen=True)
-class MotionVAELossConfig:
-    beta: float = 1.0e-3
+class MotionMAELossConfig:
     reconstruction_loss: str = "mse"
     slice_weights: dict[str, float] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
-        if self.beta < 0.0:
-            raise ValueError("beta must be non-negative.")
-        if self.reconstruction_loss not in _VALID_RECONSTRUCTION_LOSSES:
+        if self.reconstruction_loss not in VALID_RECONSTRUCTION_LOSSES:
             raise ValueError(f"Unsupported reconstruction_loss '{self.reconstruction_loss}'.")
         if self.slice_weights is None:
             object.__setattr__(self, "slice_weights", {"root": 1.0, "joint": 1.0, "end_effector": 1.0})
@@ -237,23 +248,21 @@ class MotionVAELossConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "beta": self.beta,
             "reconstruction_loss": self.reconstruction_loss,
             "slice_weights": dict(self.slice_weights),
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionVAELossConfig":
+    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionMAELossConfig":
         payload = payload or {}
         return cls(
-            beta=float(payload.get("beta", 1.0e-3)),
             reconstruction_loss=str(payload.get("reconstruction_loss", "mse")),
             slice_weights=_normalize_slice_weights(payload.get("slice_weights")),
         )
 
 
 @dataclass(frozen=True)
-class MotionVAEOptimizerConfig:
+class MotionMAEOptimizerConfig:
     lr: float = 3.0e-4
     weight_decay: float = 0.0
 
@@ -270,7 +279,7 @@ class MotionVAEOptimizerConfig:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionVAEOptimizerConfig":
+    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionMAEOptimizerConfig":
         payload = payload or {}
         return cls(
             lr=float(payload.get("lr", 3.0e-4)),
@@ -279,7 +288,7 @@ class MotionVAEOptimizerConfig:
 
 
 @dataclass(frozen=True)
-class MotionVAETrainingConfig:
+class MotionMAETrainingConfig:
     epochs: int = 10
     device: str = "auto"
     grad_clip_norm: float | None = 1.0
@@ -302,7 +311,7 @@ class MotionVAETrainingConfig:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionVAETrainingConfig":
+    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionMAETrainingConfig":
         payload = payload or {}
         grad_clip_norm = payload.get("grad_clip_norm", 1.0)
         return cls(
@@ -314,7 +323,7 @@ class MotionVAETrainingConfig:
 
 
 @dataclass(frozen=True)
-class MotionVAEExportConfig:
+class MotionMAEExportConfig:
     save_optimizer_state: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -323,20 +332,20 @@ class MotionVAEExportConfig:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionVAEExportConfig":
+    def from_dict(cls, payload: dict[str, Any] | None) -> "MotionMAEExportConfig":
         payload = payload or {}
         return cls(save_optimizer_state=bool(payload.get("save_optimizer_state", True)))
 
 
 @dataclass(frozen=True)
-class MotionVAEPretrainConfig:
-    data: MotionVAEDataConfig = MotionVAEDataConfig()
-    feature: MotionVAEFeatureConfig = MotionVAEFeatureConfig()
-    model: MotionVAEModelConfig = MotionVAEModelConfig()
-    loss: MotionVAELossConfig = MotionVAELossConfig()
-    optimizer: MotionVAEOptimizerConfig = MotionVAEOptimizerConfig()
-    training: MotionVAETrainingConfig = MotionVAETrainingConfig()
-    export: MotionVAEExportConfig = MotionVAEExportConfig()
+class MotionMAEPretrainConfig:
+    data: MotionMAEDataConfig = MotionMAEDataConfig()
+    feature: MotionMAEFeatureConfig = MotionMAEFeatureConfig()
+    model: MotionMAEModelConfig = MotionMAEModelConfig()
+    loss: MotionMAELossConfig = MotionMAELossConfig()
+    optimizer: MotionMAEOptimizerConfig = MotionMAEOptimizerConfig()
+    training: MotionMAETrainingConfig = MotionMAETrainingConfig()
+    export: MotionMAEExportConfig = MotionMAEExportConfig()
     output_root: str = "runs"
     run_name: str | None = None
 
@@ -354,37 +363,37 @@ class MotionVAEPretrainConfig:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "MotionVAEPretrainConfig":
+    def from_dict(cls, payload: dict[str, Any]) -> "MotionMAEPretrainConfig":
         return cls(
-            data=MotionVAEDataConfig.from_dict(payload.get("data")),
-            feature=MotionVAEFeatureConfig.from_dict(payload.get("feature")),
-            model=MotionVAEModelConfig.from_dict(payload.get("model")),
-            loss=MotionVAELossConfig.from_dict(payload.get("loss")),
-            optimizer=MotionVAEOptimizerConfig.from_dict(payload.get("optimizer")),
-            training=MotionVAETrainingConfig.from_dict(payload.get("training")),
-            export=MotionVAEExportConfig.from_dict(payload.get("export")),
+            data=MotionMAEDataConfig.from_dict(payload.get("data")),
+            feature=MotionMAEFeatureConfig.from_dict(payload.get("feature")),
+            model=MotionMAEModelConfig.from_dict(payload.get("model")),
+            loss=MotionMAELossConfig.from_dict(payload.get("loss")),
+            optimizer=MotionMAEOptimizerConfig.from_dict(payload.get("optimizer")),
+            training=MotionMAETrainingConfig.from_dict(payload.get("training")),
+            export=MotionMAEExportConfig.from_dict(payload.get("export")),
             output_root=str(payload.get("output_root", "runs")),
             run_name=(str(payload["run_name"]) if payload.get("run_name") is not None else None),
         )
 
 
-def load_motion_vae_pretrain_config(path: str | Path) -> MotionVAEPretrainConfig:
+def load_motion_mae_pretrain_config(path: str | Path) -> MotionMAEPretrainConfig:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
-        raise ValueError(f"Motion VAE config must be a JSON object, got {type(payload).__name__}.")
-    return MotionVAEPretrainConfig.from_dict(payload)
+        raise ValueError(f"Motion MAE config must be a JSON object, got {type(payload).__name__}.")
+    return MotionMAEPretrainConfig.from_dict(payload)
 
 
-def apply_motion_vae_cli_overrides(
-    config: MotionVAEPretrainConfig,
+def apply_motion_mae_cli_overrides(
+    config: MotionMAEPretrainConfig,
     *,
     motion_files: list[str] | None = None,
     output_root: str | None = None,
     run_name: str | None = None,
     device: str | None = None,
-) -> MotionVAEPretrainConfig:
+) -> MotionMAEPretrainConfig:
     data_config = config.data
     training_config = config.training
     if motion_files is not None:

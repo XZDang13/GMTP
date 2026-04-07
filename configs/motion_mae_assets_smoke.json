@@ -1,12 +1,20 @@
 {
   "data": {
     "motion_files": [
-      "env/assests/61_10_stageii.npz"
+      "env/assests/05_05_stageii.npz",
+      "env/assests/06_13_stageii.npz",
+      "env/assests/55_02_stageii.npz",
+      "env/assests/61_10_stageii.npz",
+      "env/assests/63_25_stageii.npz",
+      "env/assests/115_02_stageii.npz",
+      "env/assests/115_06_stageii.npz",
+      "env/assests/120_01_stageii.npz"
     ],
+    "adapter_name": "stageii_npz",
     "past_frames": 8,
     "future_frames": 4,
-    "split_mode": "by_window",
-    "val_ratio": 0.2,
+    "split_mode": "auto",
+    "val_ratio": 0.25,
     "batch_size": 256,
     "num_workers": 0,
     "pin_memory": true,
@@ -33,24 +41,24 @@
     "policy_feature_names": [
       "root",
       "joint"
+    ],
+    "gravity_vector": [
+      0.0,
+      0.0,
+      -1.0
     ]
   },
   "model": {
-    "latent_dim": 32,
-    "encoder_channels": [
-      128,
-      256
-    ],
-    "kernel_size": 3,
-    "stride": 1,
-    "activation": "silu",
-    "decoder_hidden_dims": [
-      256,
-      256
-    ]
+    "d_model": 256,
+    "latent_dim": 64,
+    "encoder_layers": 4,
+    "decoder_layers": 2,
+    "nhead": 8,
+    "dim_feedforward": 512,
+    "dropout": 0.0,
+    "activation": "gelu"
   },
   "loss": {
-    "beta": 0.001,
     "reconstruction_loss": "mse",
     "slice_weights": {
       "root": 1.0,
@@ -63,14 +71,14 @@
     "weight_decay": 0.0
   },
   "training": {
-    "epochs": 40,
+    "epochs": 20,
     "device": "cuda",
     "grad_clip_norm": 1.0,
-    "log_interval": 20
+    "log_interval": 10
   },
   "export": {
     "save_optimizer_state": true
   },
   "output_root": "runs",
-  "run_name": "motion_vae_61_10_stageii"
+  "run_name": "motion_mae_assets_smoke"
 }

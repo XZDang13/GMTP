@@ -6,15 +6,15 @@ import torch
 from torch.utils.data import DataLoader
 
 from gmtp.integrations.ref2act.motion import motion_label, motion_names
-from gmtp.motion_vae import (
-    MotionVAEPretrainConfig,
-    ReferenceMotionVAE,
-    build_motion_encoder_checkpoint,
-    build_motion_vae_checkpoint,
-    build_motion_vae_datasets,
-    compute_motion_vae_losses,
-    save_motion_encoder_checkpoint,
-    save_motion_vae_checkpoint,
+from gmtp.motion_mae import (
+    MotionMAEPretrainConfig,
+    ReferenceMotionMAE,
+    build_motion_mae_checkpoint,
+    build_motion_mae_datasets,
+    build_motion_mae_encoder_checkpoint,
+    compute_motion_mae_losses,
+    save_motion_mae_checkpoint,
+    save_motion_mae_encoder_checkpoint,
 )
 from gmtp.runtime.io import build_run_paths, write_json
 
@@ -26,11 +26,11 @@ def resolve_training_device(device: str) -> torch.device:
     return torch.device(normalized)
 
 
-class MotionVAEPretrainRunner:
-    def __init__(self, config: MotionVAEPretrainConfig) -> None:
+class MotionMAEPretrainRunner:
+    def __init__(self, config: MotionMAEPretrainConfig) -> None:
         self.config = config
         self.device = resolve_training_device(config.training.device)
-        self.data_bundle = build_motion_vae_datasets(
+        self.data_bundle = build_motion_mae_datasets(
             config.data,
             feature_config=config.feature,
             slice_weights=config.loss.slice_weights,
@@ -38,21 +38,23 @@ class MotionVAEPretrainRunner:
         self.schema = self.data_bundle.schema
         self.motion_files = [sequence.motion_file for sequence in self.data_bundle.train_dataset.sequences]
         self.motion_name = motion_label(self.motion_files)
-        default_run_name = config.run_name or f"motion_vae_{len(self.motion_files)}motions"
-        self.run_paths = build_run_paths(config.output_root, "pretrain", default_run_name)
-        write_json(self.run_paths.config_path, {"command": "pretrain motion-vae", "config": config.to_dict()})
+        default_run_name = config.run_name or f"motion_mae_{len(self.motion_files)}motions"
+        self.run_paths = build_run_paths(config.output_root, "pretrain-motion-mae", default_run_name)
+        write_json(self.run_paths.config_path, {"command": "pretrain motion-mae", "config": config.to_dict()})
 
-        self.model = ReferenceMotionVAE(
+        self.model = ReferenceMotionMAE(
             input_dim=self.schema.d_ref,
             target_dim=self.schema.d_target,
             past_frames=config.data.past_frames,
             future_frames=config.data.future_frames,
+            d_model=config.model.d_model,
             latent_dim=config.model.latent_dim,
-            encoder_channels=config.model.encoder_channels,
-            kernel_size=config.model.kernel_size,
-            stride=config.model.stride,
+            encoder_layers=config.model.encoder_layers,
+            decoder_layers=config.model.decoder_layers,
+            nhead=config.model.nhead,
+            dim_feedforward=config.model.dim_feedforward,
+            dropout=config.model.dropout,
             activation=config.model.activation,
-            decoder_hidden_dims=config.model.decoder_hidden_dims,
         ).to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -87,14 +89,11 @@ class MotionVAEPretrainRunner:
             target = batch["target"].to(self.device, non_blocking=True)
 
             with torch.set_grad_enabled(training):
-                outputs = self.model(reference, deterministic=not training)
-                losses = compute_motion_vae_losses(
+                outputs = self.model(reference)
+                losses = compute_motion_mae_losses(
                     outputs["prediction"],
                     target,
-                    mu=outputs["mu"],
-                    logvar=outputs["logvar"],
                     target_slices=self.schema.target_slices,
-                    beta=self.config.loss.beta,
                     reconstruction_loss=self.config.loss.reconstruction_loss,
                 )
                 if training:
@@ -115,8 +114,9 @@ class MotionVAEPretrainRunner:
                 print(
                     f"train batch {batch_index}/{len(loader)} "
                     f"loss={float(losses['loss'].detach().cpu()):.6f} "
-                    f"recon={float(losses['reconstruction_loss'].detach().cpu()):.6f} "
-                    f"kl={float(losses['kl_loss'].detach().cpu()):.6f}"
+                    f"root={float(losses['root_loss'].detach().cpu()):.6f} "
+                    f"joint={float(losses['joint_loss'].detach().cpu()):.6f} "
+                    f"eef={float(losses['end_effector_loss'].detach().cpu()):.6f}"
                 )
 
         return {key: value / total_samples for key, value in aggregates.items()}
@@ -127,7 +127,7 @@ class MotionVAEPretrainRunner:
             "train_motion_names": list(self.data_bundle.train_motion_names),
             "val_motion_names": list(self.data_bundle.val_motion_names),
         }
-        vae_checkpoint = build_motion_vae_checkpoint(
+        mae_checkpoint = build_motion_mae_checkpoint(
             model=self.model,
             optimizer=self.optimizer if self.config.export.save_optimizer_state else None,
             schema=self.schema,
@@ -136,7 +136,7 @@ class MotionVAEPretrainRunner:
             best_metric=best_metric,
             artifacts=artifacts,
         )
-        encoder_checkpoint = build_motion_encoder_checkpoint(
+        encoder_checkpoint = build_motion_mae_encoder_checkpoint(
             model=self.model,
             schema=self.schema,
             config=self.config,
@@ -144,17 +144,17 @@ class MotionVAEPretrainRunner:
             best_metric=best_metric,
             artifacts=artifacts,
         )
-        vae_path = save_motion_vae_checkpoint(
-            vae_checkpoint,
-            self.run_paths.checkpoints_dir / f"{prefix}_vae.pth",
+        mae_path = save_motion_mae_checkpoint(
+            mae_checkpoint,
+            self.run_paths.checkpoints_dir / f"{prefix}_motion_mae.pth",
         )
-        encoder_path = save_motion_encoder_checkpoint(
+        encoder_path = save_motion_mae_encoder_checkpoint(
             encoder_checkpoint,
-            self.run_paths.checkpoints_dir / f"{prefix}_encoder.pth",
+            self.run_paths.checkpoints_dir / f"{prefix}_motion_mae_encoder.pth",
         )
         return {
-            f"{prefix}_vae": str(vae_path),
-            f"{prefix}_encoder": str(encoder_path),
+            f"{prefix}_motion_mae": str(mae_path),
+            f"{prefix}_motion_mae_encoder": str(encoder_path),
         }
 
     def train(self) -> dict[str, object]:

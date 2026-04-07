@@ -28,6 +28,7 @@ from gmtp.integrations.ref2act.observation_history import (
 )
 from gmtp.models import get_actor_observation
 from gmtp.runtime.checkpoints import load_checkpoint_v2
+from gmtp.runtime.amp import AMP_DTYPE_NAME, autocast_context, resolve_amp_enabled
 from gmtp.runtime.config import Sim2SimEvalConfig
 from gmtp.runtime.debug import RolloutDebugLogger
 from gmtp.runtime.io import build_run_paths, write_json
@@ -42,10 +43,11 @@ from gmtp.runtime.observations import (
     parse_sim2sim_obs,
     split_sim2sim_group_observations,
 )
-from gmtp.runtime.policy import load_actor_from_checkpoint, resolve_checkpoint_stem
 from gmtp.runtime.policy import (
-    build_motion_latent_adapter,
-    resolve_motion_encoder_checkpoint_path,
+    build_motion_mae_adapter,
+    load_actor_from_checkpoint,
+    resolve_checkpoint_stem,
+    resolve_motion_mae_checkpoint_path,
 )
 
 DEFAULT_VIDEO_HEIGHT = 720
@@ -191,6 +193,9 @@ class Sim2SimEvalRunner:
     def __init__(self, config: Sim2SimEvalConfig):
         self.config = config
         self.device = torch.device("cpu")
+        self.requested_amp = bool(config.use_amp)
+        self.use_amp = resolve_amp_enabled(self.requested_amp, self.device)
+        self.amp_dtype = AMP_DTYPE_NAME
         self.checkpoint_path = Path(config.checkpoint_path).expanduser().resolve()
         self.checkpoint = load_checkpoint_v2(self.checkpoint_path)
         self.motion_files = self._resolve_motion_files()
@@ -208,22 +213,26 @@ class Sim2SimEvalRunner:
             robot_window_length=config.robot_window_length,
             checkpoint_env=checkpoint_env,
         )
-        resolved_motion_encoder_checkpoint = resolve_motion_encoder_checkpoint_path(
+        resolved_motion_mae_checkpoint = resolve_motion_mae_checkpoint_path(
             self.checkpoint,
-            override=config.motion_encoder_checkpoint,
+            override=config.motion_mae_encoder_checkpoint,
         )
-        self.motion_encoder_checkpoint = (
-            None if resolved_motion_encoder_checkpoint is None else str(resolved_motion_encoder_checkpoint)
+        self.motion_mae_encoder_checkpoint = (
+            None if resolved_motion_mae_checkpoint is None else str(resolved_motion_mae_checkpoint)
         )
-        self.motion_latent_adapter = build_motion_latent_adapter(
-            self.motion_encoder_checkpoint,
+        self.motion_mae_adapter = build_motion_mae_adapter(
+            self.motion_mae_encoder_checkpoint,
             device=self.device,
         )
-        self.sim2sim_obs_dims = infer_sim2sim_observation_dims(
+        self.raw_obs_dims = infer_sim2sim_observation_dims(
             self.action_dim,
             observation_window_lengths=self.observation_window_lengths,
         )
-        self.raw_obs_dims = dict(self.sim2sim_obs_dims)
+        self.obs_dims = (
+            self.motion_mae_adapter.augment_observation_dims(self.raw_obs_dims)
+            if self.motion_mae_adapter is not None
+            else self.raw_obs_dims
+        )
         self.action_mode, self.action_mode_source = resolve_action_mode(
             checkpoint_env,
             config.action_mode,
@@ -242,12 +251,6 @@ class Sim2SimEvalRunner:
             checkpoint_env,
             ("anchor_body_name",),
             DEFAULT_ANCHOR_BODY_NAME,
-        )
-
-        self.obs_dims = (
-            self.motion_latent_adapter.augment_observation_dims(self.raw_obs_dims)
-            if self.motion_latent_adapter is not None
-            else self.raw_obs_dims
         )
         checkpoint_obs_dims = infer_actor_observation_dims_from_state_dict(
             self.checkpoint.model["actor"],
@@ -362,7 +365,11 @@ class Sim2SimEvalRunner:
 
         structured_actor_obs = None
         if structured_obs is not None:
-            structured_actor_obs = extract_sim2sim_actor_obs_from_mapping(structured_obs)
+            structured_actor_obs = extract_sim2sim_actor_obs_from_mapping(
+                structured_obs,
+                action_dim=self.action_dim,
+                observation_window_lengths=self.observation_window_lengths,
+            )
 
         if structured_actor_obs is not None:
             context_builder = getattr(env, "_build_observation_context", None)
@@ -408,7 +415,8 @@ class Sim2SimEvalRunner:
         self,
         actor_obs: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        actor_step = self.actor(actor_obs)
+        with autocast_context(self.device, self.use_amp):
+            actor_step = self.actor(actor_obs)
         action = actor_step.mean.squeeze(0).detach().to(device="cpu", dtype=torch.float32)
         if not torch.isfinite(action).all():
             raise RuntimeError(
@@ -445,21 +453,21 @@ class Sim2SimEvalRunner:
         try:
             obs_parts = self._extract_obs_parts(env, env.reset())
             self._validate_obs_dims(obs_parts)
-            if self.motion_latent_adapter is not None:
-                self.motion_latent_adapter.initialize_history(env)
+            if self.motion_mae_adapter is not None:
+                self.motion_mae_adapter.initialize_history(env)
             if video_recorder is not None:
                 video_recorder.capture_frame()
 
             for step_idx in range(self.config.num_steps):
                 actor_env_obs = _tensor_dict_to_batch(obs_parts)
                 actor_obs = get_actor_observation(actor_env_obs, self.actor_type)
-                if self.motion_latent_adapter is not None:
-                    actor_obs = self.motion_latent_adapter.augment_actor_observation(actor_obs)
+                if self.motion_mae_adapter is not None:
+                    actor_obs = self.motion_mae_adapter.augment_actor_observation(actor_obs)
                 action, actor_log_fields = self._get_action(actor_obs)
 
                 next_obs_parts = self._extract_obs_parts(env, env.step(action))
-                if self.motion_latent_adapter is not None:
-                    self.motion_latent_adapter.update_history(env)
+                if self.motion_mae_adapter is not None:
+                    self.motion_mae_adapter.update_history(env)
                 metrics = extract_sim2sim_metrics_from_parts(next_obs_parts)
                 metric_records.append(metrics)
 
@@ -493,8 +501,11 @@ class Sim2SimEvalRunner:
                 "metrics": _mean_metrics(metric_records),
                 "actor_type": self.actor_type.value,
                 "actor_kwargs": self.actor_kwargs,
-                "motion_encoder_checkpoint": self.motion_encoder_checkpoint,
+                "motion_mae_encoder_checkpoint": self.motion_mae_encoder_checkpoint,
                 "observation_window_lengths": self.observation_window_lengths,
+                "amp_requested": self.requested_amp,
+                "amp_enabled": self.use_amp,
+                "amp_dtype": self.amp_dtype,
                 "action_mode": self.action_mode,
                 "action_mode_source": self.action_mode_source,
                 "root_name": self.root_name,
@@ -534,8 +545,11 @@ class Sim2SimEvalRunner:
             "checkpoint": str(self.checkpoint_path),
             "actor_type": self.actor_type.value,
             "actor_kwargs": self.actor_kwargs,
-            "motion_encoder_checkpoint": self.motion_encoder_checkpoint,
+            "motion_mae_encoder_checkpoint": self.motion_mae_encoder_checkpoint,
             "observation_window_lengths": self.observation_window_lengths,
+            "amp_requested": self.requested_amp,
+            "amp_enabled": self.use_amp,
+            "amp_dtype": self.amp_dtype,
             "action_mode": self.action_mode,
             "action_mode_source": self.action_mode_source,
             "root_name": self.root_name,

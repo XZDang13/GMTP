@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from enum import StrEnum
-from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -11,17 +9,16 @@ from RLAlg.nn.layers import GaussianHead, MLPLayer, NormPosition
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
 from RLAlg.normalizer import Normalizer
 
-from gmtp.integrations.ref2act.compat import _import_module
-from gmtp.integrations.ref2act.observation_history import (
-    build_gmtp_policy_observation_spec,
-    build_robot_policy_window_lengths,
+from .film import FiLMResStack
+from .robot_encoder import (
+    RobotHistoryEncoder,
+    RobotEncoderType,
+    build_robot_window_layout,
+    normalize_robot_encoder_type,
+    reshape_robot_history,
 )
 
-from .film import FiLMResStack
-
-_OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")
-DEFAULT_OBSERVATION_TERM_REGISTRY = _OBSERVATION_SPEC.DEFAULT_OBSERVATION_TERM_REGISTRY
-ObservationLayout = _OBSERVATION_SPEC.ObservationLayout
+ACTOR_HIDDEN_DIM = 256
 
 
 class ActorType(StrEnum):
@@ -48,73 +45,7 @@ def infer_film_res_blocks(actor_weights: dict[str, torch.Tensor]) -> int:
         for key in actor_weights
         if (match := block_pattern.match(key)) is not None
     ]
-    return max(block_ids, default=3)
-
-
-@dataclass(frozen=True)
-class RobotWindowTermLayout:
-    term_id: str
-    term_dim: int
-    flat_slice: slice
-
-
-@dataclass(frozen=True)
-class RobotWindowLayout:
-    window_length: int
-    robot_obs_dim: int
-    robot_step_dim: int
-    terms: tuple[RobotWindowTermLayout, ...]
-
-
-@lru_cache(maxsize=None)
-def _build_robot_window_layout(action_dim: int, robot_window_length: int) -> RobotWindowLayout:
-    if robot_window_length < 1:
-        raise ValueError(f"robot_window_length must be positive, got {robot_window_length}.")
-
-    spec = build_gmtp_policy_observation_spec(
-        add_noise=False,
-        window_lengths=build_robot_policy_window_lengths(robot_window_length),
-    )
-    layout = ObservationLayout(joint_dim=action_dim, action_dim=action_dim, key_body_count=0)
-    robot_group = next(group for group in spec.enabled_groups() if group.name == "robot")
-
-    offset = 0
-    robot_step_dim = 0
-    term_layouts: list[RobotWindowTermLayout] = []
-    for term_spec in robot_group.terms:
-        if not term_spec.enabled:
-            continue
-        if not term_spec.flatten and term_spec.window_length > 1:
-            raise ValueError(
-                "FiLMResActor only supports flattened robot observation history, "
-                f"got term '{term_spec.id}' with flatten={term_spec.flatten} "
-                f"and window_length={term_spec.window_length}."
-            )
-        if term_spec.window_length != robot_window_length:
-            raise ValueError(
-                "FiLMResActor requires a uniform robot window length, "
-                f"got term '{term_spec.id}' with window_length={term_spec.window_length} "
-                f"and expected {robot_window_length}."
-            )
-
-        term_dim = int(DEFAULT_OBSERVATION_TERM_REGISTRY[term_spec.type].dimension(layout, term_spec))
-        flattened_dim = term_dim * term_spec.window_length if term_spec.flatten else term_dim
-        term_layouts.append(
-            RobotWindowTermLayout(
-                term_id=term_spec.id,
-                term_dim=term_dim,
-                flat_slice=slice(offset, offset + flattened_dim),
-            )
-        )
-        offset += flattened_dim
-        robot_step_dim += term_dim
-
-    return RobotWindowLayout(
-        window_length=robot_window_length,
-        robot_obs_dim=offset,
-        robot_step_dim=robot_step_dim,
-        terms=tuple(term_layouts),
-    )
+    return max(block_ids, default=4)
 
 
 class FiLMResActor(nn.Module):
@@ -123,8 +54,9 @@ class FiLMResActor(nn.Module):
         robot_obs_dim: int,
         motion_obs_dim: int,
         action_dim: int,
-        num_blocks: int = 3,
+        num_blocks: int = 4,
         robot_window_length: int = 1,
+        robot_encoder_type: str | RobotEncoderType = RobotEncoderType.TRANSFORMER,
     ):
         super().__init__()
 
@@ -134,49 +66,41 @@ class FiLMResActor(nn.Module):
             raise ValueError(f"robot_window_length must be positive, got {robot_window_length}.")
 
         self.robot_window_length = int(robot_window_length)
-        self.robot_window_layout = _build_robot_window_layout(action_dim, self.robot_window_length)
-        if robot_obs_dim != self.robot_window_layout.robot_obs_dim:
-            raise ValueError(
-                f"Expected robot_obs_dim={self.robot_window_layout.robot_obs_dim} for action_dim={action_dim} "
-                f"and robot_window_length={self.robot_window_length}, got {robot_obs_dim}."
-            )
-
-        self.robot_obs_normlizer = Normalizer((robot_obs_dim,))
+        self.robot_window_layout = build_robot_window_layout(action_dim, self.robot_window_length)
+        normalizer_shape = (
+            (self.robot_window_layout.window_length, self.robot_window_layout.robot_step_dim)
+            if self.robot_window_length > 1
+            else (robot_obs_dim,)
+        )
+        self.robot_obs_normlizer = Normalizer(normalizer_shape)
         self.motion_obs_normlizer = Normalizer((motion_obs_dim,))
         self.num_blocks = num_blocks
         self.robot_step_dim = self.robot_window_layout.robot_step_dim
-        self.robot_encoder = nn.Sequential(
-            nn.Conv1d(self.robot_step_dim, 256, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv1d(256, 256, kernel_size=3, padding=1),
-            nn.SiLU(),
+        self.robot_encoder_type = (
+            RobotEncoderType.MLP
+            if self.robot_window_length == 1
+            else normalize_robot_encoder_type(robot_encoder_type)
         )
-        self.robot_window_fuser = nn.Sequential(
-            MLPLayer(256 * self.robot_window_length, 512, nn.SiLU(), NormPosition.POST),
-            MLPLayer(512, 512, nn.Identity()),
+        self.robot_encoder = RobotHistoryEncoder(
+            robot_obs_dim=robot_obs_dim,
+            action_dim=action_dim,
+            robot_window_length=self.robot_window_length,
+            robot_encoder_type=self.robot_encoder_type,
         )
         self.motion_encoder = nn.Sequential(
-            MLPLayer(motion_obs_dim, 512, nn.SiLU(), NormPosition.POST),
-            MLPLayer(512, 512, nn.SiLU(), NormPosition.POST),
-            MLPLayer(512, 512, nn.Identity()),
+            MLPLayer(motion_obs_dim, ACTOR_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
+            MLPLayer(ACTOR_HIDDEN_DIM, ACTOR_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
+            MLPLayer(ACTOR_HIDDEN_DIM, ACTOR_HIDDEN_DIM, nn.Identity()),
         )
-        self.stack = FiLMResStack(512, 512, num_layers=num_blocks)
-        self.head = GaussianHead(512, action_dim)
+        self.stack = FiLMResStack(ACTOR_HIDDEN_DIM, ACTOR_HIDDEN_DIM, num_layers=num_blocks)
+        self.head = GaussianHead(ACTOR_HIDDEN_DIM, action_dim)
 
     @property
     def blocks(self) -> nn.ModuleList:
         return self.stack.blocks
 
     def _reshape_robot_obs(self, robot_obs: torch.Tensor) -> torch.Tensor:
-        if robot_obs.ndim != 2:
-            raise ValueError(f"Expected robot_obs batch rank 2, got shape {tuple(robot_obs.shape)}.")
-
-        batch_size = robot_obs.shape[0]
-        robot_frames = []
-        for term_layout in self.robot_window_layout.terms:
-            term_flat = robot_obs[:, term_layout.flat_slice]
-            robot_frames.append(term_flat.reshape(batch_size, self.robot_window_length, term_layout.term_dim))
-        return torch.cat(robot_frames, dim=-1)
+        return reshape_robot_history(robot_obs, self.robot_window_layout)
 
     def forward(
         self,
@@ -186,10 +110,7 @@ class FiLMResActor(nn.Module):
     ) -> StochasticContinuousPolicyStep:
         robot_obs = self.robot_obs_normlizer(obs_dict["robot_obs"], update_normlizer)
         motion_obs = self.motion_obs_normlizer(obs_dict["motion_obs"], update_normlizer)
-        robot_frames = self._reshape_robot_obs(robot_obs).transpose(1, 2)
-        batch_size = robot_frames.shape[0]
-        x_robot = self.robot_encoder(robot_frames)
-        x_robot = self.robot_window_fuser(x_robot.reshape(batch_size, -1))
+        x_robot = self.robot_encoder(robot_obs)
         x_motion = self.motion_encoder(motion_obs)
         x = self.stack(x_robot, x_motion)
         return self.head(x, action)
@@ -199,7 +120,7 @@ def build_actor(
     obs_dims: dict[str, int],
     actor_type: ActorType | str,
     action_dim: int,
-    actor_kwargs: dict[str, int] | None = None,
+    actor_kwargs: dict[str, int | str] | None = None,
 ) -> FiLMResActor:
     normalize_actor_type(str(actor_type))
     actor_kwargs = actor_kwargs or {}
@@ -207,19 +128,21 @@ def build_actor(
         obs_dims["robot"],
         obs_dims["motion"],
         action_dim,
-        num_blocks=int(actor_kwargs.get("num_blocks", 3)),
+        num_blocks=int(actor_kwargs.get("num_blocks", 4)),
         robot_window_length=int(actor_kwargs.get("robot_window_length", 1)),
+        robot_encoder_type=str(actor_kwargs.get("robot_encoder_type", RobotEncoderType.TRANSFORMER.value)),
     )
 
 
 def get_actor_kwargs(
     actor: nn.Module,
     actor_type: ActorType | str,
-) -> dict[str, int]:
+) -> dict[str, int | str]:
     normalize_actor_type(str(actor_type))
     return {
         "num_blocks": int(actor.num_blocks),
         "robot_window_length": int(actor.robot_window_length),
+        "robot_encoder_type": str(actor.robot_encoder_type),
     }
 
 
@@ -237,11 +160,22 @@ def get_actor_observation(
 def get_policy_storage_specs(
     obs_dims: dict[str, int],
     actor_type: ActorType | str,
+    actor_kwargs: dict[str, int | str] | None = None,
 ) -> dict[str, tuple[int, ...]]:
     normalize_actor_type(str(actor_type))
+    actor_kwargs = actor_kwargs or {}
+    robot_window_length = int(actor_kwargs.get("robot_window_length", 1))
+    if robot_window_length > 1:
+        if obs_dims["robot"] % robot_window_length != 0:
+            raise ValueError(
+                f"Robot observation dim {obs_dims['robot']} is not divisible by robot_window_length={robot_window_length}."
+            )
+        robot_storage_shape = (robot_window_length, obs_dims["robot"] // robot_window_length)
+    else:
+        robot_storage_shape = (obs_dims["robot"],)
     return {
         "motion_observations": (obs_dims["motion"],),
-        "robot_observations": (obs_dims["robot"],),
+        "robot_observations": robot_storage_shape,
     }
 
 

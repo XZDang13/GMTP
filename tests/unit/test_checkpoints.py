@@ -29,8 +29,8 @@ def _actor_obs_dims(action_dim: int, robot_window_length: int = 1) -> tuple[int,
 
 
 def test_checkpoint_v2_roundtrip(tmp_path):
-    motion_encoder_checkpoint = tmp_path / "motion_encoder.pth"
-    motion_encoder_checkpoint.write_text("stub", encoding="utf-8")
+    motion_mae_encoder_checkpoint = tmp_path / "motion_mae_encoder.pth"
+    motion_mae_encoder_checkpoint.write_text("stub", encoding="utf-8")
     motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, robot_window_length=4)
     actor = FiLMResActor(
         robot_obs_dim=robot_obs_dim,
@@ -38,6 +38,7 @@ def test_checkpoint_v2_roundtrip(tmp_path):
         action_dim=2,
         num_blocks=4,
         robot_window_length=4,
+        robot_encoder_type="transformer",
     )
     critic = Critic(obs_dim=5)
     checkpoint = build_training_checkpoint(
@@ -48,7 +49,7 @@ def test_checkpoint_v2_roundtrip(tmp_path):
         action_mode="offset",
         root_name="torso_link",
         anchor_body_name="torso_link",
-        motion_encoder_checkpoint=str(motion_encoder_checkpoint),
+        motion_mae_encoder_checkpoint=str(motion_mae_encoder_checkpoint),
         observation_window_lengths=build_robot_policy_window_lengths(4),
         artifacts={"run_dir": "runs/train/demo"},
     )
@@ -58,11 +59,16 @@ def test_checkpoint_v2_roundtrip(tmp_path):
 
     assert loaded.checkpoint_version == CHECKPOINT_VERSION
     assert loaded.meta["actor_type"] == "film_res"
-    assert loaded.meta["actor_kwargs"] == {"num_blocks": 4, "robot_window_length": 4}
+    assert loaded.meta["actor_kwargs"] == {
+        "num_blocks": 4,
+        "robot_window_length": 4,
+        "robot_encoder_type": "transformer",
+    }
     assert loaded.env["action_mode"] == "offset"
     assert loaded.env["root_name"] == "torso_link"
     assert loaded.env["anchor_body_name"] == "torso_link"
-    assert loaded.motion_encoder_checkpoint == str(motion_encoder_checkpoint.resolve())
+    assert loaded.artifacts["run_dir"] == "runs/train/demo"
+    assert loaded.motion_mae_encoder_checkpoint == str(motion_mae_encoder_checkpoint.resolve())
     assert loaded.observation_window_lengths == build_robot_policy_window_lengths(4)
     assert loaded.motion_files[0].endswith("115_06_stageii.npz")
 

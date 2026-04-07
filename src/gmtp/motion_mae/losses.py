@@ -15,17 +15,16 @@ def _pointwise_reconstruction_error(
 ) -> torch.Tensor:
     if loss_type == "l1":
         return torch.abs(prediction - target)
-    return torch.square(prediction - target)
+    if loss_type == "mse":
+        return torch.square(prediction - target)
+    raise ValueError(f"Unsupported reconstruction loss '{loss_type}'.")
 
 
-def compute_motion_vae_losses(
+def compute_motion_mae_losses(
     prediction: torch.Tensor,
     target: torch.Tensor,
     *,
-    mu: torch.Tensor,
-    logvar: torch.Tensor,
     target_slices: Sequence[FeatureSliceSpec],
-    beta: float,
     reconstruction_loss: str = "mse",
 ) -> dict[str, torch.Tensor]:
     if prediction.shape != target.shape:
@@ -45,9 +44,6 @@ def compute_motion_vae_losses(
         loss_dict[f"{slice_spec.name}_weighted_loss"] = weighted_error
         reconstruction_total = reconstruction_total + weighted_error
 
-    kl_loss = -0.5 * torch.mean(1.0 + logvar - torch.square(mu) - torch.exp(logvar))
-    total_loss = reconstruction_total + float(beta) * kl_loss
     loss_dict["reconstruction_loss"] = reconstruction_total
-    loss_dict["kl_loss"] = kl_loss
-    loss_dict["loss"] = total_loss
+    loss_dict["loss"] = reconstruction_total
     return loss_dict

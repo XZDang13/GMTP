@@ -5,21 +5,17 @@ from typing import Any
 
 import torch
 
-from gmtp.motion_vae import (
-    build_frozen_motion_encoder as _build_frozen_motion_encoder,
-    load_motion_encoder_checkpoint_v1,
-    quat_apply_inverse,
-)
-from gmtp.motion_vae.policy import FrozenMotionEncoder
-from gmtp.motion_vae.model import TemporalConvEncoder
-from gmtp.motion_vae.policy import freeze_motion_encoder as _freeze_motion_encoder
-from gmtp.motion_vae.schema import MotionFeatureSchema
+from gmtp.motion_mae import build_frozen_motion_mae_encoder
+from gmtp.motion_mae.features import quat_apply_inverse
+from gmtp.motion_mae.policy import FrozenMotionMAEEncoder
+from gmtp.motion_mae.schema import MotionFeatureSchema
 from gmtp.models import (
     ActorType,
     build_actor,
     infer_film_res_blocks,
     normalize_actor_type,
 )
+from gmtp.models.robot_encoder import RobotEncoderType, normalize_robot_encoder_type
 from gmtp.runtime.checkpoints import CheckpointV2
 
 
@@ -30,16 +26,19 @@ def _resolve_existing_path(path: str | Path, *, label: str) -> Path:
     return resolved_path
 
 
-def resolve_motion_encoder_checkpoint_path(
+def resolve_motion_mae_checkpoint_path(
     checkpoint: CheckpointV2 | None = None,
     *,
     override: str | Path | None = None,
 ) -> Path | None:
     if override is not None:
-        return _resolve_existing_path(override, label="motion encoder checkpoint")
-    if checkpoint is None or checkpoint.motion_encoder_checkpoint is None:
+        return _resolve_existing_path(override, label="Motion MAE encoder checkpoint")
+    if checkpoint is None or checkpoint.motion_mae_encoder_checkpoint is None:
         return None
-    return _resolve_existing_path(checkpoint.motion_encoder_checkpoint, label="checkpoint motion encoder artifact")
+    return _resolve_existing_path(
+        checkpoint.motion_mae_encoder_checkpoint,
+        label="checkpoint Motion MAE encoder artifact",
+    )
 
 
 def resolve_checkpoint_actor_spec(
@@ -47,17 +46,27 @@ def resolve_checkpoint_actor_spec(
     *,
     actor_type_override: str | None = None,
     num_blocks: int | None = None,
-) -> tuple[ActorType, dict[str, int]]:
+) -> tuple[ActorType, dict[str, int | str]]:
     actor_type = normalize_actor_type(actor_type_override or checkpoint.meta.get("actor_type"))
     actor_weights = checkpoint.model["actor"]
     checkpoint_actor_kwargs = dict(checkpoint.meta.get("actor_kwargs", {}))
+    robot_window_length = int(checkpoint_actor_kwargs.get("robot_window_length", 1))
+    requested_robot_encoder_type = checkpoint_actor_kwargs.get(
+        "robot_encoder_type",
+        RobotEncoderType.TRANSFORMER.value,
+    )
     actor_kwargs = {
         "num_blocks": int(
             num_blocks
             if num_blocks is not None
             else checkpoint_actor_kwargs.get("num_blocks", infer_film_res_blocks(actor_weights))
         ),
-        "robot_window_length": int(checkpoint_actor_kwargs.get("robot_window_length", 1)),
+        "robot_window_length": robot_window_length,
+        "robot_encoder_type": str(
+            RobotEncoderType.MLP
+            if robot_window_length == 1
+            else normalize_robot_encoder_type(requested_robot_encoder_type)
+        ),
     }
     return actor_type, actor_kwargs
 
@@ -70,7 +79,7 @@ def load_actor_from_checkpoint(
     device: torch.device,
     actor_type_override: str | None = None,
     num_blocks: int | None = None,
-) -> tuple[torch.nn.Module, ActorType, dict[str, int]]:
+) -> tuple[torch.nn.Module, ActorType, dict[str, int | str]]:
     actor_type, actor_kwargs = resolve_checkpoint_actor_spec(
         checkpoint,
         actor_type_override=actor_type_override,
@@ -86,46 +95,17 @@ def resolve_checkpoint_stem(path: str | Path) -> str:
     return Path(path).expanduser().resolve().stem
 
 
-def load_motion_encoder_checkpoint(
-    path: str | Path,
-    *,
-    device: torch.device,
-) -> tuple[TemporalConvEncoder, MotionFeatureSchema, int]:
-    checkpoint = load_motion_encoder_checkpoint_v1(path)
-    encoder_kwargs = dict(checkpoint.meta["encoder_kwargs"])
-    encoder = TemporalConvEncoder(
-        input_dim=int(encoder_kwargs["input_dim"]),
-        window_length=int(encoder_kwargs["window_length"]),
-        latent_dim=int(encoder_kwargs["latent_dim"]),
-        channels=tuple(int(value) for value in encoder_kwargs["channels"]),
-        kernel_size=int(encoder_kwargs["kernel_size"]),
-        stride=int(encoder_kwargs["stride"]),
-        activation=str(encoder_kwargs["activation"]),
-    ).to(device)
-    encoder.load_state_dict(checkpoint.model["encoder"])
-    encoder.eval()
-    return encoder, checkpoint.schema, int(checkpoint.meta["latent_dim"])
-
-
-def freeze_motion_encoder(module: torch.nn.Module) -> torch.nn.Module:
-    return _freeze_motion_encoder(module)
-
-
-def build_frozen_motion_encoder(path: str | Path, *, device: torch.device | str):
-    return _build_frozen_motion_encoder(path, device)
-
-
-class ReferenceMotionLatentAdapter:
+class MotionMAELatentAdapter:
     def __init__(
         self,
-        frozen_encoder: FrozenMotionEncoder,
+        frozen_encoder: FrozenMotionMAEEncoder,
         *,
         checkpoint_path: str | Path,
     ) -> None:
         self.encoder = frozen_encoder
         self.schema = frozen_encoder.schema
         self.latent_dim = int(frozen_encoder.latent_dim)
-        self.window_length = int(frozen_encoder.encoder.window_length)
+        self.window_length = int(frozen_encoder.encoder.past_frames)
         self.policy_motion_dim = int(self.schema.policy_motion_slice.dim)
         self.device = frozen_encoder.reference_mean.device
         self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
@@ -169,7 +149,7 @@ class ReferenceMotionLatentAdapter:
     @property
     def history(self) -> torch.Tensor:
         if self._history is None:
-            raise RuntimeError("ReferenceMotionLatentAdapter history is uninitialized.")
+            raise RuntimeError("MotionMAELatentAdapter history is uninitialized.")
         return self._history
 
     def augment_actor_observation(self, actor_obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -184,9 +164,7 @@ class ReferenceMotionLatentAdapter:
 
         latent = self.encoder(self.history)
         if latent.shape[0] != motion_obs.shape[0]:
-            raise ValueError(
-                f"Expected latent batch {motion_obs.shape[0]}, got {latent.shape[0]}."
-            )
+            raise ValueError(f"Expected latent batch {motion_obs.shape[0]}, got {latent.shape[0]}.")
 
         augmented_obs = dict(actor_obs)
         augmented_obs["motion_obs"] = torch.cat((motion_obs, latent), dim=-1)
@@ -212,7 +190,7 @@ class ReferenceMotionLatentAdapter:
         anchor_body_index = getattr(base_env, "anchor_body_index", None)
         if motion_lib is None or motion_id is None or times is None or anchor_body_index is None:
             raise RuntimeError(
-                "The current environment does not expose reference motion tensors required for motion encoder startup."
+                "The current environment does not expose reference motion tensors required for Motion MAE startup."
             )
 
         motion_ids = torch.as_tensor(motion_id, dtype=torch.long).reshape(-1)
@@ -301,11 +279,11 @@ class ReferenceMotionLatentAdapter:
                     f"Runtime anchor_body_index mismatch: expected {expected_anchor_index}, got {anchor_body_index}."
                 )
         else:
-            raise ValueError("Motion encoder startup requires body_names from the checkpoint schema or runtime env.")
+            raise ValueError("Motion MAE startup requires body_names from the checkpoint schema or runtime env.")
 
         if self.schema.joint_names and len(self.schema.joint_names) != joint_pos_tensor.shape[-1]:
             raise ValueError(
-                "Runtime joint dimension does not match motion encoder schema: "
+                "Runtime joint dimension does not match Motion MAE schema: "
                 f"{joint_pos_tensor.shape[-1]} vs {len(self.schema.joint_names)}."
             )
 
@@ -331,19 +309,17 @@ class ReferenceMotionLatentAdapter:
             dim=-1,
         )
         if reference_features.shape[-1] != self.schema.d_ref:
-            raise ValueError(
-                f"Expected reference feature dim {self.schema.d_ref}, got {reference_features.shape[-1]}."
-            )
+            raise ValueError(f"Expected reference feature dim {self.schema.d_ref}, got {reference_features.shape[-1]}.")
         return reference_features
 
 
-def build_motion_latent_adapter(
+def build_motion_mae_adapter(
     path: str | Path | None,
     *,
     device: torch.device | str,
-) -> ReferenceMotionLatentAdapter | None:
+) -> MotionMAELatentAdapter | None:
     if path is None:
         return None
-    checkpoint_path = _resolve_existing_path(path, label="motion encoder checkpoint")
-    frozen_encoder = _build_frozen_motion_encoder(checkpoint_path, device=device)
-    return ReferenceMotionLatentAdapter(frozen_encoder, checkpoint_path=checkpoint_path)
+    checkpoint_path = _resolve_existing_path(path, label="Motion MAE encoder checkpoint")
+    frozen_encoder = build_frozen_motion_mae_encoder(checkpoint_path, device=device)
+    return MotionMAELatentAdapter(frozen_encoder, checkpoint_path=checkpoint_path)
