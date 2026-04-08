@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
-from RLAlg.nn.layers import CriticHead, MLPLayer, NormPosition
+from RLAlg.nn.layers import CriticHead
 from RLAlg.nn.steps import ValueStep
 from RLAlg.normalizer import Normalizer
+
+from .layers import MLPLayer, NormPosition
 
 CRITIC_HIDDEN_DIM = 512
 

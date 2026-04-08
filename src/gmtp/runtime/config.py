@@ -32,6 +32,8 @@ class IsaacEvalConfig:
     num_steps: int = 1000
     progress_interval: int = 50
     show_reference_motion: bool = False
+    save_video: bool = False
+    video_fps: int | None = None
     output_root: str = "runs"
 
 

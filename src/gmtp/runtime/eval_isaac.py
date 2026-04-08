@@ -4,16 +4,17 @@ import re
 import time
 from pathlib import Path
 
+import gymnasium as gym
 import torch
 
-from gmtp.integrations.ref2act import DEFAULT_EXPERIMENT_MOTION_FILES, infer_motion_files_from_checkpoint
+from gmtp.integrations.ref2act import DEFAULT_EXPERIMENT_MOTION_FILES, infer_motion_files_from_checkpoint, motion_label
 from gmtp.integrations.ref2act.observation_history import resolve_observation_window_lengths
 from gmtp.models import get_actor_observation
 from gmtp.runtime.checkpoints import load_checkpoint_v2
 from gmtp.runtime.amp import AMP_DTYPE_NAME, autocast_context, normalize_device, resolve_amp_enabled
 from gmtp.runtime.config import IsaacEvalConfig
 from gmtp.runtime.debug import RolloutDebugLogger
-from gmtp.runtime.io import build_run_paths, write_json
+from gmtp.runtime.io import build_run_paths, sanitize_name, write_json
 from gmtp.runtime.observations import (
     build_actor_obs_log_fields,
     infer_actor_observation_dims_from_state_dict,
@@ -57,7 +58,12 @@ class IsaacEvalRunner:
             self.motion_files,
             show_reference_motion=config.show_reference_motion,
             window_lengths=self.observation_window_lengths,
+            render_mode="rgb_array" if config.save_video else None,
         )
+        self.video_path = self._build_video_path() if config.save_video else None
+        if self.video_path is not None:
+            self.env = self._wrap_env_for_video(self.env, self.video_path)
+        self._video_recording_stopped = self.video_path is None
         self.device = normalize_device(self.env.unwrapped.device)
         self.requested_amp = bool(config.use_amp)
         self.use_amp = resolve_amp_enabled(self.requested_amp, self.device)
@@ -70,6 +76,7 @@ class IsaacEvalRunner:
             None if resolved_motion_mae_checkpoint is None else str(resolved_motion_mae_checkpoint)
         )
         self.initial_obs, _ = self.env.reset()
+        self._configure_tracking_camera()
         self.initial_obs = structure_env_observation(
             self.initial_obs,
             action_dim=self.cfg.action_space,
@@ -97,8 +104,53 @@ class IsaacEvalRunner:
             motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
         )
 
+    def _configure_tracking_camera(self) -> None:
+        controller = getattr(self.env.unwrapped, "viewport_camera_controller", None)
+        if controller is None:
+            return
+
+        try:
+            controller.update_view_to_asset_body("robot", self.cfg.root_link_name)
+        except (AttributeError, KeyError, ValueError):
+            controller.update_view_to_asset_root("robot")
+        controller.update_view_location()
+
+    def _build_video_name_prefix(self) -> str:
+        return sanitize_name(f"{resolve_checkpoint_stem(self.checkpoint_path)}_{motion_label(self.motion_files)}")
+
+    def _build_video_path(self) -> Path:
+        return self.run_paths.videos_dir / f"{self._build_video_name_prefix()}-episode-0.mp4"
+
+    def _get_video_fps(self) -> int:
+        if self.config.video_fps is not None:
+            return int(self.config.video_fps)
+        return max(1, round(1.0 / float(self.cfg.sim.dt * self.cfg.decimation)))
+
+    def _wrap_env_for_video(self, env, video_path: Path):
+        return gym.wrappers.RecordVideo(
+            env,
+            video_folder=str(video_path.parent),
+            episode_trigger=lambda episode_id: episode_id == 0,
+            name_prefix=video_path.stem.removesuffix("-episode-0"),
+            fps=self._get_video_fps(),
+            disable_logger=True,
+        )
+
     def _build_log_prefix(self) -> Path:
         return self.run_paths.debug_dir / resolve_checkpoint_stem(self.checkpoint_path)
+
+    def _stop_video_recording_after_first_episode(self) -> None:
+        if self._video_recording_stopped:
+            return
+
+        stop_recording = getattr(self.env, "stop_recording", None)
+        is_recording = getattr(self.env, "recording", False)
+        recorded_frames = getattr(self.env, "recorded_frames", None)
+        if isinstance(recorded_frames, list) and recorded_frames:
+            recorded_frames.pop()
+        if callable(stop_recording) and is_recording:
+            stop_recording()
+        self._video_recording_stopped = True
 
     @classmethod
     def _extract_info_log_fields(
@@ -219,6 +271,7 @@ class IsaacEvalRunner:
                 reward_history.append(float(reward.mean().item()))
                 if first_done_step is None and bool(done.any().item()):
                     first_done_step = step_idx + 1
+                    self._stop_video_recording_after_first_episode()
 
                 if self.config.progress_interval and (
                     (step_idx + 1) % self.config.progress_interval == 0 or step_idx + 1 == self.config.num_steps
@@ -254,6 +307,8 @@ class IsaacEvalRunner:
                     "reward_min": min(reward_history) if reward_history else None,
                     "reward_max": max(reward_history) if reward_history else None,
                     "reward_sum": sum(reward_history) if reward_history else None,
+                    "video_path": str(self.video_path) if self.video_path is not None else None,
+                    "video_fps": self._get_video_fps() if self.video_path is not None else None,
                     "info_metadata": info_metadata,
                     "error": error_message,
                 }
@@ -276,6 +331,8 @@ class IsaacEvalRunner:
             "reward_min": min(reward_history) if reward_history else None,
             "reward_max": max(reward_history) if reward_history else None,
             "reward_sum": sum(reward_history) if reward_history else None,
+            "video_path": str(self.video_path) if self.video_path is not None else None,
+            "video_fps": self._get_video_fps() if self.video_path is not None else None,
             "run_dir": str(self.run_paths.root),
         }
 

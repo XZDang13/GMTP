@@ -7,13 +7,13 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from RLAlg.nn.layers import MLPLayer, NormPosition
 
 from gmtp.integrations.ref2act.compat import _import_module
 from gmtp.integrations.ref2act.observation_history import (
     build_gmtp_policy_observation_spec,
     build_motion_policy_window_lengths,
 )
+from gmtp.models.layers import MLPLayer, NormPosition
 from gmtp.motion_mae import build_frozen_motion_mae_encoder
 
 _OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")

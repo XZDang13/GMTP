@@ -10,6 +10,8 @@ from .motion import resolve_motion_files
 from .observation_history import build_gmtp_observation_spec
 
 ENV_NAME = "G1MotionTracking-v0"
+ISAAC_EVAL_CAMERA_EYE = (2.0, 2.0, 0.5)
+ISAAC_EVAL_CAMERA_LOOKAT = (0.0, 0.0, 0.0)
 
 
 def make_training_env(
@@ -28,6 +30,7 @@ def make_eval_env(
     *,
     show_reference_motion: bool = False,
     window_lengths: Mapping[str, int] | None = None,
+    render_mode: str | None = None,
 ):
     cfg = G1MultiMotionEnv()
     cfg.expert_motion_file = resolve_motion_files(motion_files)
@@ -39,5 +42,10 @@ def make_eval_env(
     cfg.observation = build_gmtp_observation_spec(add_noise=False, window_lengths=window_lengths)
     cfg.action = replace(cfg.action, buffer_length=1, latency_range=None, noise_scale=0.0)
     cfg.reference_motion_viewer_enabled = show_reference_motion
-    env = gymnasium.make(ENV_NAME, cfg=cfg)
+    cfg.viewer.origin_type = "asset_body"
+    cfg.viewer.asset_name = "robot"
+    cfg.viewer.body_name = cfg.root_link_name
+    cfg.viewer.eye = ISAAC_EVAL_CAMERA_EYE
+    cfg.viewer.lookat = ISAAC_EVAL_CAMERA_LOOKAT
+    env = gymnasium.make(ENV_NAME, cfg=cfg, render_mode=render_mode)
     return env, cfg

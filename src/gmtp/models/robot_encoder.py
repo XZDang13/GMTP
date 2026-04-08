@@ -6,13 +6,13 @@ from functools import lru_cache
 
 import torch
 import torch.nn as nn
-from RLAlg.nn.layers import MLPLayer, NormPosition
 
 from gmtp.integrations.ref2act.compat import _import_module
 from gmtp.integrations.ref2act.observation_history import (
     build_gmtp_policy_observation_spec,
     build_robot_policy_window_lengths,
 )
+from gmtp.models.layers import MLPLayer, NormPosition
 
 _OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")
 DEFAULT_OBSERVATION_TERM_REGISTRY = _OBSERVATION_SPEC.DEFAULT_OBSERVATION_TERM_REGISTRY

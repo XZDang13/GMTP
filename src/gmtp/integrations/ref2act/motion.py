@@ -11,10 +11,14 @@ DEFAULT_EXPERIMENT_MOTION_FILES = (
     #"env/assests/06_13_stageii.npz",
     #"env/assests/55_02_stageii.npz",
     #"env/assests/63_25_stageii.npz",
-    "env/assests/61_10_stageii.npz",
+    #"env/assests/61_10_stageii.npz",
     #"env/assests/115_06_stageii.npz",
     #"env/assests/115_02_stageii.npz",
     #"env/assests/120_01_stageii.npz",
+    #"env/assests/jab.npz",
+    #"env/assests/handshake.npz",
+    #"env/assests/jump.npz",
+    "env/assests/walk.npz",
 )
 
 

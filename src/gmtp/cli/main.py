@@ -115,6 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
     isaac_parser.add_argument("--num-steps", type=int, default=1000)
     isaac_parser.add_argument("--progress-interval", type=int, default=50)
     isaac_parser.add_argument("--show-reference-motion", action="store_true")
+    isaac_parser.add_argument("--save-video", action="store_true")
+    isaac_parser.add_argument("--video-fps", type=int, default=None)
     isaac_parser.add_argument("--output-root", default="runs")
     _add_disable_amp_argument(isaac_parser)
     isaac_parser.add_argument("--headless", action="store_true")
@@ -177,7 +179,7 @@ def _run_eval_isaac(args) -> int:
 
     from gmtp.runtime.eval_isaac import IsaacEvalRunner
 
-    app_launcher = AppLauncher(args)
+    app_launcher = AppLauncher(args, enable_cameras=args.save_video)
     simulation_app = app_launcher.app
     try:
         IsaacEvalRunner(
@@ -192,6 +194,8 @@ def _run_eval_isaac(args) -> int:
                 num_steps=args.num_steps,
                 progress_interval=args.progress_interval,
                 show_reference_motion=args.show_reference_motion,
+                save_video=args.save_video,
+                video_fps=args.video_fps,
                 output_root=args.output_root,
             )
         ).evaluate()

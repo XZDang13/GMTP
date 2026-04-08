@@ -242,6 +242,13 @@ class TrainRunner:
             WandbLogger.log_metrics(payload, self.global_step)
 
     @staticmethod
+    def _build_episode_metrics_payload(mean_return: float, mean_length: float) -> dict[str, float]:
+        return {
+            "episode/returns": float(mean_return),
+            "episode/lengths": float(mean_length),
+        }
+
+    @staticmethod
     def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
         return obs["privilege"]
 
@@ -290,10 +297,10 @@ class TrainRunner:
 
             if done.any():
                 self._log_metrics(
-                    {
-                        "episode/mean_returns": self.tracker.get_mean("episode_return", done),
-                        "episode/mean_length": self.tracker.get_mean("episode_length", done),
-                    }
+                    self._build_episode_metrics_payload(
+                        self.tracker.get_mean("episode_return", done),
+                        self.tracker.get_mean("episode_length", done),
+                    )
                 )
                 self.tracker.reset("episode_return", done)
                 self.tracker.reset("episode_length", done)
