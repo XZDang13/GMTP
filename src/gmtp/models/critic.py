@@ -4,7 +4,7 @@ from RLAlg.nn.layers import CriticHead, MLPLayer, NormPosition
 from RLAlg.nn.steps import ValueStep
 from RLAlg.normalizer import Normalizer
 
-CRITIC_HIDDEN_DIM = 256
+CRITIC_HIDDEN_DIM = 512
 
 
 class Critic(nn.Module):
@@ -14,6 +14,8 @@ class Critic(nn.Module):
         self.normlizer = Normalizer((obs_dim,))
         self.encoder = nn.Sequential(
             MLPLayer(obs_dim, CRITIC_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
+            MLPLayer(CRITIC_HIDDEN_DIM, CRITIC_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
+            MLPLayer(CRITIC_HIDDEN_DIM, CRITIC_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
             MLPLayer(CRITIC_HIDDEN_DIM, CRITIC_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
         )
         self.head = CriticHead(CRITIC_HIDDEN_DIM)

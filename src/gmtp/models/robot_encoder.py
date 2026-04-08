@@ -18,8 +18,11 @@ _OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")
 DEFAULT_OBSERVATION_TERM_REGISTRY = _OBSERVATION_SPEC.DEFAULT_OBSERVATION_TERM_REGISTRY
 ObservationLayout = _OBSERVATION_SPEC.ObservationLayout
 
-ROBOT_ENCODER_HIDDEN_DIM = 256
-ROBOT_ENCODER_OUTPUT_DIM = 256
+ROBOT_ENCODER_HIDDEN_DIM = 128
+ROBOT_ENCODER_OUTPUT_DIM = 512
+ROBOT_ENCODER_TRANSFORMER_HEADS = 4
+ROBOT_ENCODER_TRANSFORMER_LAYERS = 1
+ROBOT_ENCODER_FEEDFORWARD_DIM = 256
 
 
 class RobotEncoderType(StrEnum):
@@ -181,8 +184,8 @@ class RobotTransformerWindowEncoder(nn.Module):
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=ROBOT_ENCODER_HIDDEN_DIM,
-            nhead=8,
-            dim_feedforward=512,
+            nhead=ROBOT_ENCODER_TRANSFORMER_HEADS,
+            dim_feedforward=ROBOT_ENCODER_FEEDFORWARD_DIM,
             dropout=0.0,
             activation="gelu",
             batch_first=True,
@@ -192,7 +195,7 @@ class RobotTransformerWindowEncoder(nn.Module):
         self.position_embedding = nn.Parameter(torch.zeros(1, robot_window_length, ROBOT_ENCODER_HIDDEN_DIM))
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
-            num_layers=2,
+            num_layers=ROBOT_ENCODER_TRANSFORMER_LAYERS,
             norm=nn.LayerNorm(ROBOT_ENCODER_HIDDEN_DIM),
             enable_nested_tensor=False,
         )

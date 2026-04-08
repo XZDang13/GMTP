@@ -44,10 +44,10 @@ from gmtp.runtime.observations import (
     split_sim2sim_group_observations,
 )
 from gmtp.runtime.policy import (
-    build_motion_mae_adapter,
     load_actor_from_checkpoint,
     resolve_checkpoint_stem,
     resolve_motion_mae_checkpoint_path,
+    validate_checkpoint_actor_observation_dims,
 )
 
 DEFAULT_VIDEO_HEIGHT = 720
@@ -211,6 +211,7 @@ class Sim2SimEvalRunner:
         self.action_dim = _infer_action_dim(checkpoint_env)
         self.observation_window_lengths = resolve_observation_window_lengths(
             robot_window_length=config.robot_window_length,
+            motion_window_length=config.motion_window_length,
             checkpoint_env=checkpoint_env,
         )
         resolved_motion_mae_checkpoint = resolve_motion_mae_checkpoint_path(
@@ -220,19 +221,11 @@ class Sim2SimEvalRunner:
         self.motion_mae_encoder_checkpoint = (
             None if resolved_motion_mae_checkpoint is None else str(resolved_motion_mae_checkpoint)
         )
-        self.motion_mae_adapter = build_motion_mae_adapter(
-            self.motion_mae_encoder_checkpoint,
-            device=self.device,
-        )
         self.raw_obs_dims = infer_sim2sim_observation_dims(
             self.action_dim,
             observation_window_lengths=self.observation_window_lengths,
         )
-        self.obs_dims = (
-            self.motion_mae_adapter.augment_observation_dims(self.raw_obs_dims)
-            if self.motion_mae_adapter is not None
-            else self.raw_obs_dims
-        )
+        self.obs_dims = self.raw_obs_dims
         self.action_mode, self.action_mode_source = resolve_action_mode(
             checkpoint_env,
             config.action_mode,
@@ -256,17 +249,20 @@ class Sim2SimEvalRunner:
             self.checkpoint.model["actor"],
             self.checkpoint.actor_type,
         )
-        if checkpoint_obs_dims["motion"] != self.obs_dims["motion"] or checkpoint_obs_dims["robot"] != self.obs_dims["robot"]:
-            raise ValueError(
-                "Checkpoint actor observation dims do not match runtime env dims: "
-                f"checkpoint={checkpoint_obs_dims}, runtime={self.obs_dims}."
-            )
+        validate_checkpoint_actor_observation_dims(
+            self.checkpoint,
+            checkpoint_obs_dims=checkpoint_obs_dims,
+            runtime_obs_dims=self.obs_dims,
+            motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
+        )
         self.actor, self.actor_type, self.actor_kwargs = load_actor_from_checkpoint(
             self.checkpoint,
             obs_dims=self.obs_dims,
             action_dim=self.action_dim,
             device=self.device,
             num_blocks=config.num_blocks,
+            motion_encoder_type_override=config.motion_encoder_type,
+            motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
         )
         self._print_actor_weight_details()
 
@@ -453,21 +449,15 @@ class Sim2SimEvalRunner:
         try:
             obs_parts = self._extract_obs_parts(env, env.reset())
             self._validate_obs_dims(obs_parts)
-            if self.motion_mae_adapter is not None:
-                self.motion_mae_adapter.initialize_history(env)
             if video_recorder is not None:
                 video_recorder.capture_frame()
 
             for step_idx in range(self.config.num_steps):
                 actor_env_obs = _tensor_dict_to_batch(obs_parts)
                 actor_obs = get_actor_observation(actor_env_obs, self.actor_type)
-                if self.motion_mae_adapter is not None:
-                    actor_obs = self.motion_mae_adapter.augment_actor_observation(actor_obs)
                 action, actor_log_fields = self._get_action(actor_obs)
 
                 next_obs_parts = self._extract_obs_parts(env, env.step(action))
-                if self.motion_mae_adapter is not None:
-                    self.motion_mae_adapter.update_history(env)
                 metrics = extract_sim2sim_metrics_from_parts(next_obs_parts)
                 metric_records.append(metrics)
 

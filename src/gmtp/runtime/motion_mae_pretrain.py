@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import random
+import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from gmtp.integrations.ref2act.motion import motion_label, motion_names
 from gmtp.motion_mae import (
@@ -19,6 +22,61 @@ from gmtp.motion_mae import (
     save_motion_mae_encoder_checkpoint,
 )
 from gmtp.runtime.io import build_run_paths, write_json
+
+
+_AUXILIARY_ERROR_KEYS = ("joint_pos_error", "joint_vel_error")
+
+
+def _expanded_loss_names(loss_names: tuple[str, ...]) -> tuple[str, ...]:
+    expanded_names: list[str] = []
+    for name in loss_names:
+        if name == "joint":
+            expanded_names.extend(("joint_pos", "joint_vel"))
+            continue
+        expanded_names.append(name)
+    return tuple(expanded_names)
+
+
+def _format_batch_loss_log(losses: dict[str, torch.Tensor], *, loss_names: tuple[str, ...]) -> str:
+    parts = [f"loss={float(losses['loss'].detach().cpu()):.6f}"]
+    for name in _expanded_loss_names(loss_names):
+        key = f"{name}_loss"
+        if key in losses:
+            parts.append(f"{name}={float(losses[key].detach().cpu()):.6f}")
+    for key in _AUXILIARY_ERROR_KEYS:
+        if key in losses:
+            parts.append(f"{key}={float(losses[key].detach().cpu()):.6f}")
+    return " ".join(parts)
+
+
+def _ordered_loss_metric_keys(*, loss_names: tuple[str, ...]) -> tuple[str, ...]:
+    ordered_keys = ["loss", "reconstruction_loss"]
+    for name in _expanded_loss_names(loss_names):
+        ordered_keys.append(f"{name}_loss")
+        ordered_keys.append(f"{name}_weighted_loss")
+    ordered_keys.extend(_AUXILIARY_ERROR_KEYS)
+    return tuple(ordered_keys)
+
+
+def _format_epoch_metrics_log(metrics: dict[str, float], *, prefix: str, loss_names: tuple[str, ...]) -> str:
+    ordered_keys = _ordered_loss_metric_keys(loss_names=loss_names)
+    parts: list[str] = []
+    for key in ordered_keys:
+        if key not in metrics:
+            continue
+        parts.append(f"{prefix}_{key}={float(metrics[key]):.6f}")
+    return " ".join(parts)
+
+
+def _progress_bar(iterable: Any, *, total: int, desc: str, leave: bool):
+    return tqdm(
+        iterable,
+        total=total,
+        desc=desc,
+        leave=leave,
+        dynamic_ncols=True,
+        disable=not sys.stderr.isatty(),
+    )
 
 
 def resolve_training_device(device: str) -> torch.device:
@@ -47,6 +105,7 @@ class MotionMAEPretrainRunner:
             slice_weights=config.loss.slice_weights,
         )
         self.schema = self.data_bundle.schema
+        self.loss_log_names = tuple(slice_spec.name for slice_spec in self.schema.target_slices)
         self.motion_files = [sequence.motion_file for sequence in self.data_bundle.train_dataset.sequences]
         self.motion_name = motion_label(self.motion_files)
         default_run_name = config.run_name or f"motion_mae_{len(self.motion_files)}motions"
@@ -91,44 +150,86 @@ class MotionMAEPretrainRunner:
             pin_memory=pin_memory,
         )
 
-    def _run_epoch(self, loader: DataLoader, *, training: bool) -> dict[str, float]:
+    def _build_summary(
+        self,
+        *,
+        best_epoch: int,
+        best_metric: float,
+        best_train_metrics: dict[str, float],
+        best_val_metrics: dict[str, float],
+        final_train_metrics: dict[str, float],
+        final_val_metrics: dict[str, float],
+        epoch_history: list[dict[str, Any]],
+        best_paths: dict[str, str],
+        final_paths: dict[str, str],
+        completed_epochs: int,
+        status: str,
+    ) -> dict[str, object]:
+        return {
+            "motion_files": list(self.motion_files),
+            "motion_names": motion_names(self.motion_files),
+            "motion_label": self.motion_name,
+            "train_motion_names": list(self.data_bundle.train_motion_names),
+            "val_motion_names": list(self.data_bundle.val_motion_names),
+            "train_window_count": self.data_bundle.train_window_count,
+            "val_window_count": self.data_bundle.val_window_count,
+            "schema": self.schema.to_dict(),
+            "status": status,
+            "completed_epochs": completed_epochs,
+            "best_epoch": best_epoch,
+            "best_metric": best_metric,
+            "best_train_metrics": best_train_metrics,
+            "best_val_metrics": best_val_metrics,
+            "train_metrics": final_train_metrics,
+            "val_metrics": final_val_metrics,
+            "epoch_history": epoch_history,
+            "artifacts": {
+                **best_paths,
+                **final_paths,
+            },
+            "run_dir": str(self.run_paths.root),
+        }
+
+    def _run_epoch(self, loader: DataLoader, *, training: bool, epoch: int) -> dict[str, float]:
         self.model.train(mode=training)
         aggregates: dict[str, float] = {}
         total_samples = 0
-        for batch_index, batch in enumerate(loader, start=1):
-            reference = batch["reference"].to(self.device, non_blocking=True)
-            target = batch["target"].to(self.device, non_blocking=True)
+        phase = "train" if training else "val"
+        with _progress_bar(
+            loader,
+            total=len(loader),
+            desc=f"{phase} {epoch}/{self.config.training.epochs}",
+            leave=False,
+        ) as progress:
+            for batch_index, batch in enumerate(progress, start=1):
+                reference = batch["reference"].to(self.device, non_blocking=True)
+                target = batch["target"].to(self.device, non_blocking=True)
 
-            with torch.set_grad_enabled(training):
-                outputs = self.model(reference)
-                losses = compute_motion_mae_losses(
-                    outputs["prediction"],
-                    target,
-                    target_slices=self.schema.target_slices,
-                    reconstruction_loss=self.config.loss.reconstruction_loss,
-                )
-                if training:
-                    self.optimizer.zero_grad(set_to_none=True)
-                    losses["loss"].backward()
-                    if self.config.training.grad_clip_norm is not None:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.grad_clip_norm)
-                    self.optimizer.step()
+                with torch.set_grad_enabled(training):
+                    outputs = self.model(reference)
+                    losses = compute_motion_mae_losses(
+                        outputs["prediction"],
+                        target,
+                        target_slices=self.schema.target_slices,
+                        reconstruction_loss=self.config.loss.reconstruction_loss,
+                    )
+                    if training:
+                        self.optimizer.zero_grad(set_to_none=True)
+                        losses["loss"].backward()
+                        if self.config.training.grad_clip_norm is not None:
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.grad_clip_norm)
+                        self.optimizer.step()
 
-            batch_size = int(reference.shape[0])
-            total_samples += batch_size
-            for key, value in losses.items():
-                aggregates[key] = aggregates.get(key, 0.0) + float(value.detach().cpu()) * batch_size
+                batch_size = int(reference.shape[0])
+                total_samples += batch_size
+                for key, value in losses.items():
+                    aggregates[key] = aggregates.get(key, 0.0) + float(value.detach().cpu()) * batch_size
 
-            if training and (
-                batch_index % self.config.training.log_interval == 0 or batch_index == len(loader)
-            ):
-                print(
-                    f"train batch {batch_index}/{len(loader)} "
-                    f"loss={float(losses['loss'].detach().cpu()):.6f} "
-                    f"root={float(losses['root_loss'].detach().cpu()):.6f} "
-                    f"joint={float(losses['joint_loss'].detach().cpu()):.6f} "
-                    f"eef={float(losses['end_effector_loss'].detach().cpu()):.6f}"
-                )
+                if batch_index % self.config.training.log_interval == 0 or batch_index == len(loader):
+                    progress.set_postfix_str(
+                        _format_batch_loss_log(losses, loss_names=self.loss_log_names),
+                        refresh=False,
+                    )
 
         return {key: value / total_samples for key, value in aggregates.items()}
 
@@ -171,49 +272,87 @@ class MotionMAEPretrainRunner:
     def train(self) -> dict[str, object]:
         best_metric = float("inf")
         best_epoch = 0
+        best_train_metrics: dict[str, float] = {}
+        best_val_metrics: dict[str, float] = {}
         best_paths: dict[str, str] = {}
         final_paths: dict[str, str] = {}
         final_train_metrics: dict[str, float] = {}
         final_val_metrics: dict[str, float] = {}
+        epoch_history: list[dict[str, Any]] = []
 
-        for epoch in range(1, self.config.training.epochs + 1):
-            train_metrics = self._run_epoch(self.train_loader, training=True)
-            val_metrics = self._run_epoch(self.val_loader, training=False)
-            final_train_metrics = train_metrics
-            final_val_metrics = val_metrics
-            val_loss = float(val_metrics["loss"])
-            print(
-                f"epoch {epoch}/{self.config.training.epochs} "
-                f"train_loss={train_metrics['loss']:.6f} val_loss={val_loss:.6f}"
-            )
-            if val_loss < best_metric:
-                best_metric = val_loss
-                best_epoch = epoch
-                best_paths = self._save_artifacts("best", epoch=epoch, best_metric=best_metric)
+        with _progress_bar(
+            range(1, self.config.training.epochs + 1),
+            total=self.config.training.epochs,
+            desc="epochs",
+            leave=True,
+        ) as epoch_progress:
+            for epoch in epoch_progress:
+                train_metrics = self._run_epoch(self.train_loader, training=True, epoch=epoch)
+                val_metrics = self._run_epoch(self.val_loader, training=False, epoch=epoch)
+                final_train_metrics = train_metrics
+                final_val_metrics = val_metrics
+                val_loss = float(val_metrics["loss"])
+                epoch_progress.set_postfix(
+                    train_loss=f"{train_metrics['loss']:.6f}",
+                    val_loss=f"{val_loss:.6f}",
+                )
+                tqdm.write(
+                    f"epoch {epoch}/{self.config.training.epochs} "
+                    f"{_format_epoch_metrics_log(train_metrics, prefix='train', loss_names=self.loss_log_names)} "
+                    f"{_format_epoch_metrics_log(val_metrics, prefix='val', loss_names=self.loss_log_names)}"
+                )
+                is_best = False
+                if val_loss < best_metric:
+                    best_metric = val_loss
+                    best_epoch = epoch
+                    best_train_metrics = dict(train_metrics)
+                    best_val_metrics = dict(val_metrics)
+                    best_paths = self._save_artifacts("best", epoch=epoch, best_metric=best_metric)
+                    is_best = True
+
+                epoch_history.append(
+                    {
+                        "epoch": epoch,
+                        "is_best": is_best,
+                        "best_metric_so_far": best_metric,
+                        "train_metrics": dict(train_metrics),
+                        "val_metrics": dict(val_metrics),
+                    }
+                )
+                write_json(
+                    self.run_paths.summary_path,
+                    self._build_summary(
+                        best_epoch=best_epoch,
+                        best_metric=best_metric,
+                        best_train_metrics=best_train_metrics,
+                        best_val_metrics=best_val_metrics,
+                        final_train_metrics=final_train_metrics,
+                        final_val_metrics=final_val_metrics,
+                        epoch_history=epoch_history,
+                        best_paths=best_paths,
+                        final_paths=final_paths,
+                        completed_epochs=epoch,
+                        status="running",
+                    ),
+                )
 
         final_paths = self._save_artifacts(
             "final",
             epoch=self.config.training.epochs,
             best_metric=best_metric,
         )
-        summary = {
-            "motion_files": list(self.motion_files),
-            "motion_names": motion_names(self.motion_files),
-            "motion_label": self.motion_name,
-            "train_motion_names": list(self.data_bundle.train_motion_names),
-            "val_motion_names": list(self.data_bundle.val_motion_names),
-            "train_window_count": self.data_bundle.train_window_count,
-            "val_window_count": self.data_bundle.val_window_count,
-            "schema": self.schema.to_dict(),
-            "best_epoch": best_epoch,
-            "best_metric": best_metric,
-            "train_metrics": final_train_metrics,
-            "val_metrics": final_val_metrics,
-            "artifacts": {
-                **best_paths,
-                **final_paths,
-            },
-            "run_dir": str(self.run_paths.root),
-        }
+        summary = self._build_summary(
+            best_epoch=best_epoch,
+            best_metric=best_metric,
+            best_train_metrics=best_train_metrics,
+            best_val_metrics=best_val_metrics,
+            final_train_metrics=final_train_metrics,
+            final_val_metrics=final_val_metrics,
+            epoch_history=epoch_history,
+            best_paths=best_paths,
+            final_paths=final_paths,
+            completed_epochs=self.config.training.epochs,
+            status="completed",
+        )
         write_json(self.run_paths.summary_path, summary)
         return summary

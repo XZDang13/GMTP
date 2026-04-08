@@ -28,19 +28,49 @@ def test_reference_motion_mae_shapes_and_deterministic_encode():
 
 
 def test_compute_motion_mae_losses_uses_structured_slices():
-    prediction = torch.zeros(2, 3, 5)
-    target = torch.ones(2, 3, 5)
+    prediction = torch.zeros(2, 3, 6)
+    target = torch.ones(2, 3, 6)
     losses = compute_motion_mae_losses(
         prediction,
         target,
         target_slices=(
             FeatureSliceSpec(name="root", start=0, end=2, weight=2.0),
-            FeatureSliceSpec(name="joint", start=2, end=5, weight=1.0),
+            FeatureSliceSpec(name="joint", start=2, end=6, weight=1.0),
         ),
         reconstruction_loss="mse",
     )
 
     assert torch.isclose(losses["root_loss"], torch.tensor(1.0))
-    assert torch.isclose(losses["joint_loss"], torch.tensor(1.0))
+    assert "joint_loss" not in losses
+    assert torch.isclose(losses["joint_pos_loss"], torch.tensor(1.0))
+    assert torch.isclose(losses["joint_vel_loss"], torch.tensor(1.0))
+    assert torch.isclose(losses["joint_pos_weighted_loss"], torch.tensor(0.5))
+    assert torch.isclose(losses["joint_vel_weighted_loss"], torch.tensor(0.5))
+    assert torch.isclose(losses["joint_pos_error"], torch.tensor(1.0))
+    assert torch.isclose(losses["joint_vel_error"], torch.tensor(1.0))
     assert torch.isclose(losses["reconstruction_loss"], torch.tensor(3.0))
     assert torch.isclose(losses["loss"], torch.tensor(3.0))
+
+
+def test_reference_motion_mae_reconstruction_trains_latent_head():
+    model = ReferenceMotionMAE(
+        input_dim=7,
+        target_dim=9,
+        past_frames=4,
+        future_frames=3,
+        latent_dim=5,
+        d_model=16,
+        encoder_layers=2,
+        decoder_layers=1,
+        nhead=4,
+        dim_feedforward=32,
+    )
+    reference = torch.randn(2, 4, 7)
+
+    outputs = model(reference)
+    loss = outputs["prediction"].square().mean()
+    loss.backward()
+
+    assert model.latent_norm.weight.grad is not None
+    assert model.latent_proj.weight.grad is not None
+    assert model.decoder_condition_proj.weight.grad is not None

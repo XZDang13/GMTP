@@ -63,6 +63,8 @@ def test_checkpoint_v2_roundtrip(tmp_path):
         "num_blocks": 4,
         "robot_window_length": 4,
         "robot_encoder_type": "transformer",
+        "motion_window_length": 1,
+        "motion_encoder_type": "mlp",
     }
     assert loaded.env["action_mode"] == "offset"
     assert loaded.env["root_name"] == "torso_link"

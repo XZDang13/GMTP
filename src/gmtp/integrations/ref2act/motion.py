@@ -39,21 +39,46 @@ def normalize_motion_files(motion_files: str | Sequence[str] | None) -> list[str
     return normalized
 
 
-def resolve_motion_file(motion_file: str) -> str:
-    path = Path(motion_file).expanduser()
-    if not path.suffix:
-        path = MOTION_ASSET_DIR / f"{path.name}.npz"
-    elif not path.is_absolute():
-        path = PROJECT_ROOT / path
+def _looks_like_explicit_path(candidate: str) -> bool:
+    text = str(candidate).strip()
+    return text.startswith(("~", ".", "/")) or "/" in text or "\\" in text
 
-    path = path.resolve()
+
+def _resolve_motion_path_candidate(motion_file: str) -> Path:
+    path = Path(motion_file).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+
+    project_path = (PROJECT_ROOT / path).resolve()
+    if path.suffix or _looks_like_explicit_path(motion_file) or project_path.exists():
+        return project_path
+
+    return (MOTION_ASSET_DIR / f"{path.name}.npz").resolve()
+
+
+def resolve_motion_file(motion_file: str) -> str:
+    path = _resolve_motion_path_candidate(motion_file)
     if not path.exists():
         raise FileNotFoundError(f"Motion file does not exist: {path}")
+    if path.is_dir():
+        raise IsADirectoryError(f"Motion file resolves to a directory, not a file: {path}")
     return str(path)
 
 
 def resolve_motion_files(motion_files: str | Sequence[str] | None) -> list[str]:
-    return [resolve_motion_file(motion_file) for motion_file in normalize_motion_files(motion_files)]
+    resolved: list[str] = []
+    for motion_file in normalize_motion_files(motion_files):
+        path = _resolve_motion_path_candidate(motion_file)
+        if not path.exists():
+            raise FileNotFoundError(f"Motion file does not exist: {path}")
+        if path.is_dir():
+            nested_motion_files = sorted(item.resolve() for item in path.rglob("*.npz") if item.is_file())
+            if not nested_motion_files:
+                raise FileNotFoundError(f"No .npz motion files found under directory: {path}")
+            resolved.extend(str(item) for item in nested_motion_files)
+            continue
+        resolved.append(str(path))
+    return resolved
 
 
 def motion_names(motion_files: str | Sequence[str] | None) -> list[str]:

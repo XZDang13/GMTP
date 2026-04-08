@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from gmtp.runtime.config import IsaacEvalConfig, RunConfig, Sim2SimEvalConfig
+from gmtp.runtime.config import IsaacEvalConfig, MotionMAEVisualizationConfig, RunConfig, Sim2SimEvalConfig
 
 
 def _add_num_blocks_argument(parser: argparse.ArgumentParser, *, default) -> None:
@@ -14,12 +14,25 @@ def _add_robot_window_length_argument(parser: argparse.ArgumentParser, *, defaul
     parser.add_argument("--robot-window-length", type=int, default=default)
 
 
+def _add_motion_window_length_argument(parser: argparse.ArgumentParser, *, default) -> None:
+    parser.add_argument("--motion-window-length", type=int, default=default)
+
+
 def _add_robot_encoder_type_argument(parser: argparse.ArgumentParser, *, default) -> None:
     parser.add_argument(
         "--robot-encoder-type",
         choices=("cnn", "transformer"),
         default=default,
         help="Windowed robot-history encoder. robot-window-length=1 always uses the flat MLP path.",
+    )
+
+
+def _add_motion_encoder_type_argument(parser: argparse.ArgumentParser, *, default) -> None:
+    parser.add_argument(
+        "--motion-encoder-type",
+        choices=("transformer", "mae"),
+        default=default,
+        help="Windowed motion-history encoder. motion-window-length=1 always uses the flat MLP path.",
     )
 
 
@@ -39,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_num_blocks_argument(train_parser, default=4)
     _add_robot_window_length_argument(train_parser, default=4)
     _add_robot_encoder_type_argument(train_parser, default="transformer")
+    _add_motion_window_length_argument(train_parser, default=1)
+    _add_motion_encoder_type_argument(train_parser, default="transformer")
     _add_motion_mae_encoder_checkpoint_argument(train_parser)
     train_parser.add_argument("--rollout-steps", type=int, default=20)
     train_parser.add_argument("--num-updates", type=int, default=1000)
@@ -70,6 +85,23 @@ def build_parser() -> argparse.ArgumentParser:
     motion_mae_latents_parser.add_argument("--run-name", default=None)
     motion_mae_latents_parser.add_argument("--device", default=None)
 
+    motion_mae_visualize_parser = pretrain_subparsers.add_parser(
+        "motion-mae-visualize",
+        help="Render a side-by-side GT vs predicted future-motion comparison video for a Motion MAE checkpoint.",
+    )
+    motion_mae_visualize_parser.add_argument("--checkpoint", required=True)
+    motion_mae_visualize_parser.add_argument("--config", required=True)
+    motion_mae_visualize_parser.add_argument("--motion-files", nargs="+", default=None)
+    motion_mae_visualize_parser.add_argument("--split", choices=("train", "val"), default="val")
+    motion_mae_visualize_parser.add_argument("--motion-name", default=None)
+    motion_mae_visualize_parser.add_argument("--sample-index", type=int, default=0)
+    motion_mae_visualize_parser.add_argument("--whole-motion", action="store_true")
+    motion_mae_visualize_parser.add_argument("--future-frame-index", type=int, default=None)
+    motion_mae_visualize_parser.add_argument("--fps", type=int, default=None)
+    motion_mae_visualize_parser.add_argument("--output-root", default=None)
+    motion_mae_visualize_parser.add_argument("--run-name", default=None)
+    motion_mae_visualize_parser.add_argument("--device", default=None)
+
     eval_parser = subparsers.add_parser("eval", help="Evaluate a policy.")
     eval_subparsers = eval_parser.add_subparsers(dest="eval_target", required=True)
 
@@ -77,6 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
     isaac_parser.add_argument("--checkpoint", required=True)
     _add_num_blocks_argument(isaac_parser, default=None)
     _add_robot_window_length_argument(isaac_parser, default=None)
+    _add_motion_window_length_argument(isaac_parser, default=None)
+    _add_motion_encoder_type_argument(isaac_parser, default=None)
     _add_motion_mae_encoder_checkpoint_argument(isaac_parser)
     isaac_parser.add_argument("--num-steps", type=int, default=1000)
     isaac_parser.add_argument("--progress-interval", type=int, default=50)
@@ -90,6 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     sim2sim_parser.add_argument("--motion-files", nargs="+", default=None)
     _add_num_blocks_argument(sim2sim_parser, default=None)
     _add_robot_window_length_argument(sim2sim_parser, default=None)
+    _add_motion_window_length_argument(sim2sim_parser, default=None)
+    _add_motion_encoder_type_argument(sim2sim_parser, default=None)
     _add_motion_mae_encoder_checkpoint_argument(sim2sim_parser)
     sim2sim_parser.add_argument("--num-steps", type=int, default=2000)
     sim2sim_parser.add_argument("--simulation-dt", type=float, default=1 / 200)
@@ -119,6 +155,8 @@ def _run_train(args) -> int:
                 num_blocks=args.num_blocks,
                 robot_window_length=args.robot_window_length,
                 robot_encoder_type=args.robot_encoder_type,
+                motion_window_length=args.motion_window_length,
+                motion_encoder_type=args.motion_encoder_type,
                 motion_mae_encoder_checkpoint=args.motion_mae_encoder_checkpoint,
                 use_amp=not args.disable_amp,
                 rollout_steps=args.rollout_steps,
@@ -147,6 +185,8 @@ def _run_eval_isaac(args) -> int:
                 checkpoint_path=args.checkpoint,
                 num_blocks=args.num_blocks,
                 robot_window_length=args.robot_window_length,
+                motion_window_length=args.motion_window_length,
+                motion_encoder_type=args.motion_encoder_type,
                 motion_mae_encoder_checkpoint=args.motion_mae_encoder_checkpoint,
                 use_amp=not args.disable_amp,
                 num_steps=args.num_steps,
@@ -169,6 +209,8 @@ def _run_eval_sim2sim(args) -> int:
             motion_files=args.motion_files,
             num_blocks=args.num_blocks,
             robot_window_length=args.robot_window_length,
+            motion_window_length=args.motion_window_length,
+            motion_encoder_type=args.motion_encoder_type,
             motion_mae_encoder_checkpoint=args.motion_mae_encoder_checkpoint,
             use_amp=not args.disable_amp,
             num_steps=args.num_steps,
@@ -218,6 +260,28 @@ def _run_pretrain_motion_mae_latents(args) -> int:
     return 0
 
 
+def _run_pretrain_motion_mae_visualize(args) -> int:
+    from gmtp.runtime.motion_mae_visualize import MotionMAEVisualizerRunner
+
+    MotionMAEVisualizerRunner(
+        MotionMAEVisualizationConfig(
+            checkpoint_path=args.checkpoint,
+            config_path=args.config,
+            motion_files=args.motion_files,
+            split=args.split,
+            motion_name=args.motion_name,
+            sample_index=args.sample_index,
+            whole_motion=args.whole_motion,
+            future_frame_index=args.future_frame_index,
+            fps=args.fps,
+            output_root=args.output_root,
+            run_name=args.run_name,
+            device=args.device,
+        )
+    ).visualize()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -227,6 +291,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_pretrain_motion_mae(args)
     if args.command == "pretrain" and args.pretrain_target == "motion-mae-latents":
         return _run_pretrain_motion_mae_latents(args)
+    if args.command == "pretrain" and args.pretrain_target == "motion-mae-visualize":
+        return _run_pretrain_motion_mae_visualize(args)
     if args.command == "eval" and args.eval_target == "isaac":
         return _run_eval_isaac(args)
     if args.command == "eval" and args.eval_target == "sim2sim":

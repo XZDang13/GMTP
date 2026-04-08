@@ -28,7 +28,7 @@ from gmtp.runtime.amp import AMP_DTYPE_NAME, autocast_context, build_grad_scaler
 from gmtp.runtime.config import RunConfig
 from gmtp.runtime.io import build_run_paths, write_json
 from gmtp.runtime.observations import infer_env_observation_dims, structure_env_observation
-from gmtp.runtime.policy import build_motion_mae_adapter
+from gmtp.runtime.policy import resolve_motion_mae_checkpoint_path
 
 
 class OptimizerCollection(torch.optim.Optimizer):
@@ -87,7 +87,8 @@ class TrainRunner:
         from gmtp.integrations.ref2act.isaac_env import make_training_env
 
         self.observation_window_lengths = resolve_observation_window_lengths(
-            robot_window_length=config.robot_window_length
+            robot_window_length=config.robot_window_length,
+            motion_window_length=config.motion_window_length,
         )
         self.env, self.cfg = make_training_env(window_lengths=self.observation_window_lengths)
         self.device = normalize_device(self.env.unwrapped.device)
@@ -97,12 +98,11 @@ class TrainRunner:
         self.actor_type = ActorType.FILM_RES
         self.motion_files = list(self.cfg.expert_motion_file)
         self.motion_name = motion_label(self.motion_files)
-        self.motion_mae_adapter = build_motion_mae_adapter(
-            config.motion_mae_encoder_checkpoint,
-            device=self.device,
+        resolved_motion_mae_checkpoint = resolve_motion_mae_checkpoint_path(
+            override=config.motion_mae_encoder_checkpoint,
         )
         self.motion_mae_encoder_checkpoint = (
-            self.motion_mae_adapter.checkpoint_path if self.motion_mae_adapter is not None else None
+            None if resolved_motion_mae_checkpoint is None else str(resolved_motion_mae_checkpoint)
         )
         self.run_date = datetime.now().strftime("%Y%m%d")
         self.checkpoint_date = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -120,19 +120,15 @@ class TrainRunner:
             action_dim=self.cfg.action_space,
             observation_window_lengths=self.observation_window_lengths,
         )
-        if self.motion_mae_adapter is not None:
-            self.motion_mae_adapter.initialize_history(self.env)
         self.raw_obs_dims = infer_env_observation_dims(self.initial_obs)
-        self.obs_dims = (
-            self.motion_mae_adapter.augment_observation_dims(self.raw_obs_dims)
-            if self.motion_mae_adapter is not None
-            else self.raw_obs_dims
-        )
+        self.obs_dims = self.raw_obs_dims
         self.actor = build_actor(
             self.obs_dims,
             self.actor_type,
             self.cfg.action_space,
             actor_kwargs=self._build_actor_kwargs(),
+            motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
+            device=self.device,
         ).to(self.device)
         self.actor_kwargs = get_actor_kwargs(self.actor, self.actor_type)
         self.critic = Critic(self.obs_dims["critic"]).to(self.device)
@@ -199,6 +195,8 @@ class TrainRunner:
             "num_blocks": self.config.num_blocks,
             "robot_window_length": self.config.robot_window_length,
             "robot_encoder_type": self.config.robot_encoder_type,
+            "motion_window_length": self.config.motion_window_length,
+            "motion_encoder_type": self.config.motion_encoder_type,
         }
 
     @staticmethod
@@ -276,8 +274,6 @@ class TrainRunner:
         for _ in range(self.steps):
             self.global_step += 1
             actor_obs = get_actor_observation(obs, self.actor_type)
-            if self.motion_mae_adapter is not None:
-                actor_obs = self.motion_mae_adapter.augment_actor_observation(actor_obs)
             critic_obs = self._get_critic_observation(obs)
             action, log_prob, value = self.get_action(actor_obs, critic_obs)
             next_obs, task_reward, terminate, timeout, _info = self.env.step(action)
@@ -291,8 +287,6 @@ class TrainRunner:
             self.tracker.add_values("episode_return", reward)
             self.tracker.add_values("episode_length", 1)
             done = terminate | timeout
-            if self.motion_mae_adapter is not None:
-                self.motion_mae_adapter.update_history(self.env, done=done)
 
             if done.any():
                 self._log_metrics(
@@ -318,8 +312,6 @@ class TrainRunner:
             obs = next_obs
 
         actor_obs = get_actor_observation(obs, self.actor_type)
-        if self.motion_mae_adapter is not None:
-            actor_obs = self.motion_mae_adapter.augment_actor_observation(actor_obs)
         critic_obs = self._get_critic_observation(obs)
         self._update_actor_statistics(actor_obs)
         last_value = self.get_value(critic_obs, update_normlizer=True)
@@ -457,9 +449,6 @@ class TrainRunner:
             "motion_names": motion_names(self.motion_files),
             "motion_label": self.motion_name,
             "motion_mae_encoder_checkpoint": self.motion_mae_encoder_checkpoint,
-            "motion_mae_latent_dim": (
-                self.motion_mae_adapter.latent_dim if self.motion_mae_adapter is not None else None
-            ),
             "observation_window_lengths": self.observation_window_lengths,
             "num_updates": self.config.num_updates,
             "rollout_steps": self.steps,

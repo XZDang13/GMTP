@@ -1,6 +1,9 @@
 import torch
 
-from gmtp.integrations.ref2act.observation_history import build_robot_policy_window_lengths
+from gmtp.integrations.ref2act.observation_history import (
+    build_motion_policy_window_lengths,
+    build_robot_policy_window_lengths,
+)
 from gmtp.integrations.ref2act.mujoco import normalize_action_mode, resolve_action_mode
 from gmtp.models import ActorType, FiLMResActor
 from gmtp.runtime.observations import (
@@ -151,6 +154,87 @@ def test_extract_sim2sim_actor_obs_from_mapping_structures_windowed_robot_histor
     assert actor_obs["robot_obs"].shape == (4, 12)
 
 
+def test_parse_sim2sim_obs_supports_motion_window_lengths():
+    base_flat_obs = torch.tensor(
+        [
+            0.1,
+            0.2,
+            0.3,
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            0.4,
+            0.5,
+            0.6,
+            0.7,
+            0.8,
+            0.9,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            0.05,
+            0.06,
+        ],
+        dtype=torch.float32,
+    )
+    base_parts = parse_sim2sim_obs(base_flat_obs, action_dim=2)
+    window_lengths = build_motion_policy_window_lengths(4)
+
+    def _history(latest: torch.Tensor, fill_value: float) -> torch.Tensor:
+        return torch.cat(
+            [
+                torch.full((latest.numel() * 3,), fill_value, dtype=torch.float32),
+                latest,
+            ]
+        )
+
+    windowed_motion = torch.cat(
+        [
+            _history(base_parts["target_projected_gravity"], -1.0),
+            _history(base_parts["target_joint_pos"], -2.0),
+            _history(base_parts["target_joint_vel"], -3.0),
+        ]
+    )
+    windowed_flat_obs = torch.cat([windowed_motion, base_parts["robot"]])
+
+    obs_parts = parse_sim2sim_obs(
+        windowed_flat_obs,
+        action_dim=2,
+        observation_window_lengths=window_lengths,
+    )
+    metrics = extract_sim2sim_metrics(
+        windowed_flat_obs,
+        action_dim=2,
+        observation_window_lengths=window_lengths,
+    )
+
+    assert infer_sim2sim_observation_dims(2, window_lengths) == {"motion": 28, "robot": 12, "policy": 40}
+    assert obs_parts["motion"].shape == (4, 7)
+    assert obs_parts["motion_obs"].shape == (4, 7)
+    torch.testing.assert_close(obs_parts["target_joint_pos"], base_parts["target_joint_pos"])
+    torch.testing.assert_close(obs_parts["target_joint_vel"], base_parts["target_joint_vel"])
+    assert set(("joint_pos_mae", "joint_vel_mae", "gravity_mae")).issubset(metrics)
+
+
+def test_extract_sim2sim_actor_obs_from_mapping_structures_windowed_motion_history():
+    window_lengths = build_motion_policy_window_lengths(4)
+    actor_obs = extract_sim2sim_actor_obs_from_mapping(
+        {
+            "motion": torch.arange(28, dtype=torch.float32),
+            "robot": torch.zeros(12, dtype=torch.float32),
+        },
+        action_dim=2,
+        observation_window_lengths=window_lengths,
+    )
+
+    assert actor_obs is not None
+    assert actor_obs["motion"].shape == (4, 7)
+    assert actor_obs["motion_obs"].shape == (4, 7)
+    assert actor_obs["robot"].shape == (12,)
+
+
 def test_replace_sim2sim_group_latest_terms_updates_latest_window_only():
     window_lengths = build_robot_policy_window_lengths(4)
     robot_obs = parse_sim2sim_obs(
@@ -179,6 +263,36 @@ def test_replace_sim2sim_group_latest_terms_updates_latest_window_only():
     torch.testing.assert_close(obs_parts["robot_projected_gravity"], torch.tensor([101.0, 102.0, 103.0]))
     torch.testing.assert_close(obs_parts["anchor_ang_vel"], torch.tensor([201.0, 202.0, 203.0]))
     assert updated_robot_obs.shape == (4, 12)
+
+
+def test_replace_sim2sim_group_latest_terms_updates_latest_motion_window_only():
+    window_lengths = build_motion_policy_window_lengths(4)
+    motion_obs = parse_sim2sim_obs(
+        torch.arange(40, dtype=torch.float32),
+        action_dim=2,
+        observation_window_lengths=window_lengths,
+    )["motion"]
+
+    updated_motion_obs = replace_sim2sim_group_latest_terms(
+        motion_obs,
+        group_name="motion",
+        action_dim=2,
+        latest_terms={
+            "target_projected_gravity": torch.tensor([101.0, 102.0, 103.0]),
+            "target_joint_pos": torch.tensor([201.0, 202.0]),
+        },
+        observation_window_lengths=window_lengths,
+    )
+    obs_parts = split_sim2sim_group_observations(
+        updated_motion_obs,
+        torch.zeros(12, dtype=torch.float32),
+        action_dim=2,
+        observation_window_lengths=window_lengths,
+    )
+
+    torch.testing.assert_close(obs_parts["target_projected_gravity"], torch.tensor([101.0, 102.0, 103.0]))
+    torch.testing.assert_close(obs_parts["target_joint_pos"], torch.tensor([201.0, 202.0]))
+    assert updated_motion_obs.shape == (4, 7)
 
 
 def test_resolve_action_mode_supports_current_residual():

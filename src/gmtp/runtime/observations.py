@@ -8,11 +8,17 @@ import torch
 
 from gmtp.integrations.ref2act.compat import _import_module
 from gmtp.integrations.ref2act.observation_history import (
+    MOTION_POLICY_OBSERVATION_TERM_IDS,
     ROBOT_POLICY_OBSERVATION_TERM_IDS,
     build_gmtp_policy_observation_spec,
     normalize_observation_window_lengths,
 )
 from gmtp.models import ActorType, normalize_actor_type
+from gmtp.models.motion_encoder import (
+    build_motion_window_layout,
+    flatten_motion_history,
+    reshape_motion_history,
+)
 from gmtp.models.robot_encoder import (
     build_robot_window_layout,
     flatten_robot_history,
@@ -56,6 +62,49 @@ def _resolve_robot_window_length(
     return lengths.pop()
 
 
+def _resolve_motion_window_length(
+    observation_window_lengths: Mapping[str, int] | None,
+) -> int:
+    normalized = normalize_observation_window_lengths(observation_window_lengths)
+    lengths = {int(normalized.get(term_id, 1)) for term_id in MOTION_POLICY_OBSERVATION_TERM_IDS}
+    if len(lengths) != 1:
+        raise ValueError(
+            "Motion policy observation window lengths must match across "
+            f"{MOTION_POLICY_OBSERVATION_TERM_IDS}, got {sorted(lengths)}."
+        )
+    return lengths.pop()
+
+
+def structure_motion_observation(
+    motion_obs: Any,
+    *,
+    action_dim: int,
+    observation_window_lengths: Mapping[str, int] | None = None,
+) -> torch.Tensor:
+    tensor = torch.as_tensor(motion_obs)
+    motion_window_length = _resolve_motion_window_length(observation_window_lengths)
+    if motion_window_length == 1:
+        if tensor.ndim == 3 and tensor.shape[1] == 1:
+            tensor = tensor.squeeze(1)
+        if tensor.ndim not in {1, 2}:
+            raise ValueError(
+                f"Expected single-frame motion observation rank 1 or 2, got shape {tuple(tensor.shape)}."
+            )
+        return tensor
+
+    layout = build_motion_window_layout(action_dim, motion_window_length)
+    structured_shape = (layout.window_length, layout.motion_step_dim)
+    if tensor.ndim in {1, 2} and tensor.shape[-1] == layout.motion_obs_dim:
+        return reshape_motion_history(tensor, layout)
+    if tensor.ndim in {2, 3} and tuple(tensor.shape[-2:]) == structured_shape:
+        return tensor
+    raise ValueError(
+        "Expected windowed motion observation to be either flat with dim "
+        f"{layout.motion_obs_dim} or structured with trailing shape {structured_shape}, "
+        f"got {tuple(tensor.shape)}."
+    )
+
+
 def structure_robot_observation(
     robot_obs: Any,
     *,
@@ -93,6 +142,12 @@ def structure_env_observation(
     observation_window_lengths: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
     structured_obs = dict(obs)
+    if "motion" in structured_obs:
+        structured_obs["motion"] = structure_motion_observation(
+            structured_obs["motion"],
+            action_dim=action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
     if "robot" not in structured_obs:
         return structured_obs
     structured_obs["robot"] = structure_robot_observation(
@@ -232,6 +287,34 @@ def replace_sim2sim_group_latest_terms(
     latest_terms: Mapping[str, Any],
     observation_window_lengths: Mapping[str, int] | None = None,
 ) -> torch.Tensor:
+    if group_name == "motion" and _resolve_motion_window_length(observation_window_lengths) > 1:
+        layout = build_motion_window_layout(action_dim, _resolve_motion_window_length(observation_window_lengths))
+        structured = structure_motion_observation(
+            group_obs,
+            action_dim=action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
+        if structured.ndim != 2:
+            raise ValueError(
+                f"Expected structured sim2sim motion observation rank 2, got shape {tuple(structured.shape)}."
+            )
+
+        updated = structured.clone()
+        term_map = {term_layout.term_id: term_layout for term_layout in layout.terms}
+        for term_id, replacement_value in latest_terms.items():
+            if term_id not in term_map:
+                continue
+            term_layout = term_map[term_id]
+            replacement = _coerce_sim2sim_vector(replacement_value, name=f"{group_name}.{term_id}")
+            if replacement.numel() != term_layout.term_dim:
+                raise ValueError(
+                    f"Expected replacement for {group_name}.{term_id} dim {term_layout.term_dim}, got {replacement.numel()}."
+                )
+            updated[-1, term_layout.step_slice] = replacement
+
+        input_tensor = torch.as_tensor(group_obs)
+        return flatten_motion_history(updated, layout) if input_tensor.ndim == 1 else updated
+
     if group_name == "robot" and _resolve_robot_window_length(observation_window_lengths) > 1:
         layout = build_robot_window_layout(action_dim, _resolve_robot_window_length(observation_window_lengths))
         structured = structure_robot_observation(
@@ -325,7 +408,11 @@ def extract_sim2sim_actor_obs_from_mapping(
     if motion_value is None or robot_value is None:
         return None
 
-    motion_obs = _coerce_sim2sim_vector(motion_value, name="motion")
+    motion_obs = structure_motion_observation(
+        motion_value,
+        action_dim=action_dim,
+        observation_window_lengths=observation_window_lengths,
+    )
     robot_obs = structure_robot_observation(
         robot_value,
         action_dim=action_dim,
@@ -345,7 +432,11 @@ def split_sim2sim_group_observations(
     action_dim: int,
     observation_window_lengths: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
-    motion_obs = _coerce_sim2sim_vector(motion_obs, name="motion")
+    motion_obs = structure_motion_observation(
+        motion_obs,
+        action_dim=action_dim,
+        observation_window_lengths=observation_window_lengths,
+    )
     robot_obs = structure_robot_observation(
         robot_obs,
         action_dim=action_dim,
@@ -361,7 +452,12 @@ def split_sim2sim_group_observations(
     parsed_terms.update(
         _split_group_observation(
             "motion",
-            motion_obs,
+            flatten_motion_history(
+                motion_obs,
+                build_motion_window_layout(action_dim, _resolve_motion_window_length(observation_window_lengths)),
+            )
+            if motion_obs.ndim == 2
+            else motion_obs,
             action_dim=action_dim,
             observation_window_lengths=observation_window_lengths,
         )

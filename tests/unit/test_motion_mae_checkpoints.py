@@ -1,4 +1,3 @@
-import types
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +20,7 @@ from gmtp.motion_mae import (
     save_motion_mae_checkpoint,
     save_motion_mae_encoder_checkpoint,
 )
-from gmtp.runtime.policy import build_motion_mae_adapter, resolve_motion_mae_checkpoint_path
+from gmtp.runtime.policy import resolve_motion_mae_checkpoint_path
 from gmtp.runtime.checkpoints import CheckpointV2
 
 
@@ -81,24 +80,6 @@ def _config() -> MotionMAEPretrainConfig:
             dim_feedforward=32,
         ),
     )
-
-
-def _reference_motion(batch_size: int = 1):
-    return types.SimpleNamespace(
-        joint_pos=torch.tensor([[0.1, 0.2]], dtype=torch.float32).repeat(batch_size, 1),
-        joint_vel=torch.tensor([[0.3, 0.4]], dtype=torch.float32).repeat(batch_size, 1),
-        body_positions=torch.tensor(
-            [[[0.0, 0.0, 0.0], [0.2, 0.0, 0.1], [0.0, 0.3, 0.2]]],
-            dtype=torch.float32,
-        ).repeat(batch_size, 1, 1),
-        body_quaternions=torch.tensor(
-            [[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]],
-            dtype=torch.float32,
-        ).repeat(batch_size, 1, 1),
-        anchor_body_index=0,
-    )
-
-
 def _write_motion_mae_encoder_checkpoint(tmp_path: Path) -> Path:
     model = ReferenceMotionMAE(
         input_dim=13,
@@ -166,67 +147,6 @@ def test_motion_mae_encoder_loader_and_frozen_wrapper(tmp_path):
     assert loaded.meta["latent_dim"] == 6
     assert frozen_encoder(reference).shape == (2, 6)
     assert all(not parameter.requires_grad for parameter in frozen_encoder.parameters())
-
-
-def test_motion_mae_runtime_adapter_supports_isaac_reference_motion(tmp_path):
-    checkpoint_path = _write_motion_mae_encoder_checkpoint(tmp_path)
-    adapter = build_motion_mae_adapter(checkpoint_path, device="cpu")
-    env = types.SimpleNamespace(
-        unwrapped=types.SimpleNamespace(
-            reference_motion=_reference_motion(batch_size=2),
-            motion_lib=types.SimpleNamespace(body_names=("pelvis", "left_hand", "right_hand")),
-        )
-    )
-
-    assert adapter is not None
-    adapter.initialize_history(env)
-    augmented_dims = adapter.augment_observation_dims({"motion": 7, "robot": 12, "critic": 5, "policy": 19})
-    actor_obs = adapter.augment_actor_observation(
-        {
-            "motion_obs": torch.zeros(2, 7),
-            "robot_obs": torch.zeros(2, 12),
-        }
-    )
-
-    assert adapter.history.shape == (2, 4, 13)
-    assert augmented_dims == {"motion": 13, "robot": 12, "critic": 5, "policy": 25}
-    assert actor_obs["motion_obs"].shape == (2, 13)
-    assert actor_obs["robot_obs"].shape == (2, 12)
-
-
-def test_motion_mae_runtime_adapter_supports_sampled_motion_runtime(tmp_path):
-    checkpoint_path = _write_motion_mae_encoder_checkpoint(tmp_path)
-    adapter = build_motion_mae_adapter(checkpoint_path, device="cpu")
-
-    sample = {
-        "joint_pos": torch.tensor([[0.1, 0.2]], dtype=torch.float32),
-        "joint_vel": torch.tensor([[0.3, 0.4]], dtype=torch.float32),
-        "body_positions": torch.tensor(
-            [[[0.0, 0.0, 0.0], [0.2, 0.0, 0.1], [0.0, 0.3, 0.2]]],
-            dtype=torch.float32,
-        ),
-        "body_quaternions": torch.tensor(
-            [[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]],
-            dtype=torch.float32,
-        ),
-    }
-    env = types.SimpleNamespace(
-        motion_id=torch.tensor([0], dtype=torch.long),
-        times=torch.tensor([0.0], dtype=torch.float32),
-        anchor_body_index=0,
-        motion_lib=types.SimpleNamespace(
-            body_names=("pelvis", "left_hand", "right_hand"),
-            sample_motion=lambda motion_ids, times: sample,
-        ),
-    )
-
-    assert adapter is not None
-    adapter.initialize_history(env)
-    adapter.update_history(env)
-
-    assert adapter.history.shape == (1, 4, 13)
-
-
 def test_resolve_motion_mae_checkpoint_path_prefers_override(tmp_path):
     checkpoint_path = _write_motion_mae_encoder_checkpoint(tmp_path)
     checkpoint = CheckpointV2(

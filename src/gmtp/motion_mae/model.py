@@ -79,6 +79,7 @@ class ReferenceMotionMAE(nn.Module):
         )
         self.latent_norm = nn.LayerNorm(d_model)
         self.latent_proj = nn.Linear(d_model, latent_dim)
+        self.decoder_condition_proj = nn.Linear(latent_dim, d_model)
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.decoder_position_embedding = nn.Parameter(torch.zeros(1, past_frames + future_frames, d_model))
@@ -123,12 +124,15 @@ class ReferenceMotionMAE(nn.Module):
         visible_tokens = visible_tokens + self.encoder_position_embedding
         return self.encoder(visible_tokens)
 
-    def encode(self, reference: torch.Tensor) -> torch.Tensor:
-        encoded_visible = self.encode_visible(reference)
+    def _pool_latent(self, encoded_visible: torch.Tensor) -> torch.Tensor:
         pooled = encoded_visible.mean(dim=1)
         return self.latent_proj(self.latent_norm(pooled))
 
-    def decode(self, encoded_visible: torch.Tensor) -> torch.Tensor:
+    def encode(self, reference: torch.Tensor) -> torch.Tensor:
+        encoded_visible = self.encode_visible(reference)
+        return self._pool_latent(encoded_visible)
+
+    def decode(self, encoded_visible: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
         if encoded_visible.ndim != 3:
             raise ValueError(
                 f"Expected encoded_visible tensor shape [B, T_visible, D], got {tuple(encoded_visible.shape)}."
@@ -138,9 +142,16 @@ class ReferenceMotionMAE(nn.Module):
                 f"Expected encoded_visible trailing shape {(self.past_frames, self.d_model)}, "
                 f"got {tuple(encoded_visible.shape[-2:])}."
             )
+        if latent.ndim != 2:
+            raise ValueError(f"Expected latent tensor shape [B, D_latent], got {tuple(latent.shape)}.")
+        if tuple(latent.shape[-1:]) != (self.latent_dim,):
+            raise ValueError(
+                f"Expected latent trailing shape {(self.latent_dim,)}, got {tuple(latent.shape[-1:])}."
+            )
 
         batch_size = int(encoded_visible.shape[0])
-        future_tokens = self.mask_token.expand(batch_size, self.future_frames, self.d_model)
+        latent_condition = self.decoder_condition_proj(latent).unsqueeze(1)
+        future_tokens = self.mask_token.expand(batch_size, self.future_frames, self.d_model) + latent_condition
         decoder_input = torch.cat((encoded_visible, future_tokens), dim=1)
         decoder_input = decoder_input + self.decoder_position_embedding
         decoded = self.decoder(decoder_input)
@@ -148,8 +159,8 @@ class ReferenceMotionMAE(nn.Module):
 
     def forward(self, reference: torch.Tensor) -> dict[str, torch.Tensor]:
         encoded_visible = self.encode_visible(reference)
-        latent = self.latent_proj(self.latent_norm(encoded_visible.mean(dim=1)))
-        prediction = self.decode(encoded_visible)
+        latent = self._pool_latent(encoded_visible)
+        prediction = self.decode(encoded_visible, latent)
         return {
             "prediction": prediction,
             "encoded_visible": encoded_visible,

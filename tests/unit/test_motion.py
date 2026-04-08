@@ -29,3 +29,21 @@ def test_infer_motion_files_from_checkpoint_prefers_checkpoint_metadata():
     )
     assert len(motion_files) == 1
     assert motion_files[0].endswith("115_06_stageii.npz")
+
+
+def test_resolve_motion_files_expands_directories_recursively(tmp_path: Path):
+    dataset_dir = tmp_path / "dataset"
+    first_dir = dataset_dir / "01"
+    second_dir = dataset_dir / "02"
+    first_dir.mkdir(parents=True)
+    second_dir.mkdir()
+
+    first_file = first_dir / "01_01_stageii.npz"
+    second_file = second_dir / "02_03_stageii.npz"
+    first_file.touch()
+    second_file.touch()
+    (second_dir / "ignore.txt").write_text("ignore", encoding="utf-8")
+
+    resolved = resolve_motion_files([str(dataset_dir)])
+
+    assert resolved == [str(first_file.resolve()), str(second_file.resolve())]

@@ -8,6 +8,8 @@ class RunConfig:
     num_blocks: int = 4
     robot_window_length: int = 4
     robot_encoder_type: str = "transformer"
+    motion_window_length: int = 1
+    motion_encoder_type: str = "transformer"
     motion_mae_encoder_checkpoint: str | None = None
     use_amp: bool = True
     rollout_steps: int = 20
@@ -23,6 +25,8 @@ class IsaacEvalConfig:
     checkpoint_path: str
     num_blocks: int | None = None
     robot_window_length: int | None = None
+    motion_window_length: int | None = None
+    motion_encoder_type: str | None = None
     motion_mae_encoder_checkpoint: str | None = None
     use_amp: bool = True
     num_steps: int = 1000
@@ -37,6 +41,8 @@ class Sim2SimEvalConfig:
     motion_files: list[str] | None = None
     num_blocks: int | None = None
     robot_window_length: int | None = None
+    motion_window_length: int | None = None
+    motion_encoder_type: str | None = None
     motion_mae_encoder_checkpoint: str | None = None
     use_amp: bool = True
     num_steps: int = 2000
@@ -49,3 +55,19 @@ class Sim2SimEvalConfig:
     save_video: bool = False
     video_fps: int | None = None
     output_root: str = "runs"
+
+
+@dataclass(frozen=True)
+class MotionMAEVisualizationConfig:
+    checkpoint_path: str
+    config_path: str
+    motion_files: list[str] | None = None
+    split: str = "val"
+    motion_name: str | None = None
+    sample_index: int = 0
+    whole_motion: bool = False
+    future_frame_index: int | None = None
+    fps: int | None = None
+    output_root: str | None = None
+    run_name: str | None = None
+    device: str | None = None

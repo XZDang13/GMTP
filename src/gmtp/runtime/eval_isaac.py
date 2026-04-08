@@ -21,10 +21,10 @@ from gmtp.runtime.observations import (
     structure_env_observation,
 )
 from gmtp.runtime.policy import (
-    build_motion_mae_adapter,
     load_actor_from_checkpoint,
     resolve_checkpoint_stem,
     resolve_motion_mae_checkpoint_path,
+    validate_checkpoint_actor_observation_dims,
 )
 
 
@@ -41,6 +41,7 @@ class IsaacEvalRunner:
         )
         self.observation_window_lengths = resolve_observation_window_lengths(
             robot_window_length=config.robot_window_length,
+            motion_window_length=config.motion_window_length,
             checkpoint_env=self.checkpoint.env,
         )
         self.run_paths = build_run_paths(
@@ -68,39 +69,32 @@ class IsaacEvalRunner:
         self.motion_mae_encoder_checkpoint = (
             None if resolved_motion_mae_checkpoint is None else str(resolved_motion_mae_checkpoint)
         )
-        self.motion_mae_adapter = build_motion_mae_adapter(
-            self.motion_mae_encoder_checkpoint,
-            device=self.device,
-        )
         self.initial_obs, _ = self.env.reset()
         self.initial_obs = structure_env_observation(
             self.initial_obs,
             action_dim=self.cfg.action_space,
             observation_window_lengths=self.observation_window_lengths,
         )
-        if self.motion_mae_adapter is not None:
-            self.motion_mae_adapter.initialize_history(self.env)
         self.raw_obs_dims = infer_env_observation_dims(self.initial_obs)
-        self.obs_dims = (
-            self.motion_mae_adapter.augment_observation_dims(self.raw_obs_dims)
-            if self.motion_mae_adapter is not None
-            else self.raw_obs_dims
-        )
+        self.obs_dims = self.raw_obs_dims
         checkpoint_obs_dims = infer_actor_observation_dims_from_state_dict(
             self.checkpoint.model["actor"],
             self.checkpoint.actor_type,
         )
-        if checkpoint_obs_dims["motion"] != self.obs_dims["motion"] or checkpoint_obs_dims["robot"] != self.obs_dims["robot"]:
-            raise ValueError(
-                "Checkpoint actor observation dims do not match runtime env dims: "
-                f"checkpoint={checkpoint_obs_dims}, runtime={self.obs_dims}."
-            )
+        validate_checkpoint_actor_observation_dims(
+            self.checkpoint,
+            checkpoint_obs_dims=checkpoint_obs_dims,
+            runtime_obs_dims=self.obs_dims,
+            motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
+        )
         self.actor, self.actor_type, self.actor_kwargs = load_actor_from_checkpoint(
             self.checkpoint,
             obs_dims=self.obs_dims,
             action_dim=self.cfg.action_space,
             device=self.device,
             num_blocks=config.num_blocks,
+            motion_encoder_type_override=config.motion_encoder_type,
+            motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
         )
 
     def _build_log_prefix(self) -> Path:
@@ -190,8 +184,6 @@ class IsaacEvalRunner:
         try:
             for step_idx in range(self.config.num_steps):
                 actor_obs = get_actor_observation(obs, self.actor_type)
-                if self.motion_mae_adapter is not None:
-                    actor_obs = self.motion_mae_adapter.augment_actor_observation(actor_obs)
                 action = self.get_action(actor_obs, True)
                 if not torch.isfinite(action).all():
                     raise RuntimeError(
@@ -212,8 +204,6 @@ class IsaacEvalRunner:
                         f"min={reward.min().item():.6f} max={reward.max().item():.6f}"
                     )
                 done = terminate | timeout
-                if self.motion_mae_adapter is not None:
-                    self.motion_mae_adapter.update_history(self.env, done=done)
 
                 step_payload, step_info_metadata = self._build_debug_step_payload(
                     obs,

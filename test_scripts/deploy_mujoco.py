@@ -36,7 +36,11 @@ from gmtp.runtime.observations import (
     replace_sim2sim_group_latest_terms,
     split_sim2sim_group_observations,
 )
-from gmtp.runtime.policy import build_motion_mae_adapter, load_actor_from_checkpoint, resolve_motion_mae_checkpoint_path
+from gmtp.runtime.policy import (
+    load_actor_from_checkpoint,
+    resolve_motion_mae_checkpoint_path,
+    validate_checkpoint_actor_observation_dims,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--motion-file", default=None)
     parser.add_argument("--num-blocks", type=int, default=None)
     parser.add_argument("--robot-window-length", type=int, default=None)
+    parser.add_argument("--motion-window-length", type=int, default=None)
+    parser.add_argument("--motion-encoder-type", choices=("transformer", "mae"), default=None)
     parser.add_argument("--motion-mae-encoder-checkpoint", default=None)
     parser.add_argument("--num-steps", type=int, default=2000)
     parser.add_argument("--simulation-dt", type=float, default=1 / 200)
@@ -294,6 +300,7 @@ def run(args: argparse.Namespace) -> int:
     action_dim = _infer_action_dim(checkpoint_env)
     observation_window_lengths = resolve_observation_window_lengths(
         robot_window_length=args.robot_window_length,
+        motion_window_length=args.motion_window_length,
         checkpoint_env=checkpoint_env,
     )
     motion_file = _resolve_motion_file(
@@ -328,30 +335,29 @@ def run(args: argparse.Namespace) -> int:
     motion_mae_encoder_checkpoint = (
         None if resolved_motion_mae_checkpoint is None else str(resolved_motion_mae_checkpoint)
     )
-    motion_mae_adapter = build_motion_mae_adapter(
-        motion_mae_encoder_checkpoint,
-        device=torch.device("cpu"),
-    )
     raw_obs_dims = infer_sim2sim_observation_dims(
         action_dim,
         observation_window_lengths=observation_window_lengths,
     )
-    obs_dims = motion_mae_adapter.augment_observation_dims(raw_obs_dims) if motion_mae_adapter is not None else raw_obs_dims
+    obs_dims = raw_obs_dims
     checkpoint_obs_dims = infer_actor_observation_dims_from_state_dict(
         checkpoint.model["actor"],
         checkpoint.actor_type,
     )
-    if checkpoint_obs_dims["motion"] != obs_dims["motion"] or checkpoint_obs_dims["robot"] != obs_dims["robot"]:
-        raise ValueError(
-            "Checkpoint actor observation dims do not match runtime env dims: "
-            f"checkpoint={checkpoint_obs_dims}, runtime={obs_dims}."
-        )
+    validate_checkpoint_actor_observation_dims(
+        checkpoint,
+        checkpoint_obs_dims=checkpoint_obs_dims,
+        runtime_obs_dims=obs_dims,
+        motion_mae_encoder_checkpoint=motion_mae_encoder_checkpoint,
+    )
     actor, actor_type, actor_kwargs = load_actor_from_checkpoint(
         checkpoint,
         obs_dims=obs_dims,
         action_dim=action_dim,
         device=torch.device("cpu"),
         num_blocks=args.num_blocks,
+        motion_encoder_type_override=args.motion_encoder_type,
+        motion_mae_encoder_checkpoint=motion_mae_encoder_checkpoint,
     )
     render = not args.headless
     env = _build_env(
@@ -380,13 +386,9 @@ def run(args: argparse.Namespace) -> int:
             action_dim,
             observation_window_lengths,
         )
-        if motion_mae_adapter is not None:
-            motion_mae_adapter.initialize_history(env)
         while steps_executed < args.num_steps and _viewer_is_running(env, render=render):
             actor_env_obs = _tensor_dict_to_batch(obs_parts)
             actor_obs = get_actor_observation(actor_env_obs, actor_type)
-            if motion_mae_adapter is not None:
-                actor_obs = motion_mae_adapter.augment_actor_observation(actor_obs)
             actor_step = actor(actor_obs)
             action = actor_step.mean.squeeze(0).detach().to(device="cpu", dtype=torch.float32)
             if not torch.isfinite(action).all():
@@ -401,8 +403,6 @@ def run(args: argparse.Namespace) -> int:
                 action_dim,
                 observation_window_lengths,
             )
-            if motion_mae_adapter is not None:
-                motion_mae_adapter.update_history(env)
             steps_executed += 1
     finally:
         env.close()
