@@ -8,11 +8,12 @@ MOTION_ASSET_DIR = PROJECT_ROOT / "env" / "assests"
 _EXCLUDED_DEFAULT_MOTION_FILES = {"05_05_stageii.npz"}
 
 DEFAULT_EXPERIMENT_MOTION_FILES = (
-    tuple(
-        f"env/assests/{path.name}"
-        for path in sorted(MOTION_ASSET_DIR.glob("*.npz"))
-        if path.name not in _EXCLUDED_DEFAULT_MOTION_FILES
-    )
+    #tuple(
+    #    f"env/assests/{path.name}"
+    #    for path in sorted(MOTION_ASSET_DIR.glob("*.npz"))
+    #    if path.name not in _EXCLUDED_DEFAULT_MOTION_FILES
+    #)
+    ("env/assests/05_03_stageii.npz")
 )
 
 
