@@ -53,6 +53,7 @@ class Sim2SimEvalConfig:
     action_mode: str | None = None
     root_name: str | None = None
     anchor_body_name: str | None = None
+    allow_unstable_init: bool = False
     render: bool = False
     save_video: bool = False
     video_fps: int | None = None

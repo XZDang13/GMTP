@@ -23,6 +23,7 @@ class G1MultiMotionEnv(G1MotionTrackingEnvCfg):
     events = None
     root_link_name = "pelvis"
     anchor_body_name = "pelvis"
+    recovery = replace(_BASE_G1_ENV_CFG.recovery, enabled=False)
 
 
 @configclass

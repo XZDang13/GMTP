@@ -22,5 +22,8 @@ gmtp eval isaac --checkpoint path/to/model_v2.pth
 gmtp eval isaac --checkpoint path/to/model_v2.pth --save-video
 gmtp eval sim2sim --checkpoint path/to/model_v2.pth
 gmtp eval sim2sim --checkpoint path/to/model_v2.pth --motion-files env/assests/115_06_stageii.npz
+gmtp eval sim2sim --checkpoint path/to/model_v2.pth --allow-unstable-init
 gmtp eval sim2sim --checkpoint path/to/model_v2.pth --save-video
 ```
+
+`--allow-unstable-init` requests a large random unstable reset around the reference state in the MuJoCo bridge instead of the default stabilized `+0.05` root-height lift.

@@ -1,4 +1,5 @@
 import json
+import sys
 import types
 from pathlib import Path
 
@@ -185,6 +186,14 @@ class _BadObsMujocoEnv(_FakeMujocoEnv):
         return torch.zeros(18, dtype=torch.float32)
 
 
+class _SupportsUnstableInitMujocoEnv(_FakeMujocoEnv):
+    instances: list["_SupportsUnstableInitMujocoEnv"] = []
+
+    def __init__(self, *, allow_unstable_init=False, **kwargs):
+        super().__init__(**kwargs)
+        self.allow_unstable_init = allow_unstable_init
+
+
 class _StructuredObsMujocoEnv(_FakeMujocoEnv):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -259,11 +268,12 @@ class _ObservationBuilderMujocoEnv(_FakeMujocoEnv):
 class _FakeVideoRecorder:
     instances: list["_FakeVideoRecorder"] = []
 
-    def __init__(self, *, mj_model, mj_data, output_path, fps, width, height):
+    def __init__(self, *, mj_model, mj_data, env=None, output_path, fps, width, height):
         self.output_path = Path(output_path)
         self.fps = fps
         self.width = width
         self.height = height
+        self.env = env
         self.frames = 0
         self.closed = False
         type(self).instances.append(self)
@@ -280,6 +290,7 @@ class _FakeVideoRecorder:
 @pytest.fixture(autouse=True)
 def _reset_fakes():
     _FakeMujocoEnv.instances.clear()
+    _SupportsUnstableInitMujocoEnv.instances.clear()
     _FakeVideoRecorder.instances.clear()
 
 
@@ -323,6 +334,36 @@ def test_sim2sim_runner_uses_checkpoint_defaults_until_overridden(tmp_path, monk
     assert env.root_link_name == "pelvis"
     assert env.anchor_body_name == "pelvis"
     assert summary["motions"][0]["steps"] == 1
+
+
+def test_sim2sim_runner_forwards_allow_unstable_init_when_supported(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        eval_sim2sim,
+        "get_mujoco_symbols",
+        lambda: types.SimpleNamespace(MujocoEnv=_SupportsUnstableInitMujocoEnv),
+    )
+    checkpoint_path = _write_sim2sim_checkpoint(tmp_path)
+    runner = eval_sim2sim.Sim2SimEvalRunner(
+        Sim2SimEvalConfig(
+            checkpoint_path=str(checkpoint_path),
+            num_steps=1,
+            allow_unstable_init=True,
+            output_root=str(tmp_path / "runs-unstable-init"),
+        )
+    )
+
+    summary = runner.evaluate()
+
+    env = _SupportsUnstableInitMujocoEnv.instances[-1]
+    assert env.allow_unstable_init is True
+    assert summary["allow_unstable_init"] is True
+
+    summary_path = Path(summary["run_dir"]) / "summary.json"
+    summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary_payload["allow_unstable_init"] is True
+
+    debug_payload = json.loads(Path(summary["motions"][0]["debug_json_path"]).read_text(encoding="utf-8"))
+    assert debug_payload["allow_unstable_init"] is True
 
 
 def test_sim2sim_runner_passes_policy_only_observation_spec_to_mujoco_builder(tmp_path, monkeypatch):
@@ -374,6 +415,87 @@ def test_sim2sim_runner_restores_windowed_robot_obs_from_checkpoint_metadata(tmp
     assert runner.observation_window_lengths == build_robot_policy_window_lengths(4)
     assert runner.obs_dims == {"motion": 7, "robot": 48, "policy": 55}
     assert summary["motions"][0]["steps"] == 1
+
+
+def test_offscreen_video_recorder_uses_env_tracking_camera(monkeypatch, tmp_path):
+    update_calls: list[tuple[int, int]] = []
+
+    class _FakeCamera:
+        def __init__(self):
+            self.type = -1
+            self.fixedcamid = 99
+            self.trackbodyid = 88
+            self.lookat = np.zeros(3, dtype=np.float64)
+            self.distance = 0.0
+            self.azimuth = 0.0
+            self.elevation = 0.0
+
+    class _FakeRenderer:
+        def __init__(self, mj_model, *, height, width):
+            self.height = height
+            self.width = width
+            self.last_camera = None
+            self.closed = False
+
+        def update_scene(self, mj_data, camera=None):
+            self.last_camera = camera
+
+        def render(self):
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+        def close(self):
+            self.closed = True
+
+    class _FakeWriter:
+        def __init__(self):
+            self.frames = 0
+            self.closed = False
+
+        def append_data(self, frame):
+            self.frames += 1
+
+        def close(self):
+            self.closed = True
+
+    fake_writer = _FakeWriter()
+    fake_mujoco = types.SimpleNamespace(
+        Renderer=_FakeRenderer,
+        MjvCamera=_FakeCamera,
+        mjv_defaultFreeCamera=lambda mj_model, camera: setattr(camera, "distance", 1.5),
+    )
+    monkeypatch.setitem(sys.modules, "mujoco", fake_mujoco)
+    monkeypatch.setattr(eval_sim2sim.imageio, "get_writer", lambda output_path, fps: fake_writer)
+
+    env = types.SimpleNamespace()
+
+    def _update_tracking_camera(camera, *, frame_width, frame_height, mujoco_module):
+        update_calls.append((frame_width, frame_height))
+        camera.lookat[:] = np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
+        camera.distance = 4.0
+
+    env._update_tracking_camera = _update_tracking_camera
+
+    recorder = eval_sim2sim.OffscreenMujocoVideoRecorder(
+        mj_model=object(),
+        mj_data=object(),
+        env=env,
+        output_path=tmp_path / "tracking.mp4",
+        fps=30,
+        width=640,
+        height=360,
+    )
+
+    try:
+        recorder.capture_frame()
+    finally:
+        recorder.close()
+
+    assert update_calls == [(640, 360)]
+    assert recorder._renderer.last_camera is recorder._camera
+    assert np.allclose(recorder._camera.lookat, np.asarray([1.0, 2.0, 3.0], dtype=np.float64))
+    assert recorder._camera.distance == pytest.approx(4.0)
+    assert fake_writer.frames == 1
+    assert fake_writer.closed is True
 
 
 def test_sim2sim_runner_evaluate_writes_summary_debug_and_video(tmp_path, monkeypatch):
@@ -448,6 +570,26 @@ def test_sim2sim_runner_rejects_unexpected_obs_dim(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ValueError, match="Expected sim2sim observation dim"):
+        runner.evaluate()
+
+
+def test_sim2sim_runner_rejects_allow_unstable_init_for_legacy_bridge(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        eval_sim2sim,
+        "get_mujoco_symbols",
+        lambda: types.SimpleNamespace(MujocoEnv=_FakeMujocoEnv),
+    )
+    checkpoint_path = _write_sim2sim_checkpoint(tmp_path)
+    runner = eval_sim2sim.Sim2SimEvalRunner(
+        Sim2SimEvalConfig(
+            checkpoint_path=str(checkpoint_path),
+            num_steps=1,
+            allow_unstable_init=True,
+            output_root=str(tmp_path / "runs-legacy-bridge"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="allow_unstable_init"):
         runner.evaluate()
 
 

@@ -333,6 +333,9 @@ def test_cli_parser_builds_train_and_eval_commands():
     args = parser.parse_args(["eval", "sim2sim", "--checkpoint", "foo.pth", "--save-video"])
     assert args.save_video is True
 
+    args = parser.parse_args(["eval", "sim2sim", "--checkpoint", "foo.pth", "--allow-unstable-init"])
+    assert args.allow_unstable_init is True
+
     args = parser.parse_args(["pretrain", "motion-mae", "--config", "foo.json"])
     assert args.command == "pretrain"
     assert args.pretrain_target == "motion-mae"

@@ -135,6 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
     sim2sim_parser.add_argument("--action-mode", default=None)
     sim2sim_parser.add_argument("--root-name", default=None)
     sim2sim_parser.add_argument("--anchor-body-name", default=None)
+    sim2sim_parser.add_argument(
+        "--allow-unstable-init",
+        action="store_true",
+        help="Sample a large random unstable reset in MuJoCo around the reference state instead of the default stabilized lift.",
+    )
     sim2sim_parser.add_argument("--render", action="store_true")
     sim2sim_parser.add_argument("--save-video", action="store_true")
     sim2sim_parser.add_argument("--video-fps", type=int, default=None)
@@ -223,6 +228,7 @@ def _run_eval_sim2sim(args) -> int:
             action_mode=args.action_mode,
             root_name=args.root_name,
             anchor_body_name=args.anchor_body_name,
+            allow_unstable_init=args.allow_unstable_init,
             render=args.render,
             save_video=args.save_video,
             video_fps=args.video_fps,

@@ -60,6 +60,7 @@ class OffscreenMujocoVideoRecorder:
         *,
         mj_model: Any,
         mj_data: Any,
+        env: Any | None = None,
         output_path: str | Path,
         fps: int,
         width: int = DEFAULT_VIDEO_WIDTH,
@@ -69,12 +70,35 @@ class OffscreenMujocoVideoRecorder:
 
         self.output_path = Path(output_path).expanduser().resolve()
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._mujoco = mujoco
         self._renderer = mujoco.Renderer(mj_model, height=height, width=width)
         self._mj_data = mj_data
+        self._env = env
+        self._width = int(width)
+        self._height = int(height)
+        self._camera = getattr(mujoco, "MjvCamera", lambda: None)()
+        if self._camera is not None and hasattr(mujoco, "mjv_defaultFreeCamera"):
+            mujoco.mjv_defaultFreeCamera(mj_model, self._camera)
         self._writer = imageio.get_writer(self.output_path, fps=fps)
 
     def capture_frame(self) -> None:
-        self._renderer.update_scene(self._mj_data)
+        if self._camera is not None and self._env is not None:
+            update_tracking_camera = getattr(self._env, "_update_tracking_camera", None)
+            if callable(update_tracking_camera):
+                update_tracking_camera(
+                    self._camera,
+                    frame_width=self._width,
+                    frame_height=self._height,
+                    mujoco_module=self._mujoco,
+                )
+
+        if self._camera is None:
+            self._renderer.update_scene(self._mj_data)
+        else:
+            try:
+                self._renderer.update_scene(self._mj_data, camera=self._camera)
+            except TypeError:
+                self._renderer.update_scene(self._mj_data)
         self._writer.append_data(self._renderer.render())
 
     def close(self) -> None:
@@ -317,6 +341,10 @@ class Sim2SimEvalRunner:
 
     def _build_env(self, motion_file: str):
         symbols = get_mujoco_symbols()
+        try:
+            init_parameters = inspect.signature(symbols.MujocoEnv).parameters
+        except (TypeError, ValueError):
+            init_parameters = {}
         env_kwargs = {
             "simulation_dt": self.config.simulation_dt,
             "decimation": self.config.decimation,
@@ -332,12 +360,15 @@ class Sim2SimEvalRunner:
             "render": self.config.render,
             "action_mode": self.action_mode,
         }
+        if self.config.allow_unstable_init:
+            if "allow_unstable_init" not in init_parameters:
+                raise ValueError(
+                    "Sim2sim requested unstable-init, but the installed Ref2Act MujocoEnv "
+                    "does not accept the 'allow_unstable_init' constructor argument."
+                )
+            env_kwargs["allow_unstable_init"] = True
         observation_builder_cls = getattr(symbols, "IsaacLabMujocoObservation", None)
         if observation_builder_cls is not None:
-            try:
-                init_parameters = inspect.signature(symbols.MujocoEnv).parameters
-            except (TypeError, ValueError):
-                init_parameters = {}
             if "observation_builder" in init_parameters:
                 env_kwargs["observation_builder"] = observation_builder_cls(
                     spec=build_gmtp_policy_observation_spec(
@@ -433,6 +464,7 @@ class Sim2SimEvalRunner:
             OffscreenMujocoVideoRecorder(
                 mj_model=env.mj_model,
                 mj_data=env.mj_data,
+                env=env,
                 output_path=video_path,
                 fps=self._get_video_fps(),
                 width=DEFAULT_VIDEO_WIDTH,
@@ -500,6 +532,7 @@ class Sim2SimEvalRunner:
                 "action_mode_source": self.action_mode_source,
                 "root_name": self.root_name,
                 "anchor_body_name": self.anchor_body_name,
+                "allow_unstable_init": self.config.allow_unstable_init,
                 "video_path": str(video_path) if video_path is not None else None,
                 "error": error_message,
             }
@@ -544,6 +577,7 @@ class Sim2SimEvalRunner:
             "action_mode_source": self.action_mode_source,
             "root_name": self.root_name,
             "anchor_body_name": self.anchor_body_name,
+            "allow_unstable_init": self.config.allow_unstable_init,
             "motion_files": list(self.motion_files),
             "motion_label": self.motion_name,
             "num_steps_per_motion": self.config.num_steps,
