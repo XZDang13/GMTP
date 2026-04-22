@@ -54,22 +54,27 @@ def _install_env_cfg_stubs(monkeypatch):
     class FakeSamplingStrategy:
         FailureWeighted = "FailureWeighted"
 
+    class FakeSegmentSource:
+        Anchor = "Anchor"
+
     @dataclass(frozen=True)
     class FakeEnvCfgSymbols:
         G1MotionTrackingEnvCfg: type
         G1TrainingEventCfg: type
         SamplingStrategy: type
+        SegmentSource: type
 
     compat_mod = types.ModuleType("gmtp.integrations.ref2act.compat")
     compat_mod.load_env_cfg_symbols = lambda: FakeEnvCfgSymbols(
         G1MotionTrackingEnvCfg=FakeG1MotionTrackingEnvCfg,
         G1TrainingEventCfg=FakeG1TrainingEventCfg,
         SamplingStrategy=FakeSamplingStrategy,
+        SegmentSource=FakeSegmentSource,
     )
     compat_mod.load_mujoco_symbols = lambda: None
 
     motion_mod = types.ModuleType("gmtp.integrations.ref2act.motion")
-    motion_mod.DEFAULT_EXPERIMENT_MOTION_FILES = ["walk.npz"]
+    motion_mod.DEFAULT_EXPERIMENT_MOTION_FILES = ["walk_anchor.npz"]
     motion_mod.infer_motion_files_from_checkpoint = lambda *args, **kwargs: []
     motion_mod.motion_label = lambda *args, **kwargs: "walk"
     motion_mod.motion_names = lambda *args, **kwargs: ["walk"]
@@ -85,7 +90,7 @@ def _install_env_cfg_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.observation_history", observation_mod)
 
 
-def test_training_env_enables_recovery_without_affecting_eval(monkeypatch):
+def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
     _install_env_cfg_stubs(monkeypatch)
     sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
     sys.modules.pop("gmtp.integrations.ref2act", None)
@@ -95,5 +100,7 @@ def test_training_env_enables_recovery_without_affecting_eval(monkeypatch):
     training_cfg = env_cfg.G1MultiMotionTrainingEnv()
     eval_cfg = env_cfg.G1MultiMotionEnv()
 
-    assert training_cfg.recovery.enabled is True
+    assert training_cfg.sampling_strategy == env_cfg.SamplingStrategy.FailureWeighted
+    assert training_cfg.segment_source == env_cfg.SegmentSource.Anchor
+    assert training_cfg.recovery.enabled is False
     assert eval_cfg.recovery.enabled is False

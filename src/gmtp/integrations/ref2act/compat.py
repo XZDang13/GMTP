@@ -17,6 +17,7 @@ class EnvCfgSymbols:
     G1MotionTrackingEnvCfg: type
     G1TrainingEventCfg: type
     SamplingStrategy: type
+    SegmentSource: type
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,7 @@ def load_env_cfg_symbols() -> EnvCfgSymbols:
         G1MotionTrackingEnvCfg=g1_module.G1MotionTrackingEnvCfg,
         G1TrainingEventCfg=g1_module.G1TrainingEventCfg,
         SamplingStrategy=sampling_module.SamplingStrategy,
+        SegmentSource=sampling_module.SegmentSource,
     )
 
 

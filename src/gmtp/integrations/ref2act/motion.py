@@ -5,16 +5,20 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MOTION_ASSET_DIR = PROJECT_ROOT / "env" / "assests"
-_EXCLUDED_DEFAULT_MOTION_FILES = {"05_05_stageii.npz"}
 
-DEFAULT_EXPERIMENT_MOTION_FILES = (
-    #tuple(
-    #    f"env/assests/{path.name}"
-    #    for path in sorted(MOTION_ASSET_DIR.glob("*.npz"))
-    #    if path.name not in _EXCLUDED_DEFAULT_MOTION_FILES
-    #)
-    ("env/assests/05_03_stageii.npz")
-)
+
+def _discover_default_experiment_motion_files() -> tuple[str, ...]:
+    #motion_files = tuple(f"env/assests/{path.name}" for path in sorted(MOTION_ASSET_DIR.glob("*_anchor.npz")))
+    motion_files = ("env/assests/dance_anchor.npz",)
+    if not motion_files:
+        raise FileNotFoundError(
+            f"No default anchor motion files found under {MOTION_ASSET_DIR}. "
+            "Expected files matching '*_anchor.npz'."
+        )
+    return motion_files
+
+
+DEFAULT_EXPERIMENT_MOTION_FILES = _discover_default_experiment_motion_files()
 
 
 def normalize_motion_files(motion_files: str | Sequence[str] | None) -> list[str]:

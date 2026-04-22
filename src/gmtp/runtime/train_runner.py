@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import torch
 from RLAlg.alg.ppo import PPO
@@ -96,6 +97,8 @@ class TrainRunner:
         self.use_amp = resolve_amp_enabled(self.requested_amp, self.device)
         self.amp_dtype = AMP_DTYPE_NAME
         self.actor_type = ActorType.FILM_RES
+        self.segment_source = self._normalize_choice_name(getattr(self.cfg, "segment_source", None))
+        self.sampling_strategy = self._normalize_choice_name(getattr(self.cfg, "sampling_strategy", None))
         self.motion_files = list(self.cfg.expert_motion_file)
         self.motion_name = motion_label(self.motion_files)
         resolved_motion_mae_checkpoint = resolve_motion_mae_checkpoint_path(
@@ -111,6 +114,7 @@ class TrainRunner:
         self.checkpoint_interval = config.checkpoint_interval
         self.steps = config.rollout_steps
         self.global_step = 0
+        self.update_count = 0
 
         write_json(self.run_paths.config_path, {"command": "train", "config": self.config})
 
@@ -200,6 +204,19 @@ class TrainRunner:
         }
 
     @staticmethod
+    def _normalize_choice_name(value: Any) -> str | None:
+        if value is None:
+            return None
+
+        text = str(getattr(value, "name", value)).split(".")[-1].replace("-", "_")
+        normalized: list[str] = []
+        for index, char in enumerate(text):
+            if char.isupper() and index > 0 and normalized and normalized[-1] != "_" and not text[index - 1].isupper():
+                normalized.append("_")
+            normalized.append(char.lower())
+        return "".join(normalized)
+
+    @staticmethod
     def _split_optimizer_param_groups(
         modules: dict[str, torch.nn.Module],
         *,
@@ -247,6 +264,166 @@ class TrainRunner:
             "episode/returns": float(mean_return),
             "episode/lengths": float(mean_length),
         }
+
+    @staticmethod
+    def _build_guarded_sampling_probabilities(
+        fail_counts: torch.Tensor,
+        sample_counts: torch.Tensor,
+        *,
+        temperature: float,
+        uniform_mix: float,
+        eligible_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if temperature <= 0.0:
+            raise ValueError("temperature must be > 0.")
+
+        fail_counts = torch.as_tensor(fail_counts, dtype=torch.float32).reshape(-1)
+        sample_counts = torch.as_tensor(sample_counts, dtype=torch.float32).reshape(-1)
+        if fail_counts.shape != sample_counts.shape:
+            raise ValueError("fail_counts and sample_counts must have the same shape.")
+
+        if eligible_mask is None:
+            eligible = torch.ones_like(fail_counts, dtype=torch.bool)
+        else:
+            eligible = torch.as_tensor(eligible_mask, dtype=torch.bool).reshape(-1)
+            if eligible.shape != fail_counts.shape:
+                raise ValueError("eligible_mask must have the same shape as fail_counts.")
+
+        uniform_probs = eligible.to(dtype=torch.float32)
+        uniform_sum = torch.sum(uniform_probs)
+        if float(uniform_sum.item()) <= 0.0:
+            raise ValueError("eligible_mask must include at least one entry.")
+        uniform_probs = uniform_probs / uniform_sum
+
+        fail_rate = fail_counts / torch.clamp(sample_counts, min=1.0)
+        learned_weights = fail_rate.pow(1.0 / temperature)
+        learned_weights = torch.where(eligible, learned_weights, torch.zeros_like(learned_weights))
+
+        learned_sum = torch.sum(learned_weights)
+        if bool(torch.all(torch.isfinite(learned_weights)).item()) and float(learned_sum.item()) > 0.0:
+            learned_probs = learned_weights / learned_sum
+        else:
+            learned_probs = uniform_probs
+
+        probs = (1.0 - uniform_mix) * learned_probs + uniform_mix * uniform_probs
+        return probs / torch.clamp(torch.sum(probs), min=torch.finfo(probs.dtype).eps)
+
+    @staticmethod
+    def _as_cpu_tensor(
+        value: Any,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        tensor = torch.as_tensor(value, dtype=dtype)
+        if tensor.device.type != "cpu":
+            tensor = tensor.detach().to(device="cpu")
+        return tensor
+
+    @staticmethod
+    def _resolve_anchor_index(anchor_times: torch.Tensor, reset_time: torch.Tensor) -> int:
+        matches = torch.nonzero(torch.isclose(anchor_times, reset_time, atol=1e-6, rtol=0.0), as_tuple=False)
+        if matches.numel() > 0:
+            return int(matches[0, 0].item())
+        return int(torch.argmin(torch.abs(anchor_times - reset_time)).item())
+
+    @classmethod
+    def _compute_anchor_reset_probabilities(
+        cls,
+        sampler: Any,
+        *,
+        temperature: float,
+    ) -> list[dict[str, float | int | str]]:
+        motion_lib = getattr(sampler, "motion_lib", None)
+        clips = getattr(motion_lib, "clips", None)
+        bin_fail_counts = getattr(sampler, "bin_fail_counts", None)
+        bin_sample_counts = getattr(sampler, "bin_sample_counts", None)
+        bin_reset_eligible = getattr(sampler, "bin_reset_eligible", None)
+        bin_reset_times = getattr(sampler, "bin_reset_times", None)
+        if not clips or bin_fail_counts is None or bin_sample_counts is None or bin_reset_eligible is None or bin_reset_times is None:
+            return []
+
+        uniform_mix = float(getattr(sampler, "failure_weight_uniform_mix", 0.0))
+        motion_fail_counts = torch.stack(
+            [cls._as_cpu_tensor(fail_counts, dtype=torch.float32).sum() for fail_counts in bin_fail_counts],
+            dim=0,
+        )
+        motion_sample_counts = torch.stack(
+            [cls._as_cpu_tensor(sample_counts, dtype=torch.float32).sum() for sample_counts in bin_sample_counts],
+            dim=0,
+        )
+        motion_probs = cls._build_guarded_sampling_probabilities(
+            motion_fail_counts,
+            motion_sample_counts,
+            temperature=temperature,
+            uniform_mix=uniform_mix,
+        )
+
+        results: list[dict[str, float | int | str]] = []
+        for motion_index, clip in enumerate(clips):
+            anchor_times_raw = getattr(clip, "anchor_times", None)
+            if anchor_times_raw is None:
+                continue
+
+            anchor_times = cls._as_cpu_tensor(anchor_times_raw, dtype=torch.float32).reshape(-1)
+            anchor_probs = torch.zeros(anchor_times.shape, dtype=torch.float32, device=anchor_times.device)
+
+            if anchor_times.numel() > 0:
+                fail_counts = cls._as_cpu_tensor(bin_fail_counts[motion_index], dtype=torch.float32).reshape(-1)
+                sample_counts = cls._as_cpu_tensor(bin_sample_counts[motion_index], dtype=torch.float32).reshape(-1)
+                eligible_mask = cls._as_cpu_tensor(bin_reset_eligible[motion_index], dtype=torch.bool).reshape(-1)
+                reset_times = cls._as_cpu_tensor(bin_reset_times[motion_index], dtype=torch.float32).reshape(-1)
+                bin_probs = cls._build_guarded_sampling_probabilities(
+                    fail_counts,
+                    sample_counts,
+                    temperature=temperature,
+                    uniform_mix=uniform_mix,
+                    eligible_mask=eligible_mask,
+                )
+                for bin_index in torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1).tolist():
+                    anchor_index = cls._resolve_anchor_index(anchor_times, reset_times[bin_index])
+                    anchor_probs[anchor_index] += motion_probs[motion_index] * bin_probs[bin_index]
+
+            motion_name = str(getattr(clip, "name", f"motion_{motion_index}"))
+            for anchor_index, anchor_time in enumerate(anchor_times.tolist()):
+                results.append(
+                    {
+                        "motion_name": motion_name,
+                        "anchor_index": anchor_index,
+                        "anchor_time": float(anchor_time),
+                        "probability": float(anchor_probs[anchor_index].item()),
+                    }
+                )
+
+        return results
+
+    def _collect_anchor_reset_probabilities(self) -> list[dict[str, float | int | str]]:
+        sampler = getattr(self.env.unwrapped, "sampler", None)
+        if sampler is None:
+            return []
+        if self._normalize_choice_name(getattr(sampler, "segment_source", self.segment_source)) != "anchor":
+            return []
+        return self._compute_anchor_reset_probabilities(
+            sampler,
+            temperature=float(getattr(self.cfg, "failure_temperature", 1.0)),
+        )
+
+    def _log_anchor_reset_probabilities(self) -> None:
+        anchor_probabilities = self._collect_anchor_reset_probabilities()
+        if not anchor_probabilities:
+            return
+
+        print(f"anchor reset probabilities after update {self.update_count}:", flush=True)
+        current_motion_name: str | None = None
+        for entry in anchor_probabilities:
+            motion_name = str(entry["motion_name"])
+            if motion_name != current_motion_name:
+                current_motion_name = motion_name
+                print(f"  motion={motion_name}", flush=True)
+            print(
+                f"    A{int(entry['anchor_index'])} t={float(entry['anchor_time']):.3f}s "
+                f"p={float(entry['probability']):.6f}",
+                flush=True,
+            )
 
     @staticmethod
     def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -405,6 +582,9 @@ class TrainRunner:
                 "update/avg_kl_divergence": self.tracker.get_mean("kl_divergence"),
             }
         )
+        self.update_count += 1
+        if self.update_count % 100 == 0:
+            self._log_anchor_reset_probabilities()
 
     def save_checkpoint(self, name: str) -> Path:
         joint_params = self.env.unwrapped.get_joint_params()
@@ -427,6 +607,8 @@ class TrainRunner:
             action_mode=action_mode,
             root_name=getattr(self.cfg, "root_link_name", None),
             anchor_body_name=getattr(self.cfg, "anchor_body_name", None),
+            segment_source=self.segment_source,
+            sampling_strategy=self.sampling_strategy,
             motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
             observation_window_lengths=self.observation_window_lengths,
             artifacts={"run_dir": str(self.run_paths.root)},
@@ -456,6 +638,8 @@ class TrainRunner:
             "motion_names": motion_names(self.motion_files),
             "motion_label": self.motion_name,
             "motion_mae_encoder_checkpoint": self.motion_mae_encoder_checkpoint,
+            "segment_source": self.segment_source,
+            "sampling_strategy": self.sampling_strategy,
             "observation_window_lengths": self.observation_window_lengths,
             "num_updates": self.config.num_updates,
             "rollout_steps": self.steps,

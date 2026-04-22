@@ -23,10 +23,12 @@ from gmtp.motion_mae import (
     build_motion_mae_encoder_checkpoint,
     save_motion_mae_encoder_checkpoint,
 )
-from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
+from gmtp.runtime.checkpoints import build_training_checkpoint, load_checkpoint_v2, save_checkpoint_v2
 from gmtp.runtime.config import IsaacEvalConfig, RunConfig, Sim2SimEvalConfig
 from gmtp.runtime.eval_isaac import IsaacEvalRunner
 from gmtp.runtime.train_runner import TrainRunner
+
+DEFAULT_TEST_MOTION_FILE = "env/assests/jump_anchor.npz"
 
 
 class _DummyTrainEnv:
@@ -106,11 +108,14 @@ def _fake_train_module():
     cfg = types.SimpleNamespace(
         scene=types.SimpleNamespace(num_envs=2),
         action_space=2,
-        expert_motion_file=["env/assests/115_06_stageii.npz"],
+        expert_motion_file=[DEFAULT_TEST_MOTION_FILE],
         action=types.SimpleNamespace(mode="offset"),
         action_mod="Offset",
         root_link_name="torso_link",
         anchor_body_name="torso_link",
+        segment_source="Anchor",
+        sampling_strategy="FailureWeighted",
+        failure_temperature=1.0,
     )
     return types.SimpleNamespace(
         make_training_env=lambda window_lengths=None: (
@@ -127,7 +132,7 @@ def _fake_train_module():
 def _fake_eval_module():
     cfg = types.SimpleNamespace(scene=types.SimpleNamespace(num_envs=1), action_space=2)
     return types.SimpleNamespace(
-        make_eval_env=lambda motion_files, show_reference_motion=False, window_lengths=None: (
+        make_eval_env=lambda motion_files, show_reference_motion=False, window_lengths=None, render_mode=None: (
             _DummyTrainEnv(
                 batch_size=1,
                 robot_window_length=_window_length(window_lengths, "projected_gravity", 1),
@@ -169,7 +174,7 @@ def _write_checkpoint(
     checkpoint = build_training_checkpoint(
         actor=actor,
         critic=critic,
-        motion_files=motion_files or ["env/assests/115_06_stageii.npz"],
+        motion_files=motion_files or [DEFAULT_TEST_MOTION_FILE],
         joint_params={
             "joint_names": ["j0", "j1"],
             "joint_effort_limits": torch.ones(2),
@@ -182,6 +187,8 @@ def _write_checkpoint(
         action_mode="offset",
         root_name="torso_link",
         anchor_body_name="torso_link",
+        segment_source="anchor",
+        sampling_strategy="failure_weighted",
         motion_mae_encoder_checkpoint=motion_mae_encoder_checkpoint,
         observation_window_lengths=observation_window_lengths or None,
     )
@@ -246,7 +253,7 @@ def _write_motion_mae_encoder_checkpoint(tmp_path) -> Path:
         schema=_motion_mae_schema(),
         config=MotionMAEPretrainConfig(
             data=MotionMAEDataConfig(
-                motion_files=("env/assests/115_02_stageii.npz",),
+                motion_files=(DEFAULT_TEST_MOTION_FILE,),
                 past_frames=4,
                 future_frames=2,
                 split_mode="by_window",
@@ -395,7 +402,7 @@ def test_train_runner_dry_construction(monkeypatch):
         **build_robot_policy_window_lengths(4),
         **build_motion_policy_window_lengths(1),
     }
-    assert runner.motion_files[0].endswith("115_06_stageii.npz")
+    assert runner.motion_files[0].endswith("jump_anchor.npz")
     config_payload = json.loads(runner.run_paths.config_path.read_text(encoding="utf-8"))
     assert config_payload["config"]["use_amp"] is True
     runner.env.close()
@@ -485,6 +492,57 @@ def test_train_runner_update_smoke_uses_cpu_fallback(monkeypatch):
     runner.env.close()
 
 
+def test_train_runner_logs_anchor_probabilities_every_hundred_updates(monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=1,
+            num_updates=1,
+        )
+    )
+    runner._collect_anchor_reset_probabilities = lambda: [
+        {"motion_name": "jump_anchor", "anchor_index": 0, "anchor_time": 0.0, "probability": 1.0}
+    ]
+
+    capsys.readouterr()
+    runner.rollout(runner.initial_obs)
+    runner.update()
+    assert "anchor reset probabilities after update" not in capsys.readouterr().out
+
+    runner.update_count = 99
+    runner.rollout(runner.initial_obs)
+    runner.update()
+    output = capsys.readouterr().out
+
+    assert "anchor reset probabilities after update 100:" in output
+    assert "motion=jump_anchor" in output
+    assert "A0 t=0.000s p=1.000000" in output
+    runner.env.close()
+
+
+def test_train_runner_summary_and_checkpoint_record_anchor_sampler_metadata(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=1,
+            num_updates=1,
+            checkpoint_interval=1000,
+            output_root=str(tmp_path / "runs"),
+        )
+    )
+
+    summary = runner.train()
+    checkpoint = load_checkpoint_v2(summary["final_checkpoint"])
+
+    assert summary["segment_source"] == "anchor"
+    assert summary["sampling_strategy"] == "failure_weighted"
+    assert checkpoint.env["segment_source"] == "anchor"
+    assert checkpoint.env["sampling_strategy"] == "failure_weighted"
+    assert checkpoint.motion_files[0].endswith("jump_anchor.npz")
+
+
 def test_isaac_eval_runner_dry_construction(tmp_path, monkeypatch):
     checkpoint_path = _write_isaac_checkpoint(tmp_path)
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_eval_module())
@@ -498,7 +556,7 @@ def test_isaac_eval_runner_dry_construction(tmp_path, monkeypatch):
     )
     summary = runner.evaluate()
 
-    assert runner.motion_files[0].endswith("115_06_stageii.npz")
+    assert runner.motion_files[0].endswith("jump_anchor.npz")
     assert summary["amp_requested"] is True
     assert summary["amp_enabled"] is False
     assert summary["amp_dtype"] == "float16"
@@ -549,4 +607,4 @@ def test_sim2sim_runner_accepts_v2_checkpoint(tmp_path):
     assert runner.action_mode == "offset"
     assert runner.requested_amp is True
     assert runner.use_amp is False
-    assert runner.motion_files[0].endswith("115_06_stageii.npz")
+    assert runner.checkpoint.motion_files[0].endswith("jump_anchor.npz")

@@ -44,11 +44,13 @@ def test_checkpoint_v2_roundtrip(tmp_path):
     checkpoint = build_training_checkpoint(
         actor=actor,
         critic=critic,
-        motion_files=["env/assests/115_06_stageii.npz"],
+        motion_files=["env/assests/jump_anchor.npz"],
         joint_params=_joint_params(),
         action_mode="offset",
         root_name="torso_link",
         anchor_body_name="torso_link",
+        segment_source="anchor",
+        sampling_strategy="failure_weighted",
         motion_mae_encoder_checkpoint=str(motion_mae_encoder_checkpoint),
         observation_window_lengths=build_robot_policy_window_lengths(4),
         artifacts={"run_dir": "runs/train/demo"},
@@ -69,10 +71,12 @@ def test_checkpoint_v2_roundtrip(tmp_path):
     assert loaded.env["action_mode"] == "offset"
     assert loaded.env["root_name"] == "torso_link"
     assert loaded.env["anchor_body_name"] == "torso_link"
+    assert loaded.env["segment_source"] == "anchor"
+    assert loaded.env["sampling_strategy"] == "failure_weighted"
     assert loaded.artifacts["run_dir"] == "runs/train/demo"
     assert loaded.motion_mae_encoder_checkpoint == str(motion_mae_encoder_checkpoint.resolve())
     assert loaded.observation_window_lengths == build_robot_policy_window_lengths(4)
-    assert loaded.motion_files[0].endswith("115_06_stageii.npz")
+    assert loaded.motion_files[0].endswith("jump_anchor.npz")
 
 
 def test_checkpoint_v2_defaults_to_legacy_single_frame_window_lengths_when_missing():
@@ -80,7 +84,7 @@ def test_checkpoint_v2_defaults_to_legacy_single_frame_window_lengths_when_missi
     checkpoint = build_training_checkpoint(
         actor=FiLMResActor(robot_obs_dim=robot_obs_dim, motion_obs_dim=motion_obs_dim, action_dim=2, num_blocks=4),
         critic=Critic(obs_dim=5),
-        motion_files=["env/assests/115_06_stageii.npz"],
+        motion_files=["env/assests/jump_anchor.npz"],
         joint_params=_joint_params(),
         action_mode="offset",
         root_name="torso_link",

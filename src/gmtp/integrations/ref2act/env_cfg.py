@@ -10,6 +10,7 @@ _REF2ACT = load_env_cfg_symbols()
 G1MotionTrackingEnvCfg = _REF2ACT.G1MotionTrackingEnvCfg
 G1TrainingEventCfg = _REF2ACT.G1TrainingEventCfg
 SamplingStrategy = _REF2ACT.SamplingStrategy
+SegmentSource = _REF2ACT.SegmentSource
 _BASE_G1_ENV_CFG = G1MotionTrackingEnvCfg()
 
 
@@ -23,11 +24,13 @@ class G1MultiMotionEnv(G1MotionTrackingEnvCfg):
     events = None
     root_link_name = "pelvis"
     anchor_body_name = "pelvis"
-    recovery = replace(_BASE_G1_ENV_CFG.recovery, enabled=False)
+    if hasattr(_BASE_G1_ENV_CFG, "recovery"):
+        recovery = replace(_BASE_G1_ENV_CFG.recovery, enabled=False)
 
 
 @configclass
 class G1MultiMotionTrainingEnv(G1MultiMotionEnv):
     sampling_strategy = SamplingStrategy.FailureWeighted
+    segment_source = SegmentSource.Anchor
     random_start = True
     events = G1TrainingEventCfg()
