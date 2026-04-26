@@ -42,10 +42,29 @@ def _install_env_cfg_stubs(monkeypatch):
     class RecoveryCfg:
         enabled: bool = False
 
+    @dataclass
+    class FallRecoveryCfg:
+        enabled: bool = False
+        reference_time_scale: float = 0.25
+
+    @dataclass
+    class QualityGateCfg:
+        enabled: bool = False
+        soft_threshold: float = 1.0
+        recovery_enter_threshold: float = 1.8
+        hard_tracking_threshold: float | None = 4.0
+
+    @dataclass
+    class RobustTrackingCfg:
+        enabled: bool = False
+        quality_gate: QualityGateCfg = field(default_factory=QualityGateCfg)
+        fall_recovery: FallRecoveryCfg = field(default_factory=FallRecoveryCfg)
+
     @_configclass
     class FakeG1MotionTrackingEnvCfg:
         action = ActionCfg()
         recovery = RecoveryCfg()
+        robust_tracking = RobustTrackingCfg()
 
     @_configclass
     class FakeG1TrainingEventCfg:
@@ -95,12 +114,24 @@ def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
     sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
     sys.modules.pop("gmtp.integrations.ref2act", None)
 
-    env_cfg = importlib.import_module("gmtp.integrations.ref2act.env_cfg")
+    try:
+        env_cfg = importlib.import_module("gmtp.integrations.ref2act.env_cfg")
 
-    training_cfg = env_cfg.G1MultiMotionTrainingEnv()
-    eval_cfg = env_cfg.G1MultiMotionEnv()
+        training_cfg = env_cfg.G1MultiMotionTrainingEnv()
+        eval_cfg = env_cfg.G1MultiMotionEnv()
 
-    assert training_cfg.sampling_strategy == env_cfg.SamplingStrategy.FailureWeighted
-    assert training_cfg.segment_source == env_cfg.SegmentSource.Anchor
-    assert training_cfg.recovery.enabled is False
-    assert eval_cfg.recovery.enabled is False
+        assert training_cfg.sampling_strategy == env_cfg.SamplingStrategy.FailureWeighted
+        assert training_cfg.segment_source == env_cfg.SegmentSource.Anchor
+        assert training_cfg.recovery.enabled is False
+        assert eval_cfg.recovery.enabled is False
+        assert training_cfg.robust_tracking.enabled is True
+        assert eval_cfg.robust_tracking.enabled is True
+        assert training_cfg.robust_tracking.quality_gate.enabled is True
+        assert eval_cfg.robust_tracking.quality_gate.enabled is True
+        assert training_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 1.8
+        assert eval_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 1.8
+        assert training_cfg.robust_tracking.fall_recovery.enabled is False
+        assert eval_cfg.robust_tracking.fall_recovery.enabled is False
+    finally:
+        sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
+        sys.modules.pop("gmtp.integrations.ref2act", None)

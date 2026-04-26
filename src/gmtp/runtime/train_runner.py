@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,19 @@ from gmtp.runtime.config import RunConfig
 from gmtp.runtime.io import build_run_paths, write_json
 from gmtp.runtime.observations import infer_env_observation_dims, structure_env_observation
 from gmtp.runtime.policy import resolve_motion_mae_checkpoint_path
+
+RECOVERY_METRIC_LOG_NAMES = {
+    "fall_recovery/active_rate": "recovery/active_rate",
+    "fall_recovery/entry_rate": "recovery/entry_rate",
+    "fall_recovery/exit_rate": "recovery/exit_rate",
+    "fall_recovery/timeout_rate": "recovery/timeout_rate",
+    "fall_recovery/reference_time_scale_mean": "recovery/reference_time_scale_mean",
+    "tracking_quality/score_mean": "recovery/tracking_score_mean",
+}
+RECOVERY_ENTRY_RATE_KEY = "fall_recovery/entry_rate"
+RECOVERY_EXIT_RATE_KEY = "fall_recovery/exit_rate"
+RECOVERY_TIMEOUT_RATE_KEY = "fall_recovery/timeout_rate"
+RECOVERY_RATIO_EPS = 1.0e-8
 
 
 class OptimizerCollection(torch.optim.Optimizer):
@@ -259,6 +273,85 @@ class TrainRunner:
             WandbLogger.log_metrics(payload, self.global_step)
 
     @staticmethod
+    def _iter_metric_items(payload: Mapping[str, Any], prefix: str = ""):
+        for key, value in payload.items():
+            name = str(key)
+            metric_name = f"{prefix}/{name}" if prefix else name
+            if isinstance(value, Mapping):
+                yield from TrainRunner._iter_metric_items(value, metric_name)
+            else:
+                yield metric_name, value
+
+    @staticmethod
+    def _coerce_metric_scalar(value: Any) -> float | None:
+        try:
+            tensor = torch.as_tensor(value, dtype=torch.float32)
+        except (TypeError, ValueError):
+            return None
+        if tensor.numel() == 0:
+            return None
+        if tensor.device.type != "cpu":
+            tensor = tensor.detach().to(device="cpu")
+        if not torch.isfinite(tensor).all():
+            return None
+        return float(tensor.mean().item())
+
+    @classmethod
+    def _extract_recovery_metric_sample_from_mapping(cls, payload: Mapping[str, Any] | None) -> dict[str, float]:
+        if not isinstance(payload, Mapping):
+            return {}
+
+        sample: dict[str, float] = {}
+        for metric_name, value in cls._iter_metric_items(payload):
+            normalized_name = metric_name.strip("/")
+            for source_name in RECOVERY_METRIC_LOG_NAMES:
+                if normalized_name != source_name and not normalized_name.endswith(f"/{source_name}"):
+                    continue
+                scalar = cls._coerce_metric_scalar(value)
+                if scalar is not None:
+                    sample[source_name] = scalar
+                break
+        return sample
+
+    def _extract_recovery_metric_sample(self, info: Mapping[str, Any] | None) -> dict[str, float]:
+        sample = self._extract_recovery_metric_sample_from_mapping(info)
+        missing_source_names = set(RECOVERY_METRIC_LOG_NAMES) - set(sample)
+        if not missing_source_names:
+            return sample
+
+        extras = getattr(self.env.unwrapped, "extras", None)
+        extras_sample = self._extract_recovery_metric_sample_from_mapping(extras)
+        for source_name in missing_source_names:
+            if source_name in extras_sample:
+                sample[source_name] = extras_sample[source_name]
+        return sample
+
+    @staticmethod
+    def _build_recovery_metrics_payload(metric_samples: list[dict[str, float]]) -> dict[str, float]:
+        if not metric_samples:
+            return {}
+
+        payload: dict[str, float] = {}
+        for source_name, log_name in RECOVERY_METRIC_LOG_NAMES.items():
+            values = [sample[source_name] for sample in metric_samples if source_name in sample]
+            if values:
+                payload[log_name] = float(sum(values) / len(values))
+
+        entry_sum = sum(sample.get(RECOVERY_ENTRY_RATE_KEY, 0.0) for sample in metric_samples)
+        exit_sum = sum(sample.get(RECOVERY_EXIT_RATE_KEY, 0.0) for sample in metric_samples)
+        timeout_sum = sum(sample.get(RECOVERY_TIMEOUT_RATE_KEY, 0.0) for sample in metric_samples)
+        if any(
+            key in sample
+            for sample in metric_samples
+            for key in (RECOVERY_ENTRY_RATE_KEY, RECOVERY_EXIT_RATE_KEY, RECOVERY_TIMEOUT_RATE_KEY)
+        ):
+            denominator = max(entry_sum, RECOVERY_RATIO_EPS)
+            payload["recovery/exit_to_entry_ratio"] = float(exit_sum / denominator)
+            payload["recovery/timeout_to_entry_ratio"] = float(timeout_sum / denominator)
+
+        return payload
+
+    @staticmethod
     def _build_episode_metrics_payload(mean_return: float, mean_length: float) -> dict[str, float]:
         return {
             "episode/returns": float(mean_return),
@@ -455,12 +548,16 @@ class TrainRunner:
         return action, log_prob, value
 
     def rollout(self, obs):
+        recovery_metric_samples: list[dict[str, float]] = []
         for _ in range(self.steps):
             self.global_step += 1
             actor_obs = get_actor_observation(obs, self.actor_type)
             critic_obs = self._get_critic_observation(obs)
             action, log_prob, value = self.get_action(actor_obs, critic_obs)
-            next_obs, task_reward, terminate, timeout, _info = self.env.step(action)
+            next_obs, task_reward, terminate, timeout, info = self.env.step(action)
+            recovery_metric_sample = self._extract_recovery_metric_sample(info)
+            if recovery_metric_sample:
+                recovery_metric_samples.append(recovery_metric_sample)
             next_obs = structure_env_observation(
                 next_obs,
                 action_dim=self.cfg.action_space,
@@ -494,6 +591,10 @@ class TrainRunner:
 
             self.rollout_buffer.add_records(records)
             obs = next_obs
+
+        recovery_metrics_payload = self._build_recovery_metrics_payload(recovery_metric_samples)
+        if recovery_metrics_payload:
+            self._log_metrics(recovery_metrics_payload)
 
         actor_obs = get_actor_observation(obs, self.actor_type)
         critic_obs = self._get_critic_observation(obs)

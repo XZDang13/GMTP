@@ -32,9 +32,15 @@ def _write_sim2sim_checkpoint(
     anchor_body_name: str = "torso_link",
     robot_window_length: int = 1,
 ) -> Path:
+    resolved_motion_files = []
+    for raw_motion_file in motion_files or ["env/assests/115_06_stageii.npz"]:
+        motion_path = tmp_path / Path(raw_motion_file).name
+        motion_path.write_bytes(b"")
+        resolved_motion_files.append(str(motion_path))
+
     actor = FiLMResActor(
         robot_obs_dim=12 * robot_window_length,
-        motion_obs_dim=7,
+        motion_obs_dim=5,
         action_dim=2,
         num_blocks=4,
         robot_window_length=robot_window_length,
@@ -43,7 +49,7 @@ def _write_sim2sim_checkpoint(
     checkpoint = build_training_checkpoint(
         actor=actor,
         critic=critic,
-        motion_files=motion_files or ["env/assests/115_06_stageii.npz"],
+        motion_files=resolved_motion_files,
         joint_params={
             "joint_names": ["j0", "j1"],
             "joint_effort_limits": torch.ones(2),
@@ -85,7 +91,6 @@ def _make_flat_obs(step: int, bias: float) -> torch.Tensor:
         [
             target_projected_gravity,
             target_joint_pos,
-            target_joint_vel,
             robot_projected_gravity,
             anchor_ang_vel,
             robot_joint_pos,
@@ -147,13 +152,13 @@ class _FakeMujocoEnv:
         self.joint_pos_limits = torch.as_tensor(joint_pos_limits, dtype=torch.float32)
         self.action_offset = torch.as_tensor(action_offset, dtype=torch.float32)
         self.action_scale = torch.as_tensor(action_scale, dtype=torch.float32)
-        self.motion_file = expert_motion_file
+        self.motion_file = str(expert_motion_file)
         self.root_link_name = root_link_name
         self.anchor_body_name = anchor_body_name
         self.render = render
         self.action_mode = action_mode
         self.action_dim = int(self.action_offset.shape[0])
-        self.bias = 0.0 if "115_06" in expert_motion_file else 0.25
+        self.bias = 0.0 if "115_06" in self.motion_file else 0.25
         self.mj_viewer = types.SimpleNamespace(is_alive=True) if render else None
         self.mj_data = types.SimpleNamespace(
             qpos=torch.zeros(self.action_dim + 7, dtype=torch.float32),
@@ -277,6 +282,8 @@ def test_script_uses_checkpoint_defaults_and_render_on_by_default(tmp_path, monk
 
 def test_script_applies_motion_and_name_overrides_in_headless_mode(tmp_path, monkeypatch):
     checkpoint_path = _write_sim2sim_checkpoint(tmp_path)
+    override_motion_file = tmp_path / "120_01_stageii.npz"
+    override_motion_file.write_bytes(b"")
     module = _load_script_module("deploy_mujoco_overrides")
     monkeypatch.setattr(module, "get_mujoco_symbols", lambda: types.SimpleNamespace(MujocoEnv=_FakeMujocoEnv))
 
@@ -285,7 +292,7 @@ def test_script_applies_motion_and_name_overrides_in_headless_mode(tmp_path, mon
             "--checkpoint",
             str(checkpoint_path),
             "--motion-file",
-            "env/assests/120_01_stageii.npz",
+            str(override_motion_file),
             "--action-mode",
             "residual",
             "--root-name",

@@ -32,7 +32,6 @@ ObservationLayout = _OBSERVATION_SPEC.ObservationLayout
 _SIM2SIM_TERM_OUTPUT_NAMES = {
     "target_projected_gravity": "target_projected_gravity",
     "target_joint_pos": "target_joint_pos",
-    "target_joint_vel": "target_joint_vel",
     "projected_gravity": "robot_projected_gravity",
     "anchor_ang_vel_b": "anchor_ang_vel",
     "joint_pos": "robot_joint_pos",
@@ -418,12 +417,13 @@ def extract_sim2sim_actor_obs_from_mapping(
         action_dim=action_dim,
         observation_window_lengths=observation_window_lengths,
     )
-    return {
+    obs_parts = {
         "motion": motion_obs,
         "robot": robot_obs,
         "motion_obs": motion_obs,
         "robot_obs": robot_obs,
     }
+    return obs_parts
 
 
 def split_sim2sim_group_observations(
@@ -488,14 +488,19 @@ def split_sim2sim_group_observations(
 def build_sim2sim_obs_parts_from_context(context: Any) -> dict[str, torch.Tensor]:
     target_projected_gravity = _coerce_sim2sim_vector(context.target_projected_gravity, name="target_projected_gravity")
     target_joint_pos = _coerce_sim2sim_vector(context.target_joint_pos, name="target_joint_pos")
-    target_joint_vel = _coerce_sim2sim_vector(context.target_joint_vel, name="target_joint_vel")
+    target_joint_vel_raw = getattr(context, "target_joint_vel", None)
+    target_joint_vel = (
+        None
+        if target_joint_vel_raw is None
+        else _coerce_sim2sim_vector(target_joint_vel_raw, name="target_joint_vel")
+    )
     robot_projected_gravity = _coerce_sim2sim_vector(context.projected_gravity, name="projected_gravity")
     anchor_ang_vel = _coerce_sim2sim_vector(context.anchor_ang_vel_b, name="anchor_ang_vel_b")
     robot_joint_pos = _coerce_sim2sim_vector(context.joint_pos, name="joint_pos")
     robot_joint_vel = _coerce_sim2sim_vector(context.joint_vel, name="joint_vel")
     previous_action = _coerce_sim2sim_vector(context.previous_action, name="previous_action")
 
-    motion_obs = torch.cat((target_projected_gravity, target_joint_pos, target_joint_vel), dim=-1)
+    motion_obs = torch.cat((target_projected_gravity, target_joint_pos), dim=-1)
     robot_obs = torch.cat(
         (
             robot_projected_gravity,
@@ -506,28 +511,28 @@ def build_sim2sim_obs_parts_from_context(context: Any) -> dict[str, torch.Tensor
         ),
         dim=-1,
     )
-    return {
+    obs_parts = {
         "motion": motion_obs,
         "robot": robot_obs,
         "motion_obs": motion_obs,
         "robot_obs": robot_obs,
         "target_projected_gravity": target_projected_gravity,
         "target_joint_pos": target_joint_pos,
-        "target_joint_vel": target_joint_vel,
         "robot_projected_gravity": robot_projected_gravity,
         "anchor_ang_vel": anchor_ang_vel,
         "robot_joint_pos": robot_joint_pos,
         "robot_joint_vel": robot_joint_vel,
         "previous_action": previous_action,
     }
+    if target_joint_vel is not None:
+        obs_parts["target_joint_vel"] = target_joint_vel
+    return obs_parts
 
 
 def extract_sim2sim_metrics_from_parts(obs_parts: Mapping[str, torch.Tensor]) -> dict[str, float]:
     required_keys = (
         "target_joint_pos",
         "robot_joint_pos",
-        "target_joint_vel",
-        "robot_joint_vel",
         "target_projected_gravity",
         "robot_projected_gravity",
     )
@@ -537,7 +542,6 @@ def extract_sim2sim_metrics_from_parts(obs_parts: Mapping[str, torch.Tensor]) ->
 
     return {
         "joint_pos_mae": torch.mean(torch.abs(obs_parts["target_joint_pos"] - obs_parts["robot_joint_pos"])).item(),
-        "joint_vel_mae": torch.mean(torch.abs(obs_parts["target_joint_vel"] - obs_parts["robot_joint_vel"])).item(),
         "gravity_mae": torch.mean(
             torch.abs(obs_parts["target_projected_gravity"] - obs_parts["robot_projected_gravity"])
         ).item(),

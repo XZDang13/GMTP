@@ -23,9 +23,15 @@ def _write_sim2sim_checkpoint(
     anchor_body_name: str = "torso_link",
     robot_window_length: int = 1,
 ) -> Path:
+    resolved_motion_files = []
+    for raw_motion_file in motion_files or ["env/assests/115_06_stageii.npz"]:
+        motion_path = tmp_path / Path(raw_motion_file).name
+        motion_path.write_bytes(b"")
+        resolved_motion_files.append(str(motion_path))
+
     actor = FiLMResActor(
         robot_obs_dim=12 * robot_window_length,
-        motion_obs_dim=7,
+        motion_obs_dim=5,
         action_dim=2,
         num_blocks=4,
         robot_window_length=robot_window_length,
@@ -34,7 +40,7 @@ def _write_sim2sim_checkpoint(
     checkpoint = build_training_checkpoint(
         actor=actor,
         critic=critic,
-        motion_files=motion_files or ["env/assests/115_06_stageii.npz"],
+        motion_files=resolved_motion_files,
         joint_params={
             "joint_names": ["j0", "j1"],
             "joint_effort_limits": torch.ones(2),
@@ -76,7 +82,6 @@ def _make_flat_obs(step: int, bias: float) -> torch.Tensor:
         [
             target_projected_gravity,
             target_joint_pos,
-            target_joint_vel,
             robot_projected_gravity,
             anchor_ang_vel,
             robot_joint_pos,
@@ -139,13 +144,13 @@ class _FakeMujocoEnv:
         self.joint_pos_limits = torch.as_tensor(joint_pos_limits, dtype=torch.float32)
         self.action_offset = torch.as_tensor(action_offset, dtype=torch.float32)
         self.action_scale = torch.as_tensor(action_scale, dtype=torch.float32)
-        self.motion_file = expert_motion_file
+        self.motion_file = str(expert_motion_file)
         self.root_link_name = root_link_name
         self.anchor_body_name = anchor_body_name
         self.render = render
         self.action_mode = action_mode
         self.action_dim = int(self.action_offset.shape[0])
-        self.bias = 0.0 if "115_06" in expert_motion_file else 0.25
+        self.bias = 0.0 if "115_06" in self.motion_file else 0.25
         self.times = torch.zeros(1, dtype=torch.float32)
         self.target_pos = torch.zeros(self.action_dim, dtype=torch.float32)
         self.mj_model = object()
@@ -203,16 +208,20 @@ class _StructuredObsMujocoEnv(_FakeMujocoEnv):
         return eval_sim2sim.parse_sim2sim_obs(_make_flat_obs(step=self.step_count, bias=self.bias), action_dim=self.action_dim)
 
     def _build_observation_context(self, advance_time: bool = False):
-        parts = self._build_obs_parts()
+        metrics = _metric_values(self.bias)
+        target_projected_gravity = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32) + self.bias + self.step_count
+        target_joint_pos = torch.tensor([4.0, 5.0], dtype=torch.float32) + self.bias + self.step_count
+        target_joint_vel = torch.tensor([6.0, 7.0], dtype=torch.float32) + self.bias + self.step_count
+        robot_joint_pos = target_joint_pos + metrics["joint_pos_mae"]
         return types.SimpleNamespace(
-            target_projected_gravity=parts["target_projected_gravity"],
-            target_joint_pos=parts["target_joint_pos"],
-            target_joint_vel=parts["target_joint_vel"],
-            projected_gravity=parts["robot_projected_gravity"],
-            anchor_ang_vel_b=parts["anchor_ang_vel"],
-            joint_pos=parts["robot_joint_pos"],
-            joint_vel=parts["robot_joint_vel"],
-            previous_action=parts["previous_action"],
+            target_projected_gravity=target_projected_gravity,
+            target_joint_pos=target_joint_pos,
+            target_joint_vel=target_joint_vel,
+            projected_gravity=target_projected_gravity + metrics["gravity_mae"],
+            anchor_ang_vel_b=torch.tensor([8.0, 9.0, 10.0], dtype=torch.float32) + self.bias + self.step_count,
+            joint_pos=robot_joint_pos,
+            joint_vel=target_joint_vel + metrics["joint_vel_mae"],
+            previous_action=torch.tensor([11.0, 12.0], dtype=torch.float32) + self.step_count,
         )
 
     def get_obs_dict(self, advance_time: bool = False):
@@ -301,6 +310,8 @@ def test_sim2sim_runner_uses_checkpoint_defaults_until_overridden(tmp_path, monk
         lambda: types.SimpleNamespace(MujocoEnv=_FakeMujocoEnv),
     )
     checkpoint_path = _write_sim2sim_checkpoint(tmp_path)
+    override_motion_file = tmp_path / "120_01_stageii.npz"
+    override_motion_file.write_bytes(b"")
 
     runner = eval_sim2sim.Sim2SimEvalRunner(
         Sim2SimEvalConfig(
@@ -317,7 +328,7 @@ def test_sim2sim_runner_uses_checkpoint_defaults_until_overridden(tmp_path, monk
     override_runner = eval_sim2sim.Sim2SimEvalRunner(
         Sim2SimEvalConfig(
             checkpoint_path=str(checkpoint_path),
-            motion_files=["env/assests/120_01_stageii.npz"],
+            motion_files=[str(override_motion_file)],
             num_steps=1,
             action_mode="residual",
             root_name="pelvis",
@@ -413,7 +424,7 @@ def test_sim2sim_runner_restores_windowed_robot_obs_from_checkpoint_metadata(tmp
     summary = runner.evaluate()
 
     assert runner.observation_window_lengths == build_robot_policy_window_lengths(4)
-    assert runner.obs_dims == {"motion": 7, "robot": 48, "policy": 55}
+    assert runner.obs_dims == {"motion": 5, "robot": 48, "policy": 53}
     assert summary["motions"][0]["steps"] == 1
 
 
@@ -532,7 +543,6 @@ def test_sim2sim_runner_evaluate_writes_summary_debug_and_video(tmp_path, monkey
     expected_aggregate = {
         "gravity_mae": (_metric_values(0.0)["gravity_mae"] + _metric_values(0.25)["gravity_mae"]) / 2,
         "joint_pos_mae": (_metric_values(0.0)["joint_pos_mae"] + _metric_values(0.25)["joint_pos_mae"]) / 2,
-        "joint_vel_mae": (_metric_values(0.0)["joint_vel_mae"] + _metric_values(0.25)["joint_vel_mae"]) / 2,
     }
     assert summary["aggregate_metrics"] == pytest.approx(expected_aggregate)
 

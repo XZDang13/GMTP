@@ -15,7 +15,6 @@ DEFAULT_MOTION_WINDOW_LENGTH = 1
 MOTION_POLICY_OBSERVATION_TERM_IDS = (
     "target_projected_gravity",
     "target_joint_pos",
-    "target_joint_vel",
 )
 ROBOT_POLICY_OBSERVATION_TERM_IDS = (
     "projected_gravity",
@@ -29,7 +28,6 @@ ROBOT_POLICY_OBSERVATION_TERM_IDS = (
 DEFAULT_OBSERVATION_WINDOW_LENGTHS: dict[str, int] = {
     "target_projected_gravity": 1,
     "target_joint_pos": 1,
-    "target_joint_vel": 1,
     "projected_gravity": 1,
     "anchor_ang_vel_b": 1,
     "joint_pos": 1,
@@ -182,11 +180,6 @@ def build_gmtp_observation_spec(
                         id="target_joint_pos",
                         type="target_joint_pos",
                         window_length=_window_length("target_joint_pos", window_lengths),
-                    ),
-                    ObservationTermSpec(
-                        id="target_joint_vel",
-                        type="target_joint_vel",
-                        window_length=_window_length("target_joint_vel", window_lengths),
                     ),
                 ),
             ),

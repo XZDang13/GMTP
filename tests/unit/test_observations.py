@@ -28,9 +28,9 @@ def test_infer_env_observation_dims_requires_expected_keys():
 
 
 def test_infer_actor_observation_dims_from_state_dict_for_film_res_actor():
-    actor = FiLMResActor(robot_obs_dim=12, motion_obs_dim=7, action_dim=2, num_blocks=3)
+    actor = FiLMResActor(robot_obs_dim=12, motion_obs_dim=5, action_dim=2, num_blocks=3)
     dims = infer_actor_observation_dims_from_state_dict(actor.state_dict(), ActorType.FILM_RES)
-    assert dims == {"motion": 7, "robot": 12, "policy": 19}
+    assert dims == {"motion": 5, "robot": 12, "policy": 17}
 
 
 def test_parse_sim2sim_obs_and_extract_metrics():
@@ -41,8 +41,6 @@ def test_parse_sim2sim_obs_and_extract_metrics():
             0.3,
             1.0,
             2.0,
-            3.0,
-            4.0,
             0.4,
             0.5,
             0.6,
@@ -62,12 +60,12 @@ def test_parse_sim2sim_obs_and_extract_metrics():
     obs_parts = parse_sim2sim_obs(flat_obs, action_dim=2)
     metrics = extract_sim2sim_metrics(flat_obs, action_dim=2)
 
-    assert infer_sim2sim_observation_dims(2) == {"motion": 7, "robot": 12, "policy": 19}
-    assert obs_parts["motion"].shape == (7,)
+    assert infer_sim2sim_observation_dims(2) == {"motion": 5, "robot": 12, "policy": 17}
+    assert obs_parts["motion"].shape == (5,)
     assert obs_parts["robot"].shape == (12,)
-    assert obs_parts["motion_obs"].shape == (7,)
+    assert obs_parts["motion_obs"].shape == (5,)
     assert obs_parts["robot_obs"].shape == (12,)
-    assert set(("joint_pos_mae", "joint_vel_mae", "gravity_mae")).issubset(metrics)
+    assert set(("joint_pos_mae", "gravity_mae")).issubset(metrics)
 
 
 def test_parse_sim2sim_obs_supports_robot_window_lengths():
@@ -78,8 +76,6 @@ def test_parse_sim2sim_obs_supports_robot_window_lengths():
             0.3,
             1.0,
             2.0,
-            3.0,
-            4.0,
             0.4,
             0.5,
             0.6,
@@ -128,20 +124,20 @@ def test_parse_sim2sim_obs_supports_robot_window_lengths():
         observation_window_lengths=window_lengths,
     )
 
-    assert infer_sim2sim_observation_dims(2, window_lengths) == {"motion": 7, "robot": 48, "policy": 55}
-    assert obs_parts["motion"].shape == (7,)
+    assert infer_sim2sim_observation_dims(2, window_lengths) == {"motion": 5, "robot": 48, "policy": 53}
+    assert obs_parts["motion"].shape == (5,)
     assert obs_parts["robot"].shape == (4, 12)
     assert obs_parts["robot_obs"].shape == (4, 12)
     torch.testing.assert_close(obs_parts["target_joint_pos"], base_parts["target_joint_pos"])
     torch.testing.assert_close(obs_parts["robot_joint_vel"], base_parts["robot_joint_vel"])
-    assert set(("joint_pos_mae", "joint_vel_mae", "gravity_mae")).issubset(metrics)
+    assert set(("joint_pos_mae", "gravity_mae")).issubset(metrics)
 
 
 def test_extract_sim2sim_actor_obs_from_mapping_structures_windowed_robot_history():
     window_lengths = build_robot_policy_window_lengths(4)
     actor_obs = extract_sim2sim_actor_obs_from_mapping(
         {
-            "motion": torch.zeros(7, dtype=torch.float32),
+            "motion": torch.zeros(5, dtype=torch.float32),
             "robot": torch.arange(48, dtype=torch.float32),
         },
         action_dim=2,
@@ -149,7 +145,7 @@ def test_extract_sim2sim_actor_obs_from_mapping_structures_windowed_robot_histor
     )
 
     assert actor_obs is not None
-    assert actor_obs["motion"].shape == (7,)
+    assert actor_obs["motion"].shape == (5,)
     assert actor_obs["robot"].shape == (4, 12)
     assert actor_obs["robot_obs"].shape == (4, 12)
 
@@ -162,8 +158,6 @@ def test_parse_sim2sim_obs_supports_motion_window_lengths():
             0.3,
             1.0,
             2.0,
-            3.0,
-            4.0,
             0.4,
             0.5,
             0.6,
@@ -194,7 +188,6 @@ def test_parse_sim2sim_obs_supports_motion_window_lengths():
         [
             _history(base_parts["target_projected_gravity"], -1.0),
             _history(base_parts["target_joint_pos"], -2.0),
-            _history(base_parts["target_joint_vel"], -3.0),
         ]
     )
     windowed_flat_obs = torch.cat([windowed_motion, base_parts["robot"]])
@@ -210,19 +203,18 @@ def test_parse_sim2sim_obs_supports_motion_window_lengths():
         observation_window_lengths=window_lengths,
     )
 
-    assert infer_sim2sim_observation_dims(2, window_lengths) == {"motion": 28, "robot": 12, "policy": 40}
-    assert obs_parts["motion"].shape == (4, 7)
-    assert obs_parts["motion_obs"].shape == (4, 7)
+    assert infer_sim2sim_observation_dims(2, window_lengths) == {"motion": 20, "robot": 12, "policy": 32}
+    assert obs_parts["motion"].shape == (4, 5)
+    assert obs_parts["motion_obs"].shape == (4, 5)
     torch.testing.assert_close(obs_parts["target_joint_pos"], base_parts["target_joint_pos"])
-    torch.testing.assert_close(obs_parts["target_joint_vel"], base_parts["target_joint_vel"])
-    assert set(("joint_pos_mae", "joint_vel_mae", "gravity_mae")).issubset(metrics)
+    assert set(("joint_pos_mae", "gravity_mae")).issubset(metrics)
 
 
 def test_extract_sim2sim_actor_obs_from_mapping_structures_windowed_motion_history():
     window_lengths = build_motion_policy_window_lengths(4)
     actor_obs = extract_sim2sim_actor_obs_from_mapping(
         {
-            "motion": torch.arange(28, dtype=torch.float32),
+            "motion": torch.arange(20, dtype=torch.float32),
             "robot": torch.zeros(12, dtype=torch.float32),
         },
         action_dim=2,
@@ -230,15 +222,15 @@ def test_extract_sim2sim_actor_obs_from_mapping_structures_windowed_motion_histo
     )
 
     assert actor_obs is not None
-    assert actor_obs["motion"].shape == (4, 7)
-    assert actor_obs["motion_obs"].shape == (4, 7)
+    assert actor_obs["motion"].shape == (4, 5)
+    assert actor_obs["motion_obs"].shape == (4, 5)
     assert actor_obs["robot"].shape == (12,)
 
 
 def test_replace_sim2sim_group_latest_terms_updates_latest_window_only():
     window_lengths = build_robot_policy_window_lengths(4)
     robot_obs = parse_sim2sim_obs(
-        torch.arange(55, dtype=torch.float32),
+        torch.arange(53, dtype=torch.float32),
         action_dim=2,
         observation_window_lengths=window_lengths,
     )["robot"]
@@ -254,7 +246,7 @@ def test_replace_sim2sim_group_latest_terms_updates_latest_window_only():
         observation_window_lengths=window_lengths,
     )
     obs_parts = split_sim2sim_group_observations(
-        torch.zeros(7, dtype=torch.float32),
+        torch.zeros(5, dtype=torch.float32),
         updated_robot_obs,
         action_dim=2,
         observation_window_lengths=window_lengths,
@@ -268,7 +260,7 @@ def test_replace_sim2sim_group_latest_terms_updates_latest_window_only():
 def test_replace_sim2sim_group_latest_terms_updates_latest_motion_window_only():
     window_lengths = build_motion_policy_window_lengths(4)
     motion_obs = parse_sim2sim_obs(
-        torch.arange(40, dtype=torch.float32),
+        torch.arange(32, dtype=torch.float32),
         action_dim=2,
         observation_window_lengths=window_lengths,
     )["motion"]
@@ -292,7 +284,7 @@ def test_replace_sim2sim_group_latest_terms_updates_latest_motion_window_only():
 
     torch.testing.assert_close(obs_parts["target_projected_gravity"], torch.tensor([101.0, 102.0, 103.0]))
     torch.testing.assert_close(obs_parts["target_joint_pos"], torch.tensor([201.0, 202.0]))
-    assert updated_motion_obs.shape == (4, 7)
+    assert updated_motion_obs.shape == (4, 5)
 
 
 def test_resolve_action_mode_supports_current_residual():

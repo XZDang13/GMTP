@@ -27,8 +27,17 @@ from gmtp.runtime.checkpoints import build_training_checkpoint, load_checkpoint_
 from gmtp.runtime.config import IsaacEvalConfig, RunConfig, Sim2SimEvalConfig
 from gmtp.runtime.eval_isaac import IsaacEvalRunner
 from gmtp.runtime.train_runner import TrainRunner
+from gmtp.models.motion_encoder import build_motion_window_layout
 
 DEFAULT_TEST_MOTION_FILE = "env/assests/jump_anchor.npz"
+
+
+def _motion_obs_dim(motion_window_length: int = 1) -> int:
+    return build_motion_window_layout(2, motion_window_length).motion_obs_dim
+
+
+def _motion_step_dim(motion_window_length: int = 1) -> int:
+    return build_motion_window_layout(2, motion_window_length).motion_step_dim
 
 
 class _DummyTrainEnv:
@@ -38,9 +47,10 @@ class _DummyTrainEnv:
         self.batch_size = batch_size
         self.robot_window_length = int(robot_window_length)
         self.motion_window_length = int(motion_window_length)
-        self.motion_obs_dim = 7 * self.motion_window_length
+        self.motion_obs_dim = _motion_obs_dim(self.motion_window_length)
         self.robot_obs_dim = 12 * self.robot_window_length
         self.motion_lib = types.SimpleNamespace(body_names=("pelvis", "left_hand", "right_hand"))
+        self.extras = {}
         self.step_count = 0
         self.reference_motion = self._build_reference_motion()
 
@@ -98,13 +108,69 @@ class _DummyTrainEnv:
         return None
 
 
+def _recovery_metrics_for_step(step_count: int) -> dict[str, float]:
+    if step_count == 1:
+        return {
+            "active_rate": 0.2,
+            "entry_rate": 0.1,
+            "exit_rate": 0.05,
+            "timeout_rate": 0.0,
+            "reference_time_scale_mean": 0.9,
+            "score_mean": 1.5,
+        }
+    return {
+        "active_rate": 0.4,
+        "entry_rate": 0.3,
+        "exit_rate": 0.15,
+        "timeout_rate": 0.05,
+        "reference_time_scale_mean": 0.8,
+        "score_mean": 1.0,
+    }
+
+
+class _RecoveryInfoTrainEnv(_DummyTrainEnv):
+    def step(self, action):
+        obs, reward, terminate, timeout, _ = super().step(action)
+        metrics = _recovery_metrics_for_step(self.step_count)
+        info = {
+            "env": {
+                "fall_recovery": {
+                    "active_rate": torch.tensor([metrics["active_rate"]], dtype=torch.float32),
+                    "entry_rate": torch.tensor(metrics["entry_rate"], dtype=torch.float32),
+                    "exit_rate": torch.tensor(metrics["exit_rate"], dtype=torch.float32),
+                    "timeout_rate": torch.tensor(metrics["timeout_rate"], dtype=torch.float32),
+                    "reference_time_scale_mean": torch.tensor(metrics["reference_time_scale_mean"], dtype=torch.float32),
+                },
+                "tracking_quality": {
+                    "score_mean": torch.tensor(metrics["score_mean"], dtype=torch.float32),
+                },
+            }
+        }
+        return obs, reward, terminate, timeout, info
+
+
+class _RecoveryExtrasTrainEnv(_DummyTrainEnv):
+    def step(self, action):
+        obs, reward, terminate, timeout, _ = super().step(action)
+        metrics = _recovery_metrics_for_step(self.step_count)
+        self.extras = {
+            "fall_recovery/active_rate": torch.tensor(metrics["active_rate"], dtype=torch.float32),
+            "fall_recovery/entry_rate": torch.tensor(metrics["entry_rate"], dtype=torch.float32),
+            "fall_recovery/exit_rate": torch.tensor(metrics["exit_rate"], dtype=torch.float32),
+            "fall_recovery/timeout_rate": torch.tensor(metrics["timeout_rate"], dtype=torch.float32),
+            "fall_recovery/reference_time_scale_mean": torch.tensor(metrics["reference_time_scale_mean"], dtype=torch.float32),
+            "tracking_quality/score_mean": torch.tensor(metrics["score_mean"], dtype=torch.float32),
+        }
+        return obs, reward, terminate, timeout, {}
+
+
 def _window_length(window_lengths, prefix: str, default: int) -> int:
     if not window_lengths:
         return default
     return int(next((value for key, value in window_lengths.items() if str(key).startswith(prefix)), default))
 
 
-def _fake_train_module():
+def _fake_train_module(env_cls=_DummyTrainEnv):
     cfg = types.SimpleNamespace(
         scene=types.SimpleNamespace(num_envs=2),
         action_space=2,
@@ -119,7 +185,7 @@ def _fake_train_module():
     )
     return types.SimpleNamespace(
         make_training_env=lambda window_lengths=None: (
-            _DummyTrainEnv(
+            env_cls(
                 batch_size=2,
                 robot_window_length=_window_length(window_lengths, "projected_gravity", 4),
                 motion_window_length=_window_length(window_lengths, "target_projected_gravity", 1),
@@ -153,7 +219,7 @@ def _write_checkpoint(
     motion_obs_dim: int | None = None,
     motion_mae_encoder_checkpoint: str | None = None,
 ):
-    motion_obs_dim = motion_obs_dim if motion_obs_dim is not None else 7 * motion_window_length
+    motion_obs_dim = motion_obs_dim if motion_obs_dim is not None else _motion_obs_dim(motion_window_length)
     robot_obs_dim = 12 * robot_window_length
     actor = FiLMResActor(
         robot_obs_dim=robot_obs_dim,
@@ -204,23 +270,24 @@ def _write_sim2sim_checkpoint(tmp_path):
 
 
 def _motion_mae_schema() -> MotionFeatureSchema:
+    motion_step_dim = _motion_step_dim()
     return MotionFeatureSchema(
-        d_ref=7,
-        d_target=7,
-        full_feature_dim=7,
+        d_ref=motion_step_dim,
+        d_target=motion_step_dim,
+        full_feature_dim=motion_step_dim,
         base_slices=(
             FeatureSliceSpec("root", 0, 3),
-            FeatureSliceSpec("joint", 3, 7),
+            FeatureSliceSpec("joint", 3, motion_step_dim),
         ),
         reference_slices=(
             FeatureSliceSpec("root", 0, 3),
-            FeatureSliceSpec("joint", 3, 7),
+            FeatureSliceSpec("joint", 3, motion_step_dim),
         ),
         target_slices=(
             FeatureSliceSpec("root", 0, 3),
-            FeatureSliceSpec("joint", 3, 7),
+            FeatureSliceSpec("joint", 3, motion_step_dim),
         ),
-        policy_motion_slice=FeatureSliceSpec("policy_motion", 0, 7),
+        policy_motion_slice=FeatureSliceSpec("policy_motion", 0, motion_step_dim),
         anchor_body_name="pelvis",
         end_effector_body_names=("left_hand", "right_hand"),
         reference_feature_names=("root", "joint"),
@@ -228,17 +295,17 @@ def _motion_mae_schema() -> MotionFeatureSchema:
         policy_feature_names=("root", "joint"),
         joint_names=("j0", "j1"),
         body_names=("pelvis", "left_hand", "right_hand"),
-        reference_mean=tuple(0.0 for _ in range(7)),
-        reference_std=tuple(1.0 for _ in range(7)),
-        target_mean=tuple(0.0 for _ in range(7)),
-        target_std=tuple(1.0 for _ in range(7)),
+        reference_mean=tuple(0.0 for _ in range(motion_step_dim)),
+        reference_std=tuple(1.0 for _ in range(motion_step_dim)),
+        target_mean=tuple(0.0 for _ in range(motion_step_dim)),
+        target_std=tuple(1.0 for _ in range(motion_step_dim)),
     )
 
 
 def _write_motion_mae_encoder_checkpoint(tmp_path) -> Path:
     model = ReferenceMotionMAE(
-        input_dim=7,
-        target_dim=7,
+        input_dim=_motion_step_dim(),
+        target_dim=_motion_step_dim(),
         past_frames=4,
         future_frames=2,
         latent_dim=6,
@@ -445,10 +512,78 @@ def test_train_runner_rollout_updates_actor_statistics(monkeypatch):
 
     returned_obs = runner.rollout(runner.initial_obs)
 
-    assert returned_obs["motion"].shape == (2, 7)
+    assert returned_obs["motion"].shape == (2, _motion_step_dim())
     assert returned_obs["robot"].shape == (2, 4, 12)
-    assert runner.rollout_buffer.data["motion_observations"].shape[-1] == 7
+    assert runner.rollout_buffer.data["motion_observations"].shape[-1] == _motion_step_dim()
     assert runner.rollout_buffer.data["robot_observations"].shape[-2:] == (4, 12)
+    runner.env.close()
+
+
+def test_train_runner_logs_rollout_recovery_metrics_from_info(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module(_RecoveryInfoTrainEnv))
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=2,
+            num_updates=1,
+        )
+    )
+    logged_payloads = []
+    runner._log_metrics = lambda payload: logged_payloads.append(dict(payload))
+
+    runner.rollout(runner.initial_obs)
+
+    assert len(logged_payloads) == 1
+    assert logged_payloads[0] == pytest.approx(
+        {
+            "recovery/active_rate": 0.3,
+            "recovery/entry_rate": 0.2,
+            "recovery/exit_rate": 0.1,
+            "recovery/timeout_rate": 0.025,
+            "recovery/reference_time_scale_mean": 0.85,
+            "recovery/tracking_score_mean": 1.25,
+            "recovery/exit_to_entry_ratio": 0.5,
+            "recovery/timeout_to_entry_ratio": 0.125,
+        }
+    )
+    runner.env.close()
+
+
+def test_train_runner_logs_rollout_recovery_metrics_from_extras_fallback(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module(_RecoveryExtrasTrainEnv))
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=2,
+            num_updates=1,
+        )
+    )
+    logged_payloads = []
+    runner._log_metrics = lambda payload: logged_payloads.append(dict(payload))
+
+    runner.rollout(runner.initial_obs)
+
+    assert len(logged_payloads) == 1
+    assert logged_payloads[0]["recovery/active_rate"] == pytest.approx(0.3)
+    assert logged_payloads[0]["recovery/exit_to_entry_ratio"] == pytest.approx(0.5)
+    runner.env.close()
+
+
+def test_train_runner_skips_recovery_metric_log_when_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=1,
+            num_updates=1,
+        )
+    )
+    logged_payloads = []
+    runner._log_metrics = lambda payload: logged_payloads.append(dict(payload))
+
+    runner.rollout(runner.initial_obs)
+
+    assert logged_payloads == []
     runner.env.close()
 
 
@@ -467,10 +602,10 @@ def test_train_runner_supports_actor_integrated_motion_mae(tmp_path, monkeypatch
     )
 
     assert runner.motion_mae_encoder_checkpoint == str(motion_mae_checkpoint.resolve())
-    assert runner.obs_dims["motion"] == 28
+    assert runner.obs_dims["motion"] == _motion_obs_dim(4)
     returned_obs = runner.rollout(runner.initial_obs)
-    assert returned_obs["motion"].shape == (2, 4, 7)
-    assert runner.rollout_buffer.data["motion_observations"].shape[-2:] == (4, 7)
+    assert returned_obs["motion"].shape == (2, 4, _motion_step_dim())
+    assert runner.rollout_buffer.data["motion_observations"].shape[-2:] == (4, _motion_step_dim())
     runner.env.close()
 
 
@@ -587,7 +722,7 @@ def test_isaac_eval_runner_supports_actor_integrated_motion_mae(tmp_path, monkey
     summary = runner.evaluate()
 
     assert summary["motion_mae_encoder_checkpoint"] == str(motion_mae_checkpoint.resolve())
-    assert runner.obs_dims["motion"] == 28
+    assert runner.obs_dims["motion"] == _motion_obs_dim(4)
 
 
 @pytest.mark.skipif(pytest.importorskip("mujoco", reason="mujoco required") is None, reason="mujoco required")
