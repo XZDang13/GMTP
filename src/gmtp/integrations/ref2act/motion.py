@@ -9,7 +9,7 @@ MOTION_ASSET_DIR = PROJECT_ROOT / "env" / "assests"
 
 def _discover_default_experiment_motion_files() -> tuple[str, ...]:
     #motion_files = tuple(f"env/assests/{path.name}" for path in sorted(MOTION_ASSET_DIR.glob("*_anchor.npz")))
-    motion_files = ("env/assests/jump_anchor.npz",)
+    motion_files = ("env/assests/crawling.npz",)
     if not motion_files:
         raise FileNotFoundError(
             f"No default anchor motion files found under {MOTION_ASSET_DIR}. "

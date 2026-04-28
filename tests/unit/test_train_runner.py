@@ -50,3 +50,18 @@ def test_compute_anchor_reset_probabilities_aggregates_per_anchor_and_keeps_zero
         {"motion_name": "walk_anchor", "anchor_index": 0, "anchor_time": 1.5, "probability": 0.0},
     ]
     assert sum(entry["probability"] for entry in probabilities) == pytest.approx(1.0)
+
+
+def test_build_anchor_reset_probability_metrics_sanitizes_names_and_adds_max():
+    payload = TrainRunner._build_anchor_reset_probability_metrics(
+        [
+            {"motion_name": "jump/anchor 01", "anchor_index": 2, "anchor_time": 0.0, "probability": 0.25},
+            {"motion_name": "walk.anchor", "anchor_index": 0, "anchor_time": 1.0, "probability": 0.75},
+        ]
+    )
+
+    assert payload == {
+        "sampling/anchor_reset_probability/jump_anchor_01/A002": 0.25,
+        "sampling/anchor_reset_probability/walk.anchor/A000": 0.75,
+        "sampling/anchor_reset_probability/max": 0.75,
+    }

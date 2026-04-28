@@ -2,6 +2,8 @@ import torch
 
 from gmtp.integrations.ref2act.observation_history import build_robot_policy_window_lengths
 from gmtp.models import Critic, FiLMResActor
+from gmtp.models.motion_encoder import build_motion_window_layout
+from gmtp.models.robot_encoder import build_robot_window_layout
 from gmtp.runtime.checkpoints import (
     CHECKPOINT_VERSION,
     build_training_checkpoint,
@@ -23,9 +25,10 @@ def _joint_params(action_dim: int = 2):
 
 
 def _actor_obs_dims(action_dim: int, robot_window_length: int = 1) -> tuple[int, int]:
-    motion_obs_dim = 3 + 2 * action_dim
-    robot_step_dim = 6 + 3 * action_dim
-    return motion_obs_dim, robot_step_dim * robot_window_length
+    return (
+        build_motion_window_layout(action_dim, 1).motion_obs_dim,
+        build_robot_window_layout(action_dim, robot_window_length).robot_obs_dim,
+    )
 
 
 def test_checkpoint_v2_roundtrip(tmp_path):
@@ -67,6 +70,7 @@ def test_checkpoint_v2_roundtrip(tmp_path):
         "robot_encoder_type": "transformer",
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
+        "actor_fusion_type": "film",
     }
     assert loaded.env["action_mode"] == "offset"
     assert loaded.env["root_name"] == "torso_link"

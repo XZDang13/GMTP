@@ -36,6 +36,15 @@ def _add_motion_encoder_type_argument(parser: argparse.ArgumentParser, *, defaul
     )
 
 
+def _add_actor_fusion_type_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--actor-fusion-type",
+        choices=("film", "motion_residual", "concat_mlp"),
+        default="film",
+        help="Actor motion-fusion ablation. Default keeps the baseline FiLM-only actor.",
+    )
+
+
 def _add_disable_amp_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--disable-amp", action="store_true", help="Disable CUDA automatic mixed precision.")
 
@@ -54,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_robot_encoder_type_argument(train_parser, default="transformer")
     _add_motion_window_length_argument(train_parser, default=1)
     _add_motion_encoder_type_argument(train_parser, default="transformer")
+    _add_actor_fusion_type_argument(train_parser)
     _add_motion_mae_encoder_checkpoint_argument(train_parser)
     train_parser.add_argument("--rollout-steps", type=int, default=20)
     train_parser.add_argument("--num-updates", type=int, default=1000)
@@ -164,6 +174,7 @@ def _run_train(args) -> int:
                 robot_encoder_type=args.robot_encoder_type,
                 motion_window_length=args.motion_window_length,
                 motion_encoder_type=args.motion_encoder_type,
+                actor_fusion_type=args.actor_fusion_type,
                 motion_mae_encoder_checkpoint=args.motion_mae_encoder_checkpoint,
                 use_amp=not args.disable_amp,
                 rollout_steps=args.rollout_steps,

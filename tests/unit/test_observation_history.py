@@ -15,7 +15,7 @@ def test_build_gmtp_observation_spec_matches_default_dims():
     assert spec.describe(layout).group_dims == {
         "motion": 5,
         "robot": 12,
-        "privilege": 61,
+        "privilege": 67,
     }
 
 
@@ -38,7 +38,7 @@ def test_build_gmtp_observation_spec_applies_window_length_overrides():
     assert spec.describe(layout).group_dims == {
         "motion": 7,
         "robot": 16,
-        "privilege": 34,
+        "privilege": 40,
     }
 
 
@@ -53,7 +53,7 @@ def test_build_robot_policy_window_lengths_applies_uniform_robot_window():
     assert spec.describe(layout).group_dims == {
         "motion": 5,
         "robot": 48,
-        "privilege": 61,
+        "privilege": 67,
     }
 
 
@@ -83,7 +83,7 @@ def test_build_motion_policy_window_lengths_applies_uniform_motion_window():
     assert spec.describe(layout).group_dims == {
         "motion": 15,
         "robot": 12,
-        "privilege": 61,
+        "privilege": 67,
     }
 
 

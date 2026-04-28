@@ -358,6 +358,7 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.robot_encoder_type == "transformer"
     assert args.motion_window_length == 1
     assert args.motion_encoder_type == "transformer"
+    assert args.actor_fusion_type == "film"
     assert args.disable_amp is False
     assert args.disable_wandb is False
     assert args.motion_mae_encoder_checkpoint is None
@@ -367,6 +368,9 @@ def test_cli_parser_builds_train_and_eval_commands():
 
     args = parser.parse_args(["train", "--disable-amp"])
     assert args.disable_amp is True
+
+    args = parser.parse_args(["train", "--actor-fusion-type", "motion_residual"])
+    assert args.actor_fusion_type == "motion_residual"
 
     args = parser.parse_args(["eval", "isaac", "--checkpoint", "foo.pth", "--disable-amp"])
     assert args.command == "eval"
@@ -481,6 +485,7 @@ def test_train_runner_constructs_film_res_actor(monkeypatch):
         RunConfig(
             num_blocks=4,
             robot_encoder_type="cnn",
+            actor_fusion_type="motion_residual",
             use_wandb=False,
         )
     )
@@ -491,6 +496,7 @@ def test_train_runner_constructs_film_res_actor(monkeypatch):
         "robot_encoder_type": "cnn",
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
+        "actor_fusion_type": "motion_residual",
     }
     assert runner.observation_window_lengths == {
         **build_robot_policy_window_lengths(4),
@@ -624,6 +630,10 @@ def test_train_runner_update_smoke_uses_cpu_fallback(monkeypatch):
 
     assert runner.requested_amp is True
     assert runner.use_amp is False
+    assert hasattr(runner, "actor_optimizer")
+    assert hasattr(runner, "critic_optimizer")
+    assert runner.actor_optimizer is not runner.critic_optimizer
+    assert runner.lr_scheduler.optimizer is runner.actor_optimizer
     runner.env.close()
 
 
@@ -639,11 +649,16 @@ def test_train_runner_logs_anchor_probabilities_every_hundred_updates(monkeypatc
     runner._collect_anchor_reset_probabilities = lambda: [
         {"motion_name": "jump_anchor", "anchor_index": 0, "anchor_time": 0.0, "probability": 1.0}
     ]
+    logged_payloads = []
+    runner._log_metrics = logged_payloads.append
 
     capsys.readouterr()
     runner.rollout(runner.initial_obs)
     runner.update()
     assert "anchor reset probabilities after update" not in capsys.readouterr().out
+    assert not any(
+        "sampling/anchor_reset_probability/jump_anchor/A000" in payload for payload in logged_payloads
+    )
 
     runner.update_count = 99
     runner.rollout(runner.initial_obs)
@@ -653,6 +668,11 @@ def test_train_runner_logs_anchor_probabilities_every_hundred_updates(monkeypatc
     assert "anchor reset probabilities after update 100:" in output
     assert "motion=jump_anchor" in output
     assert "A0 t=0.000s p=1.000000" in output
+    assert any(
+        payload.get("sampling/anchor_reset_probability/jump_anchor/A000") == 1.0
+        and payload.get("sampling/anchor_reset_probability/max") == 1.0
+        for payload in logged_payloads
+    )
     runner.env.close()
 
 

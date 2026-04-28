@@ -2,11 +2,19 @@ import pytest
 import torch
 import torch.nn as nn
 
-from gmtp.models import Critic, FiLMResActor, build_actor, get_actor_kwargs, infer_film_res_blocks
+from gmtp.models import (
+    Critic,
+    FiLMResActor,
+    build_actor,
+    get_actor_kwargs,
+    infer_actor_fusion_type,
+    infer_film_res_blocks,
+)
 from gmtp.models.actor import ACTOR_HIDDEN_DIM
+from gmtp.models.critic import CRITIC_GROUP_HIDDEN_DIM, CRITIC_HIDDEN_DIM, build_critic_privilege_layout
 from gmtp.models.film import FiLMResStack
-from gmtp.models.motion_encoder import MOTION_ENCODER_OUTPUT_DIM
-from gmtp.models.robot_encoder import ROBOT_ENCODER_HIDDEN_DIM, ROBOT_ENCODER_OUTPUT_DIM
+from gmtp.models.motion_encoder import MOTION_ENCODER_OUTPUT_DIM, build_motion_window_layout
+from gmtp.models.robot_encoder import ROBOT_ENCODER_HIDDEN_DIM, ROBOT_ENCODER_OUTPUT_DIM, build_robot_window_layout
 from gmtp.motion_mae import (
     FeatureSliceSpec,
     MotionFeatureSchema,
@@ -44,9 +52,9 @@ def _actor_obs_dims(
     robot_window_length: int = 1,
     motion_window_length: int = 1,
 ) -> tuple[int, int]:
-    motion_step_dim = 3 + 2 * action_dim
-    robot_step_dim = 6 + 3 * action_dim
-    return motion_step_dim * motion_window_length, robot_step_dim * robot_window_length
+    motion_dim = build_motion_window_layout(action_dim, motion_window_length).motion_obs_dim
+    robot_dim = build_robot_window_layout(action_dim, robot_window_length).robot_obs_dim
+    return motion_dim, robot_dim
 
 
 def _motion_mae_schema(
@@ -58,7 +66,7 @@ def _motion_mae_schema(
 ) -> MotionFeatureSchema:
     base_dims = {
         "root": 3,
-        "joint": 2 * action_dim,
+        "joint": action_dim,
         "end_effector": 6,
     }
     base_slices = []
@@ -196,6 +204,9 @@ def test_film_res_actor_defaults_to_four_blocks_and_512_width():
     )
 
     assert actor.num_blocks == 4
+    assert actor.actor_fusion_type == "film"
+    assert not hasattr(actor, "motion_skip")
+    assert not hasattr(actor, "fusion_mlp")
     assert len(actor.blocks) == 4
     assert actor.motion_encoder.motion_encoder_type == "mlp"
     assert actor.motion_encoder.single_frame_encoder[0].linear.out_features == MOTION_ENCODER_OUTPUT_DIM
@@ -218,11 +229,13 @@ def test_build_actor_constructs_film_res_with_requested_depth():
             "robot_encoder_type": "cnn",
             "motion_window_length": 4,
             "motion_encoder_type": "transformer",
+            "actor_fusion_type": "concat_mlp",
         },
     )
 
     assert isinstance(actor, FiLMResActor)
     assert actor.num_blocks == 4
+    assert actor.actor_fusion_type == "concat_mlp"
     assert len(actor.blocks) == 4
     assert get_actor_kwargs(actor, "film_res") == {
         "num_blocks": 4,
@@ -230,8 +243,58 @@ def test_build_actor_constructs_film_res_with_requested_depth():
         "robot_encoder_type": "cnn",
         "motion_window_length": 4,
         "motion_encoder_type": "transformer",
+        "actor_fusion_type": "concat_mlp",
     }
     assert infer_film_res_blocks(actor.state_dict()) == 4
+    assert infer_actor_fusion_type(actor.state_dict()) == "concat_mlp"
+
+
+def test_film_res_actor_supports_motion_residual_fusion():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        actor_fusion_type="motion_residual",
+    )
+    step = actor(
+        {
+            "robot_obs": torch.randn(3, robot_obs_dim),
+            "motion_obs": torch.randn(3, motion_obs_dim),
+        }
+    )
+
+    assert actor.actor_fusion_type == "motion_residual"
+    assert actor.motion_skip.in_features == ACTOR_HIDDEN_DIM
+    assert actor.motion_skip.out_features == ACTOR_HIDDEN_DIM
+    assert actor.motion_skip_scale.shape == (ACTOR_HIDDEN_DIM,)
+    assert infer_actor_fusion_type(actor.state_dict()) == "motion_residual"
+    assert step.action.shape == (3, 2)
+    assert step.log_prob.shape == (3,)
+
+
+def test_film_res_actor_supports_concat_mlp_fusion():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        actor_fusion_type="concat_mlp",
+    )
+    step = actor(
+        {
+            "robot_obs": torch.randn(3, robot_obs_dim),
+            "motion_obs": torch.randn(3, motion_obs_dim),
+        }
+    )
+
+    assert actor.actor_fusion_type == "concat_mlp"
+    assert actor.fusion_mlp[0].linear.in_features == ACTOR_HIDDEN_DIM * 2
+    assert actor.fusion_mlp[0].linear.out_features == ACTOR_HIDDEN_DIM
+    assert actor.fusion_mlp[-1].linear.out_features == ACTOR_HIDDEN_DIM
+    assert infer_actor_fusion_type(actor.state_dict()) == "concat_mlp"
+    assert step.action.shape == (3, 2)
+    assert step.log_prob.shape == (3,)
 
 
 def test_film_res_actor_reshapes_windowed_robot_obs_from_ref2act_layout():
@@ -316,7 +379,7 @@ def test_film_res_actor_windowed_motion_encoder_supports_transformer_mode():
     assert isinstance(actor.motion_encoder.window_encoder.transformer, nn.TransformerEncoder)
     assert isinstance(actor.motion_encoder.window_encoder.input_proj, nn.Linear)
     assert actor.motion_encoder.window_encoder.output_proj.out_features == MOTION_ENCODER_OUTPUT_DIM
-    assert actor.motion_obs_normlizer.mean.shape == (4, 7)
+    assert actor.motion_obs_normlizer.mean.shape == (4, actor.motion_step_dim)
 
 
 def test_film_res_actor_single_frame_motion_forces_mlp_mode():
@@ -392,7 +455,7 @@ def test_film_res_actor_forward_supports_windowed_motion_obs_with_transformer_en
     step = actor(
         {
             "robot_obs": torch.randn(3, robot_obs_dim),
-            "motion_obs": torch.randn(3, 4, 7),
+            "motion_obs": torch.randn(3, 4, actor.motion_step_dim),
         }
     )
 
@@ -416,7 +479,7 @@ def test_film_res_actor_forward_supports_windowed_motion_obs_with_mae_encoder(tm
     step = actor(
         {
             "robot_obs": torch.randn(3, robot_obs_dim),
-            "motion_obs": torch.randn(3, 4, 7),
+            "motion_obs": torch.randn(3, 4, actor.motion_step_dim),
         }
     )
 
@@ -508,17 +571,71 @@ def test_film_res_actor_forward_supports_single_frame_robot_obs():
     assert actor.robot_obs_normlizer.mean.shape == (robot_obs_dim,)
 
 
-def test_critic_uses_512_width_and_four_hidden_layers():
-    critic = Critic(obs_dim=5)
+def test_critic_uses_flat_fallback_for_unknown_privilege_layout():
+    critic = Critic(obs_dim=5, action_dim=2)
     step = critic(torch.randn(4, 5))
 
+    assert critic.critic_type == "flat"
+    assert critic.privilege_layout is None
     assert len(critic.encoder) == 4
-    assert critic.encoder[0].linear.out_features == 512
-    assert critic.encoder[1].linear.in_features == 512
-    assert critic.encoder[1].linear.out_features == 512
-    assert critic.encoder[2].linear.out_features == 512
-    assert critic.encoder[3].linear.out_features == 512
-    assert critic.head.critic_layer.in_features == 512
+    assert critic.encoder[0].linear.out_features == CRITIC_HIDDEN_DIM
+    assert critic.encoder[1].linear.in_features == CRITIC_HIDDEN_DIM
+    assert critic.encoder[1].linear.out_features == CRITIC_HIDDEN_DIM
+    assert critic.encoder[2].linear.out_features == CRITIC_HIDDEN_DIM
+    assert critic.encoder[3].linear.out_features == CRITIC_HIDDEN_DIM
+    assert critic.head.critic_layer.in_features == CRITIC_HIDDEN_DIM
+    assert step.value.shape == (4,)
+
+
+def test_critic_privilege_layout_uses_ref2act_term_order_and_contiguous_slices():
+    layout = build_critic_privilege_layout(2)
+
+    assert layout.obs_dim == 31
+    assert tuple(term.term_id for term in layout.terms) == (
+        "priv_target_projected_gravity",
+        "priv_target_joint_pos",
+        "priv_target_joint_vel",
+        "relative_anchor_pos",
+        "relative_anchor_tangent_and_normal",
+        "relative_key_pos",
+        "relative_key_tangent_and_normal",
+        "priv_projected_gravity",
+        "anchor_lin_vel",
+        "priv_anchor_ang_vel_b",
+        "priv_joint_pos",
+        "priv_joint_vel",
+        "priv_previous_action",
+    )
+
+    offset = 0
+    for term in layout.terms:
+        assert term.flat_slice.start == offset
+        assert term.flat_slice.stop == offset + term.flat_dim
+        offset = term.flat_slice.stop
+    assert offset == layout.obs_dim
+
+    assert layout.group("target").obs_dim == 7
+    assert layout.group("geometry").obs_dim == 9
+    assert layout.group("robot").obs_dim == 15
+
+
+def test_structured_critic_encodes_privilege_groups_before_fusion():
+    layout = build_critic_privilege_layout(2)
+    critic = Critic(obs_dim=layout.obs_dim, action_dim=2)
+    step = critic(torch.randn(4, layout.obs_dim))
+
+    assert critic.critic_type == "structured"
+    assert critic.privilege_layout is not None
+    assert critic.privilege_layout.obs_dim == layout.obs_dim
+    assert critic.target_encoder[0].linear.in_features == layout.group("target").obs_dim
+    assert critic.target_encoder[-1].linear.out_features == CRITIC_GROUP_HIDDEN_DIM
+    assert critic.geometry_encoder[0].linear.in_features == layout.group("geometry").obs_dim
+    assert critic.geometry_encoder[-1].linear.out_features == CRITIC_GROUP_HIDDEN_DIM
+    assert critic.robot_encoder[0].linear.in_features == layout.group("robot").obs_dim
+    assert critic.robot_encoder[-1].linear.out_features == CRITIC_GROUP_HIDDEN_DIM
+    assert critic.fusion_encoder[0].linear.in_features == len(layout.groups) * CRITIC_GROUP_HIDDEN_DIM
+    assert critic.fusion_encoder[0].linear.out_features == CRITIC_HIDDEN_DIM
+    assert critic.head.critic_layer.in_features == CRITIC_HIDDEN_DIM
     assert step.value.shape == (4,)
 
 
@@ -578,7 +695,7 @@ def test_checkpoint_spec_preserves_num_blocks():
     checkpoint = build_training_checkpoint(
         actor=actor,
         critic=critic,
-        motion_files=["env/assests/115_06_stageii.npz"],
+        motion_files=["env/assests/jump_anchor.npz"],
         joint_params=_joint_params(),
         action_mode="offset",
         root_name="torso_link",
@@ -594,6 +711,7 @@ def test_checkpoint_spec_preserves_num_blocks():
         "robot_encoder_type": "mlp",
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
+        "actor_fusion_type": "film",
     }
 
 
@@ -604,7 +722,7 @@ def test_checkpoint_override_replaces_num_blocks():
     checkpoint = build_training_checkpoint(
         actor=actor,
         critic=critic,
-        motion_files=["env/assests/115_06_stageii.npz"],
+        motion_files=["env/assests/jump_anchor.npz"],
         joint_params=_joint_params(),
         action_mode="offset",
         root_name="torso_link",
@@ -620,6 +738,7 @@ def test_checkpoint_override_replaces_num_blocks():
         "robot_encoder_type": "mlp",
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
+        "actor_fusion_type": "film",
     }
 
 
@@ -646,7 +765,59 @@ def test_checkpoint_spec_defaults_motion_and_robot_window_lengths_when_missing()
         "robot_encoder_type": "mlp",
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
+        "actor_fusion_type": "film",
     }
+
+
+def test_checkpoint_spec_restores_actor_fusion_type_from_meta():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=3)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=3,
+        num_blocks=2,
+        actor_fusion_type="motion_residual",
+    )
+    critic = Critic(obs_dim=3)
+    checkpoint = CheckpointV2(
+        meta={"actor_type": "film_res", "actor_kwargs": {"num_blocks": 2, "actor_fusion_type": "motion_residual"}},
+        model={
+            "actor": actor.state_dict(),
+            "critic": critic.state_dict(),
+        },
+        env={},
+        artifacts={},
+    )
+
+    actor_type, actor_kwargs = resolve_checkpoint_actor_spec(checkpoint)
+
+    assert actor_type.value == "film_res"
+    assert actor_kwargs["actor_fusion_type"] == "motion_residual"
+
+
+def test_checkpoint_spec_infers_actor_fusion_type_from_state_dict_when_meta_missing():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=3)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=3,
+        num_blocks=2,
+        actor_fusion_type="concat_mlp",
+    )
+    critic = Critic(obs_dim=3)
+    checkpoint = CheckpointV2(
+        meta={"actor_type": "film_res", "actor_kwargs": {"num_blocks": 2}},
+        model={
+            "actor": actor.state_dict(),
+            "critic": critic.state_dict(),
+        },
+        env={},
+        artifacts={},
+    )
+
+    _, actor_kwargs = resolve_checkpoint_actor_spec(checkpoint)
+
+    assert actor_kwargs["actor_fusion_type"] == "concat_mlp"
 
 
 def test_load_actor_from_checkpoint_restores_film_res_weights():
@@ -681,6 +852,7 @@ def test_load_actor_from_checkpoint_restores_film_res_weights():
         "robot_encoder_type": "mlp",
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
+        "actor_fusion_type": "film",
     }
     torch.testing.assert_close(
         loaded_actor.state_dict()["stack.blocks.0.res_scale"],

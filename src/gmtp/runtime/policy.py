@@ -7,7 +7,9 @@ import torch
 from gmtp.models import (
     ActorType,
     build_actor,
+    infer_actor_fusion_type,
     infer_film_res_blocks,
+    normalize_actor_fusion_type,
     normalize_actor_type,
 )
 from gmtp.models.motion_encoder import MotionEncoderType, normalize_motion_encoder_type
@@ -57,6 +59,7 @@ def resolve_checkpoint_actor_spec(
         "motion_encoder_type",
         motion_encoder_type_override or MotionEncoderType.TRANSFORMER.value,
     )
+    actor_fusion_type = checkpoint_actor_kwargs.get("actor_fusion_type", infer_actor_fusion_type(actor_weights))
     actor_kwargs = {
         "num_blocks": int(
             num_blocks
@@ -75,6 +78,7 @@ def resolve_checkpoint_actor_spec(
             if motion_window_length == 1
             else normalize_motion_encoder_type(motion_encoder_type_override or requested_motion_encoder_type)
         ),
+        "actor_fusion_type": str(normalize_actor_fusion_type(actor_fusion_type)),
     }
     return actor_type, actor_kwargs
 

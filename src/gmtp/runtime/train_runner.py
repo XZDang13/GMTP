@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,8 @@ RECOVERY_ENTRY_RATE_KEY = "fall_recovery/entry_rate"
 RECOVERY_EXIT_RATE_KEY = "fall_recovery/exit_rate"
 RECOVERY_TIMEOUT_RATE_KEY = "fall_recovery/timeout_rate"
 RECOVERY_RATIO_EPS = 1.0e-8
+PPO_CLIP_RATIO = 0.2
+ENTROPY_COEF = 0.005
 
 
 class OptimizerCollection(torch.optim.Optimizer):
@@ -149,20 +152,18 @@ class TrainRunner:
             device=self.device,
         ).to(self.device)
         self.actor_kwargs = get_actor_kwargs(self.actor, self.actor_type)
-        self.critic = Critic(self.obs_dims["critic"]).to(self.device)
+        self.critic = Critic(self.obs_dims["critic"], action_dim=self.cfg.action_space).to(self.device)
 
-        muon_groups, adamw_groups, optimizer_stats = self._split_optimizer_param_groups(
-            {"actor": self.actor, "critic": self.critic},
+        self.actor_optimizer, actor_optimizer_stats = self._build_optimizer_collection(
+            {"actor": self.actor},
             prefer_muon=self.device.type == "cuda",
         )
-        optimizers = []
-        if muon_groups:
-            optimizers.append(torch.optim.Muon(muon_groups, lr=1e-3, weight_decay=0.0))
-        if adamw_groups:
-            optimizers.append(torch.optim.AdamW(adamw_groups, lr=1e-3, weight_decay=0.0))
-        self.ac_optimizer = OptimizerCollection(*optimizers)
+        self.critic_optimizer, critic_optimizer_stats = self._build_optimizer_collection(
+            {"critic": self.critic},
+            prefer_muon=self.device.type == "cuda",
+        )
         self.grad_scaler = build_grad_scaler(self.use_amp)
-        self.lr_scheduler = KLAdaptiveLR(self.ac_optimizer, 0.01)
+        self.lr_scheduler = KLAdaptiveLR(self.actor_optimizer, 0.01)
 
         self.rollout_buffer = ReplayBuffer(self.cfg.scene.num_envs, self.steps)
         self.policy_storage_specs = get_policy_storage_specs(
@@ -197,15 +198,27 @@ class TrainRunner:
         self.tracker.add_list_metrics("entropy_loss")
         self.tracker.add_list_metrics("kl_divergence")
         self.tracker.add_list_metrics("value_loss")
+        self.tracker.add_list_metrics("policy_clip_fraction")
+        self.tracker.add_list_metrics("action_log_std")
+        self.tracker.add_list_metrics("action_std")
+        self.tracker.add_list_metrics("advantage_mean")
+        self.tracker.add_list_metrics("advantage_std")
+        self.tracker.add_list_metrics("value_explained_variance")
+        self.tracker.add_list_metrics("value_clip_fraction")
 
         self.use_wandb = bool(config.use_wandb)
         if self.use_wandb:
             WandbLogger.init_project("Mimic", self.run_name)
 
         print(
-            "optimizer split:",
-            f"Muon={optimizer_stats['muon_tensors']} tensors / {optimizer_stats['muon_numel']} params,",
-            f"AdamW={optimizer_stats['adamw_tensors']} tensors / {optimizer_stats['adamw_numel']} params",
+            "actor optimizer split:",
+            f"Muon={actor_optimizer_stats['muon_tensors']} tensors / {actor_optimizer_stats['muon_numel']} params,",
+            f"AdamW={actor_optimizer_stats['adamw_tensors']} tensors / {actor_optimizer_stats['adamw_numel']} params",
+        )
+        print(
+            "critic optimizer split:",
+            f"Muon={critic_optimizer_stats['muon_tensors']} tensors / {critic_optimizer_stats['muon_numel']} params,",
+            f"AdamW={critic_optimizer_stats['adamw_tensors']} tensors / {critic_optimizer_stats['adamw_numel']} params",
         )
 
     def _build_actor_kwargs(self) -> dict[str, int | str]:
@@ -215,6 +228,7 @@ class TrainRunner:
             "robot_encoder_type": self.config.robot_encoder_type,
             "motion_window_length": self.config.motion_window_length,
             "motion_encoder_type": self.config.motion_encoder_type,
+            "actor_fusion_type": self.config.actor_fusion_type,
         }
 
     @staticmethod
@@ -267,6 +281,30 @@ class TrainRunner:
                 adamw_groups.append({"params": adamw_params, "name": f"{module_name}_adamw"})
 
         return muon_groups, adamw_groups, stats
+
+    @classmethod
+    def _build_optimizer_collection(
+        cls,
+        modules: dict[str, torch.nn.Module],
+        *,
+        prefer_muon: bool = True,
+    ) -> tuple[OptimizerCollection, dict[str, int]]:
+        muon_groups, adamw_groups, stats = cls._split_optimizer_param_groups(
+            modules,
+            prefer_muon=prefer_muon,
+        )
+        optimizers = []
+        if muon_groups:
+            optimizers.append(torch.optim.Muon(muon_groups, lr=1e-3, weight_decay=0.0))
+        if adamw_groups:
+            optimizers.append(torch.optim.AdamW(adamw_groups, lr=1e-3, weight_decay=0.0))
+        return OptimizerCollection(*optimizers), stats
+
+    @staticmethod
+    def _optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
+        if not optimizer.param_groups:
+            return 0.0
+        return float(optimizer.param_groups[0]["lr"])
 
     def _log_metrics(self, payload: dict[str, float]) -> None:
         if self.use_wandb:
@@ -359,6 +397,11 @@ class TrainRunner:
         }
 
     @staticmethod
+    def _sanitize_metric_component(value: str) -> str:
+        sanitized = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(value)).strip("_")
+        return sanitized or "unknown"
+
+    @staticmethod
     def _build_guarded_sampling_probabilities(
         fail_counts: torch.Tensor,
         sample_counts: torch.Tensor,
@@ -432,7 +475,13 @@ class TrainRunner:
         bin_sample_counts = getattr(sampler, "bin_sample_counts", None)
         bin_reset_eligible = getattr(sampler, "bin_reset_eligible", None)
         bin_reset_times = getattr(sampler, "bin_reset_times", None)
-        if not clips or bin_fail_counts is None or bin_sample_counts is None or bin_reset_eligible is None or bin_reset_times is None:
+        if (
+            not clips
+            or bin_fail_counts is None
+            or bin_sample_counts is None
+            or bin_reset_eligible is None
+            or bin_reset_times is None
+        ):
             return []
 
         uniform_mix = float(getattr(sampler, "failure_weight_uniform_mix", 0.0))
@@ -500,6 +549,23 @@ class TrainRunner:
             temperature=float(getattr(self.cfg, "failure_temperature", 1.0)),
         )
 
+    @classmethod
+    def _build_anchor_reset_probability_metrics(
+        cls,
+        anchor_probabilities: list[dict[str, float | int | str]],
+    ) -> dict[str, float]:
+        payload: dict[str, float] = {}
+        max_probability = 0.0
+        for entry in anchor_probabilities:
+            motion_name = cls._sanitize_metric_component(str(entry["motion_name"]))
+            anchor_index = int(entry["anchor_index"])
+            probability = float(entry["probability"])
+            payload[f"sampling/anchor_reset_probability/{motion_name}/A{anchor_index:03d}"] = probability
+            max_probability = max(max_probability, probability)
+        if payload:
+            payload["sampling/anchor_reset_probability/max"] = max_probability
+        return payload
+
     def _log_anchor_reset_probabilities(self) -> None:
         anchor_probabilities = self._collect_anchor_reset_probabilities()
         if not anchor_probabilities:
@@ -517,6 +583,9 @@ class TrainRunner:
                 f"p={float(entry['probability']):.6f}",
                 flush=True,
             )
+        metrics_payload = self._build_anchor_reset_probability_metrics(anchor_probabilities)
+        if metrics_payload:
+            self._log_metrics(metrics_payload)
 
     @staticmethod
     def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -617,6 +686,13 @@ class TrainRunner:
         self.tracker.reset("entropy_loss")
         self.tracker.reset("kl_divergence")
         self.tracker.reset("value_loss")
+        self.tracker.reset("policy_clip_fraction")
+        self.tracker.reset("action_log_std")
+        self.tracker.reset("action_std")
+        self.tracker.reset("advantage_mean")
+        self.tracker.reset("advantage_std")
+        self.tracker.reset("value_explained_variance")
+        self.tracker.reset("value_clip_fraction")
 
         for _ in range(5):
             batch_iter = self.rollout_buffer.sample_batchs(self.batch_keys, 4096 * 10)
@@ -637,7 +713,7 @@ class TrainRunner:
                         policy_obs_batch,
                         action_batch,
                         advantage_batch,
-                        0.2,
+                        PPO_CLIP_RATIO,
                         0.0,
                     )
                     value_loss_dict = PPO.compute_clipped_value_loss(
@@ -645,35 +721,48 @@ class TrainRunner:
                         critic_obs_batch,
                         value_batch,
                         return_batch,
-                        0.2,
+                        PPO_CLIP_RATIO,
                     )
 
                     policy_loss = policy_loss_dict["loss"]
                     entropy = policy_loss_dict["entropy"]
                     kl_divergence = policy_loss_dict["kl_divergence"]
                     value_loss = value_loss_dict["loss"]
-                    ac_loss = policy_loss - entropy * 0.005 + value_loss
+                    actor_loss = policy_loss - entropy * ENTROPY_COEF
+                    critic_loss = value_loss
+                    ac_loss = actor_loss + critic_loss
 
-                self.ac_optimizer.zero_grad(set_to_none=True)
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                self.critic_optimizer.zero_grad(set_to_none=True)
                 if self.use_amp:
                     self.grad_scaler.scale(ac_loss).backward()
-                    self.grad_scaler.unscale_(self.ac_optimizer)
+                    self.grad_scaler.unscale_(self.actor_optimizer)
+                    self.grad_scaler.unscale_(self.critic_optimizer)
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                    self.grad_scaler.step(self.ac_optimizer)
+                    self.grad_scaler.step(self.actor_optimizer)
+                    self.grad_scaler.step(self.critic_optimizer)
                     self.grad_scaler.update()
                 else:
                     ac_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                    self.ac_optimizer.step()
-                self.lr_scheduler.set_kl(kl_divergence)
+                    self.actor_optimizer.step()
+                    self.critic_optimizer.step()
+                self.lr_scheduler.set_kl(float(kl_divergence.detach().to(device="cpu", dtype=torch.float32).item()))
                 self.lr_scheduler.step()
 
                 self.tracker.add_values("policy_loss", policy_loss)
                 self.tracker.add_values("entropy_loss", entropy)
                 self.tracker.add_values("kl_divergence", kl_divergence)
                 self.tracker.add_values("value_loss", value_loss)
+                self.tracker.add_values("policy_clip_fraction", policy_loss_dict["policy_clip_fraction"])
+                self.tracker.add_values("action_log_std", policy_loss_dict["action_log_std"])
+                self.tracker.add_values("action_std", policy_loss_dict["action_std"])
+                self.tracker.add_values("advantage_mean", policy_loss_dict["advantage_mean"])
+                self.tracker.add_values("advantage_std", policy_loss_dict["advantage_std"])
+                self.tracker.add_values("value_explained_variance", value_loss_dict["value_explained_variance"])
+                self.tracker.add_values("value_clip_fraction", value_loss_dict["value_clip_fraction"])
 
         self._log_metrics(
             {
@@ -681,6 +770,15 @@ class TrainRunner:
                 "update/avg_value_loss": self.tracker.get_mean("value_loss"),
                 "update/avg_entropy": self.tracker.get_mean("entropy_loss"),
                 "update/avg_kl_divergence": self.tracker.get_mean("kl_divergence"),
+                "update/avg_policy_clip_fraction": self.tracker.get_mean("policy_clip_fraction"),
+                "update/avg_action_log_std": self.tracker.get_mean("action_log_std"),
+                "update/avg_action_std": self.tracker.get_mean("action_std"),
+                "update/avg_advantage_mean": self.tracker.get_mean("advantage_mean"),
+                "update/avg_advantage_std": self.tracker.get_mean("advantage_std"),
+                "update/avg_value_explained_variance": self.tracker.get_mean("value_explained_variance"),
+                "update/avg_value_clip_fraction": self.tracker.get_mean("value_clip_fraction"),
+                "update/actor_lr": self._optimizer_lr(self.actor_optimizer),
+                "update/critic_lr": self._optimizer_lr(self.critic_optimizer),
             }
         )
         self.update_count += 1

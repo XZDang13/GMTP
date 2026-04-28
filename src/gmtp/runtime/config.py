@@ -10,6 +10,7 @@ class RunConfig:
     robot_encoder_type: str = "transformer"
     motion_window_length: int = 1
     motion_encoder_type: str = "transformer"
+    actor_fusion_type: str = "film"
     motion_mae_encoder_checkpoint: str | None = None
     use_amp: bool = True
     rollout_steps: int = 20

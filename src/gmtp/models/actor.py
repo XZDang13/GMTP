@@ -9,8 +9,10 @@ import torch.nn as nn
 from RLAlg.nn.layers import GaussianHead
 from RLAlg.nn.steps import StochasticContinuousPolicyStep
 from RLAlg.normalizer import Normalizer
+from RLAlg.utils import weight_init
 
 from .film import FiLMResStack
+from .layers import MLPLayer, NormPosition
 from .motion_encoder import (
     MotionEncoderType,
     MotionHistoryEncoder,
@@ -33,6 +35,12 @@ class ActorType(StrEnum):
     FILM_RES = "film_res"
 
 
+class ActorFusionType(StrEnum):
+    FILM = "film"
+    MOTION_RESIDUAL = "motion_residual"
+    CONCAT_MLP = "concat_mlp"
+
+
 def normalize_actor_type(actor_type: str | None) -> ActorType:
     normalized = (actor_type or ActorType.FILM_RES).lower().replace("-", "_")
     alias_map = {
@@ -46,6 +54,28 @@ def normalize_actor_type(actor_type: str | None) -> ActorType:
         ) from exc
 
 
+def normalize_actor_fusion_type(actor_fusion_type: str | ActorFusionType | None) -> ActorFusionType:
+    normalized = str(actor_fusion_type or ActorFusionType.FILM).lower().replace("-", "_")
+    alias_map = {
+        "film": ActorFusionType.FILM,
+        "film_only": ActorFusionType.FILM,
+        "baseline": ActorFusionType.FILM,
+        "motion_residual": ActorFusionType.MOTION_RESIDUAL,
+        "motion_skip": ActorFusionType.MOTION_RESIDUAL,
+        "residual": ActorFusionType.MOTION_RESIDUAL,
+        "concat_mlp": ActorFusionType.CONCAT_MLP,
+        "fusion_mlp": ActorFusionType.CONCAT_MLP,
+        "concat": ActorFusionType.CONCAT_MLP,
+    }
+    try:
+        return alias_map[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported actor_fusion_type '{actor_fusion_type}'. "
+            "Expected one of: 'film', 'motion_residual', 'concat_mlp'."
+        ) from exc
+
+
 def infer_film_res_blocks(actor_weights: dict[str, torch.Tensor]) -> int:
     block_pattern = re.compile(r"^stack\.blocks\.(\d+)\.")
     block_ids = [
@@ -54,6 +84,14 @@ def infer_film_res_blocks(actor_weights: dict[str, torch.Tensor]) -> int:
         if (match := block_pattern.match(key)) is not None
     ]
     return max(block_ids, default=4)
+
+
+def infer_actor_fusion_type(actor_weights: dict[str, torch.Tensor]) -> ActorFusionType:
+    if any(key.startswith("motion_skip.") or key == "motion_skip_scale" for key in actor_weights):
+        return ActorFusionType.MOTION_RESIDUAL
+    if any(key.startswith("fusion_mlp.") for key in actor_weights):
+        return ActorFusionType.CONCAT_MLP
+    return ActorFusionType.FILM
 
 
 class FiLMResActor(nn.Module):
@@ -67,6 +105,7 @@ class FiLMResActor(nn.Module):
         robot_encoder_type: str | RobotEncoderType = RobotEncoderType.TRANSFORMER,
         motion_window_length: int = 1,
         motion_encoder_type: str | MotionEncoderType = MotionEncoderType.TRANSFORMER,
+        actor_fusion_type: str | ActorFusionType = ActorFusionType.FILM,
         motion_mae_encoder_checkpoint: str | Path | None = None,
         device: torch.device | str = "cpu",
     ):
@@ -96,6 +135,7 @@ class FiLMResActor(nn.Module):
         self.robot_obs_normlizer = Normalizer(robot_normalizer_shape)
         self.motion_obs_normlizer = Normalizer(motion_normalizer_shape)
         self.num_blocks = num_blocks
+        self.actor_fusion_type = normalize_actor_fusion_type(actor_fusion_type)
         self.robot_step_dim = self.robot_window_layout.robot_step_dim
         self.motion_step_dim = self.motion_window_layout.motion_step_dim
         self.robot_encoder_type = (
@@ -123,6 +163,15 @@ class FiLMResActor(nn.Module):
             device=device,
         )
         self.stack = FiLMResStack(ACTOR_HIDDEN_DIM, ACTOR_HIDDEN_DIM, num_layers=num_blocks)
+        if self.actor_fusion_type is ActorFusionType.MOTION_RESIDUAL:
+            self.motion_skip = nn.Linear(ACTOR_HIDDEN_DIM, ACTOR_HIDDEN_DIM)
+            self.motion_skip_scale = nn.Parameter(torch.full((ACTOR_HIDDEN_DIM,), 1e-2))
+            weight_init(self.motion_skip)
+        elif self.actor_fusion_type is ActorFusionType.CONCAT_MLP:
+            self.fusion_mlp = nn.Sequential(
+                MLPLayer(ACTOR_HIDDEN_DIM * 2, ACTOR_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
+                MLPLayer(ACTOR_HIDDEN_DIM, ACTOR_HIDDEN_DIM, nn.SiLU(), NormPosition.POST),
+            )
         self.head = GaussianHead(ACTOR_HIDDEN_DIM, action_dim)
 
     @property
@@ -135,6 +184,14 @@ class FiLMResActor(nn.Module):
     def _reshape_motion_obs(self, motion_obs: torch.Tensor) -> torch.Tensor:
         return reshape_motion_history(motion_obs, self.motion_window_layout)
 
+    def _fuse_actor_latents(self, x_robot: torch.Tensor, x_motion: torch.Tensor) -> torch.Tensor:
+        x = self.stack(x_robot, x_motion)
+        if self.actor_fusion_type is ActorFusionType.MOTION_RESIDUAL:
+            return x + self.motion_skip_scale * self.motion_skip(x_motion)
+        if self.actor_fusion_type is ActorFusionType.CONCAT_MLP:
+            return self.fusion_mlp(torch.cat((x, x_motion), dim=-1))
+        return x
+
     def forward(
         self,
         obs_dict: dict[str, torch.Tensor],
@@ -145,7 +202,7 @@ class FiLMResActor(nn.Module):
         motion_obs = self.motion_obs_normlizer(obs_dict["motion_obs"], update_normlizer)
         x_robot = self.robot_encoder(robot_obs)
         x_motion = self.motion_encoder(motion_obs)
-        x = self.stack(x_robot, x_motion)
+        x = self._fuse_actor_latents(x_robot, x_motion)
         return self.head(x, action)
 
 
@@ -169,6 +226,7 @@ def build_actor(
         robot_encoder_type=str(actor_kwargs.get("robot_encoder_type", RobotEncoderType.TRANSFORMER.value)),
         motion_window_length=int(actor_kwargs.get("motion_window_length", 1)),
         motion_encoder_type=str(actor_kwargs.get("motion_encoder_type", MotionEncoderType.TRANSFORMER.value)),
+        actor_fusion_type=str(actor_kwargs.get("actor_fusion_type", ActorFusionType.FILM.value)),
         motion_mae_encoder_checkpoint=motion_mae_encoder_checkpoint,
         device=device,
     )
@@ -185,6 +243,7 @@ def get_actor_kwargs(
         "robot_encoder_type": str(actor.robot_encoder_type),
         "motion_window_length": int(actor.motion_window_length),
         "motion_encoder_type": str(actor.motion_encoder_type),
+        "actor_fusion_type": str(actor.actor_fusion_type),
     }
 
 

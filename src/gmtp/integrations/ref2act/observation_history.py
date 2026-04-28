@@ -33,12 +33,14 @@ DEFAULT_OBSERVATION_WINDOW_LENGTHS: dict[str, int] = {
     "joint_pos": 1,
     "joint_vel": 1,
     "previous_action": 1,
+    "priv_target_projected_gravity": 1,
     "priv_target_joint_pos": 1,
     "priv_target_joint_vel": 1,
     "relative_anchor_pos": 1,
     "relative_anchor_tangent_and_normal": 1,
     "relative_key_pos": 1,
     "relative_key_tangent_and_normal": 1,
+    "priv_projected_gravity": 1,
     "anchor_lin_vel": 1,
     "priv_anchor_ang_vel_b": 1,
     "priv_joint_pos": 1,
@@ -188,6 +190,11 @@ def build_gmtp_observation_spec(
                 name="privilege",
                 terms=(
                     ObservationTermSpec(
+                        id="priv_target_projected_gravity",
+                        type="target_projected_gravity",
+                        window_length=_window_length("priv_target_projected_gravity", window_lengths),
+                    ),
+                    ObservationTermSpec(
                         id="priv_target_joint_pos",
                         type="target_joint_pos",
                         window_length=_window_length("priv_target_joint_pos", window_lengths),
@@ -216,6 +223,11 @@ def build_gmtp_observation_spec(
                         id="relative_key_tangent_and_normal",
                         type="relative_key_tangent_and_normal",
                         window_length=_window_length("relative_key_tangent_and_normal", window_lengths),
+                    ),
+                    ObservationTermSpec(
+                        id="priv_projected_gravity",
+                        type="projected_gravity",
+                        window_length=_window_length("priv_projected_gravity", window_lengths),
                     ),
                     ObservationTermSpec(
                         id="anchor_lin_vel",
