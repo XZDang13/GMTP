@@ -27,6 +27,37 @@ def test_reference_motion_mae_shapes_and_deterministic_encode():
     torch.testing.assert_close(encoded, outputs["latent"])
 
 
+def test_reference_motion_mae_latent_uses_last_encoded_token():
+    model = ReferenceMotionMAE(
+        input_dim=4,
+        target_dim=4,
+        past_frames=3,
+        future_frames=1,
+        latent_dim=4,
+        d_model=4,
+        encoder_layers=1,
+        decoder_layers=1,
+        nhead=2,
+        dim_feedforward=8,
+    )
+    model.latent_norm = torch.nn.Identity()
+    model.latent_proj = torch.nn.Identity()
+    encoded_visible = torch.tensor(
+        [
+            [
+                [1.0, 2.0, 3.0, 4.0],
+                [10.0, 20.0, 30.0, 40.0],
+                [100.0, 200.0, 300.0, 400.0],
+            ]
+        ]
+    )
+
+    latent = model._pool_latent(encoded_visible)
+
+    torch.testing.assert_close(latent, encoded_visible[:, -1])
+    assert not torch.allclose(latent, encoded_visible.mean(dim=1))
+
+
 def test_compute_motion_mae_losses_uses_structured_slices():
     prediction = torch.zeros(2, 3, 6)
     target = torch.ones(2, 3, 6)

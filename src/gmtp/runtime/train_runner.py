@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import re
+import shutil
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from RLAlg.alg.ppo import PPO
 from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
@@ -47,6 +51,26 @@ RECOVERY_TIMEOUT_RATE_KEY = "fall_recovery/timeout_rate"
 RECOVERY_RATIO_EPS = 1.0e-8
 PPO_CLIP_RATIO = 0.2
 ENTROPY_COEF = 0.005
+ANCHOR_HEATMAP_TOP_LABELS = 30
+ANCHOR_CONSOLE_TOP_K = 10
+
+
+@dataclass(frozen=True)
+class AnchorProbabilityArrays:
+    motion_index: np.ndarray
+    motion_name: np.ndarray
+    anchor_index: np.ndarray
+    anchor_time: np.ndarray
+    probability: np.ndarray
+
+
+@dataclass(frozen=True)
+class AnchorHeatmapGrid:
+    values: np.ndarray
+    motion_indices: np.ndarray
+    motion_names: list[str]
+    motion_probabilities: np.ndarray
+    num_bins: int
 
 
 class OptimizerCollection(torch.optim.Optimizer):
@@ -129,6 +153,13 @@ class TrainRunner:
         self.run_name = config.run_name or f"G1_{len(self.motion_files)}_{self.run_date}"
         self.run_paths = build_run_paths(config.output_root, "train", self.run_name)
         self.checkpoint_interval = config.checkpoint_interval
+        if config.anchor_log_interval < 1:
+            raise ValueError("anchor_log_interval must be positive.")
+        if config.anchor_heatmap_bins < 1:
+            raise ValueError("anchor_heatmap_bins must be positive.")
+        self.anchor_log_interval = int(config.anchor_log_interval)
+        self.anchor_heatmap_bins = int(config.anchor_heatmap_bins)
+        self._anchor_heatmap_warning_emitted = False
         self.steps = config.rollout_steps
         self.global_step = 0
         self.update_count = 0
@@ -529,6 +560,7 @@ class TrainRunner:
             for anchor_index, anchor_time in enumerate(anchor_times.tolist()):
                 results.append(
                     {
+                        "motion_index": motion_index,
                         "motion_name": motion_name,
                         "anchor_index": anchor_index,
                         "anchor_time": float(anchor_time),
@@ -554,38 +586,389 @@ class TrainRunner:
         cls,
         anchor_probabilities: list[dict[str, float | int | str]],
     ) -> dict[str, float]:
-        payload: dict[str, float] = {}
-        max_probability = 0.0
+        arrays = cls._build_anchor_probability_arrays(anchor_probabilities)
+        probabilities = np.maximum(arrays.probability.astype(np.float64, copy=False), 0.0)
+        motion_probabilities = cls._aggregate_probabilities_by_motion(arrays)
+
+        return {
+            "sampling/anchor_reset_probability/sum": float(np.sum(probabilities)),
+            "sampling/anchor_reset_probability/max": float(np.max(probabilities)) if probabilities.size else 0.0,
+            "sampling/anchor_reset_probability/entropy": cls._probability_entropy(probabilities),
+            "sampling/anchor_reset_probability/effective_anchors": cls._effective_probability_count(probabilities),
+            "sampling/anchor_reset_probability/active_anchors": float(np.count_nonzero(probabilities > 0.0)),
+            "sampling/anchor_reset_probability/num_anchors": float(probabilities.size),
+            "sampling/anchor_reset_probability/top1_mass": cls._top_probability_mass(probabilities, 1),
+            "sampling/anchor_reset_probability/top5_mass": cls._top_probability_mass(probabilities, 5),
+            "sampling/anchor_reset_probability/top20_mass": cls._top_probability_mass(probabilities, 20),
+            "sampling/motion_reset_probability/max": (
+                float(np.max(motion_probabilities)) if motion_probabilities.size else 0.0
+            ),
+            "sampling/motion_reset_probability/entropy": cls._probability_entropy(motion_probabilities),
+            "sampling/motion_reset_probability/effective_motions": cls._effective_probability_count(
+                motion_probabilities
+            ),
+            "sampling/motion_reset_probability/active_motions": float(np.count_nonzero(motion_probabilities > 0.0)),
+            "sampling/motion_reset_probability/num_motions": float(motion_probabilities.size),
+            "sampling/motion_reset_probability/top1_mass": cls._top_probability_mass(motion_probabilities, 1),
+            "sampling/motion_reset_probability/top5_mass": cls._top_probability_mass(motion_probabilities, 5),
+            "sampling/motion_reset_probability/top10_mass": cls._top_probability_mass(motion_probabilities, 10),
+        }
+
+    @staticmethod
+    def _probability_entropy(probabilities: np.ndarray) -> float:
+        probabilities = np.maximum(np.asarray(probabilities, dtype=np.float64).reshape(-1), 0.0)
+        total = float(np.sum(probabilities))
+        if total <= 0.0:
+            return 0.0
+
+        normalized = probabilities[probabilities > 0.0] / total
+        return float(-np.sum(normalized * np.log(normalized)))
+
+    @classmethod
+    def _effective_probability_count(cls, probabilities: np.ndarray) -> float:
+        probabilities = np.maximum(np.asarray(probabilities, dtype=np.float64).reshape(-1), 0.0)
+        if float(np.sum(probabilities)) <= 0.0:
+            return 0.0
+        return float(np.exp(cls._probability_entropy(probabilities)))
+
+    @staticmethod
+    def _top_probability_mass(probabilities: np.ndarray, k: int) -> float:
+        probabilities = np.maximum(np.asarray(probabilities, dtype=np.float64).reshape(-1), 0.0)
+        if probabilities.size == 0 or k <= 0:
+            return 0.0
+        return float(np.sum(np.sort(probabilities)[-min(k, probabilities.size) :]))
+
+    @staticmethod
+    def _build_anchor_probability_arrays(
+        anchor_probabilities: list[dict[str, float | int | str]],
+    ) -> AnchorProbabilityArrays:
+        motion_name_to_index: dict[str, int] = {}
+        motion_indices: list[int] = []
+        motion_names_list: list[str] = []
+        anchor_indices: list[int] = []
+        anchor_times: list[float] = []
+        probabilities: list[float] = []
+
         for entry in anchor_probabilities:
-            motion_name = cls._sanitize_metric_component(str(entry["motion_name"]))
-            anchor_index = int(entry["anchor_index"])
-            probability = float(entry["probability"])
-            payload[f"sampling/anchor_reset_probability/{motion_name}/A{anchor_index:03d}"] = probability
-            max_probability = max(max_probability, probability)
-        if payload:
-            payload["sampling/anchor_reset_probability/max"] = max_probability
-        return payload
+            motion_name = str(entry["motion_name"])
+            if "motion_index" in entry:
+                motion_index = int(entry["motion_index"])
+            else:
+                motion_index = motion_name_to_index.setdefault(motion_name, len(motion_name_to_index))
+
+            motion_indices.append(motion_index)
+            motion_names_list.append(motion_name)
+            anchor_indices.append(int(entry["anchor_index"]))
+            anchor_times.append(float(entry["anchor_time"]))
+            probabilities.append(float(entry["probability"]))
+
+        return AnchorProbabilityArrays(
+            motion_index=np.asarray(motion_indices, dtype=np.int64),
+            motion_name=np.asarray(motion_names_list, dtype=np.str_),
+            anchor_index=np.asarray(anchor_indices, dtype=np.int64),
+            anchor_time=np.asarray(anchor_times, dtype=np.float32),
+            probability=np.asarray(probabilities, dtype=np.float32),
+        )
+
+    @staticmethod
+    def _aggregate_probabilities_by_motion(arrays: AnchorProbabilityArrays) -> np.ndarray:
+        if arrays.motion_index.size == 0:
+            return np.asarray([], dtype=np.float64)
+
+        motion_probabilities = []
+        for motion_index in np.unique(arrays.motion_index):
+            mask = arrays.motion_index == motion_index
+            motion_probabilities.append(float(np.sum(np.maximum(arrays.probability[mask], 0.0))))
+        return np.asarray(motion_probabilities, dtype=np.float64)
+
+    @classmethod
+    def _build_anchor_reset_probability_heatmap_grid(
+        cls,
+        anchor_probabilities: list[dict[str, float | int | str]],
+        *,
+        num_bins: int,
+    ) -> AnchorHeatmapGrid:
+        if num_bins < 1:
+            raise ValueError("num_bins must be positive.")
+
+        arrays = cls._build_anchor_probability_arrays(anchor_probabilities)
+        if arrays.motion_index.size == 0:
+            return AnchorHeatmapGrid(
+                values=np.zeros((0, num_bins), dtype=np.float32),
+                motion_indices=np.asarray([], dtype=np.int64),
+                motion_names=[],
+                motion_probabilities=np.asarray([], dtype=np.float32),
+                num_bins=num_bins,
+            )
+
+        rows: list[np.ndarray] = []
+        motion_indices: list[int] = []
+        motion_names_list: list[str] = []
+        motion_probabilities: list[float] = []
+
+        for motion_index in np.unique(arrays.motion_index):
+            mask = arrays.motion_index == motion_index
+            times = arrays.anchor_time[mask].astype(np.float64, copy=False)
+            probabilities = np.maximum(arrays.probability[mask].astype(np.float64, copy=False), 0.0)
+            row = np.zeros(num_bins, dtype=np.float64)
+
+            if times.size > 0:
+                min_time = float(np.min(times))
+                max_time = float(np.max(times))
+                if max_time > min_time:
+                    normalized_times = (times - min_time) / (max_time - min_time)
+                else:
+                    normalized_times = np.zeros_like(times)
+                bin_indices = np.floor(np.clip(normalized_times, 0.0, 1.0) * num_bins).astype(np.int64)
+                bin_indices = np.clip(bin_indices, 0, num_bins - 1)
+                np.add.at(row, bin_indices, probabilities)
+
+            first_entry_index = int(np.nonzero(mask)[0][0])
+            rows.append(row.astype(np.float32))
+            motion_indices.append(int(motion_index))
+            motion_names_list.append(str(arrays.motion_name[first_entry_index]))
+            motion_probabilities.append(float(np.sum(probabilities)))
+
+        order = sorted(range(len(rows)), key=lambda index: (-motion_probabilities[index], motion_indices[index]))
+        return AnchorHeatmapGrid(
+            values=np.stack([rows[index] for index in order], axis=0),
+            motion_indices=np.asarray([motion_indices[index] for index in order], dtype=np.int64),
+            motion_names=[motion_names_list[index] for index in order],
+            motion_probabilities=np.asarray([motion_probabilities[index] for index in order], dtype=np.float32),
+            num_bins=num_bins,
+        )
+
+    @staticmethod
+    def _build_anchor_probability_metadata(
+        arrays: AnchorProbabilityArrays,
+        *,
+        heatmap_bins: int,
+    ) -> dict[str, object]:
+        motions = []
+        for motion_index in np.unique(arrays.motion_index):
+            mask = arrays.motion_index == motion_index
+            first_entry_index = int(np.nonzero(mask)[0][0])
+            motions.append(
+                {
+                    "motion_index": int(motion_index),
+                    "motion_name": str(arrays.motion_name[first_entry_index]),
+                    "anchor_count": int(np.count_nonzero(mask)),
+                    "probability": float(np.sum(np.maximum(arrays.probability[mask], 0.0))),
+                }
+            )
+
+        return {
+            "heatmap_bins": int(heatmap_bins),
+            "num_motions": len(motions),
+            "num_anchors": int(arrays.probability.size),
+            "motions": sorted(motions, key=lambda item: int(item["motion_index"])),
+        }
+
+    @staticmethod
+    def _write_anchor_probability_heatmap(
+        grid: AnchorHeatmapGrid,
+        metrics_payload: dict[str, float],
+        output_path: Path,
+        *,
+        update_count: int,
+        global_step: int,
+    ) -> Path:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from matplotlib import pyplot as plt
+        from matplotlib.colors import LogNorm
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        num_motions = max(1, len(grid.motion_names))
+        figure_height = min(18.0, max(6.0, 3.0 + num_motions * 0.018))
+        figure, axis = plt.subplots(figsize=(14.0, figure_height))
+
+        values = np.asarray(grid.values, dtype=np.float32)
+        if values.size == 0:
+            values = np.zeros((1, grid.num_bins), dtype=np.float32)
+        masked_values = np.ma.masked_less_equal(values, 0.0)
+        positive_values = values[values > 0.0]
+
+        color_map = plt.get_cmap("magma").copy()
+        color_map.set_bad("#f0f0f0")
+        if positive_values.size:
+            max_probability = float(np.max(positive_values))
+            min_probability = float(np.min(positive_values))
+            if min_probability >= max_probability:
+                min_probability = max_probability * 0.1
+            image = axis.imshow(
+                masked_values,
+                aspect="auto",
+                interpolation="nearest",
+                cmap=color_map,
+                norm=LogNorm(vmin=max(min_probability, 1.0e-12), vmax=max_probability),
+            )
+        else:
+            image = axis.imshow(values, aspect="auto", interpolation="nearest", cmap=color_map, vmin=0.0, vmax=1.0)
+
+        axis.set_xlabel("normalized motion time")
+        axis.set_ylabel("motion rank by reset probability")
+        last_bin_index = max(0, grid.num_bins - 1)
+        axis.set_xticks(
+            [0, last_bin_index * 0.25, last_bin_index * 0.5, last_bin_index * 0.75, last_bin_index],
+            ["0.00", "0.25", "0.50", "0.75", "1.00"],
+        )
+        label_count = min(ANCHOR_HEATMAP_TOP_LABELS, len(grid.motion_names))
+        axis.set_yticks(np.arange(label_count), grid.motion_names[:label_count])
+
+        active_anchors = int(metrics_payload.get("sampling/anchor_reset_probability/active_anchors", 0.0))
+        effective_anchors = metrics_payload.get("sampling/anchor_reset_probability/effective_anchors", 0.0)
+        entropy = metrics_payload.get("sampling/anchor_reset_probability/entropy", 0.0)
+        max_probability = metrics_payload.get("sampling/anchor_reset_probability/max", 0.0)
+        axis.set_title(
+            "Motion anchor reset probability heatmap\n"
+            f"update={update_count} step={global_step} active={active_anchors} "
+            f"max={max_probability:.3g} entropy={entropy:.3f} effective={effective_anchors:.1f}"
+        )
+        figure.colorbar(image, ax=axis, label="reset probability mass")
+        figure.tight_layout()
+        figure.savefig(output_path, dpi=120)
+        plt.close(figure)
+        return output_path
+
+    def _write_anchor_reset_probability_artifacts(
+        self,
+        anchor_probabilities: list[dict[str, float | int | str]],
+        metrics_payload: dict[str, float],
+    ) -> dict[str, str]:
+        output_dir = self.run_paths.debug_dir / "anchor_reset_probabilities"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        arrays = self._build_anchor_probability_arrays(anchor_probabilities)
+        metadata_path = write_json(
+            output_dir / "metadata.json",
+            self._build_anchor_probability_metadata(arrays, heatmap_bins=self.anchor_heatmap_bins),
+        )
+
+        snapshot_stem = f"update_{self.update_count:06d}"
+        npz_path = output_dir / f"{snapshot_stem}.npz"
+        np.savez_compressed(
+            npz_path,
+            motion_index=arrays.motion_index,
+            motion_name=arrays.motion_name,
+            anchor_index=arrays.anchor_index,
+            anchor_time=arrays.anchor_time,
+            probability=arrays.probability,
+        )
+
+        summary_path = output_dir / "summary.jsonl"
+        summary_row = {
+            "update": int(self.update_count),
+            "global_step": int(self.global_step),
+            "heatmap_bins": int(self.anchor_heatmap_bins),
+            "num_anchor_entries": int(arrays.probability.size),
+            "metrics": metrics_payload,
+        }
+        with summary_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(summary_row, sort_keys=True) + "\n")
+
+        artifacts = {
+            "metadata": str(metadata_path),
+            "summary_jsonl": str(summary_path),
+            "snapshot_npz": str(npz_path),
+        }
+
+        grid = self._build_anchor_reset_probability_heatmap_grid(
+            anchor_probabilities,
+            num_bins=self.anchor_heatmap_bins,
+        )
+        heatmap_path = output_dir / f"{snapshot_stem}_heatmap.png"
+        latest_heatmap_path = output_dir / "latest_heatmap.png"
+        try:
+            self._write_anchor_probability_heatmap(
+                grid,
+                metrics_payload,
+                heatmap_path,
+                update_count=self.update_count,
+                global_step=self.global_step,
+            )
+            shutil.copyfile(heatmap_path, latest_heatmap_path)
+            artifacts["heatmap_png"] = str(heatmap_path)
+            artifacts["latest_heatmap_png"] = str(latest_heatmap_path)
+        except Exception as exc:
+            if not self._anchor_heatmap_warning_emitted:
+                print(f"skipping anchor probability heatmap rendering: {exc}", flush=True)
+                self._anchor_heatmap_warning_emitted = True
+
+        return artifacts
+
+    def _sync_anchor_reset_probability_summary_to_wandb(
+        self,
+        metrics_payload: dict[str, float],
+        artifacts: dict[str, str],
+    ) -> None:
+        if not self.use_wandb:
+            return
+
+        try:
+            import wandb
+        except ImportError:
+            return
+
+        run = getattr(wandb, "run", None)
+        if run is None:
+            return
+
+        for metric_name, value in metrics_payload.items():
+            run.summary[metric_name] = float(value)
+        run.summary["sampling/anchor_reset_probability/latest_update"] = int(self.update_count)
+        run.summary["sampling/anchor_reset_probability/latest_global_step"] = int(self.global_step)
+
+        latest_heatmap_path = artifacts.get("latest_heatmap_png")
+        if latest_heatmap_path is None:
+            return
+
+        try:
+            run.summary["sampling/anchor_reset_probability/latest_heatmap"] = wandb.Image(
+                latest_heatmap_path,
+                caption=f"anchor reset probabilities update={self.update_count} step={self.global_step}",
+            )
+        except Exception as exc:
+            print(f"failed to update W&B anchor heatmap summary: {exc}", flush=True)
+
+        try:
+            run.save(latest_heatmap_path, base_path=str(self.run_paths.debug_dir), policy="live")
+        except Exception as exc:
+            print(f"failed to sync latest anchor heatmap to W&B files: {exc}", flush=True)
 
     def _log_anchor_reset_probabilities(self) -> None:
         anchor_probabilities = self._collect_anchor_reset_probabilities()
         if not anchor_probabilities:
             return
 
-        print(f"anchor reset probabilities after update {self.update_count}:", flush=True)
-        current_motion_name: str | None = None
-        for entry in anchor_probabilities:
-            motion_name = str(entry["motion_name"])
-            if motion_name != current_motion_name:
-                current_motion_name = motion_name
-                print(f"  motion={motion_name}", flush=True)
-            print(
-                f"    A{int(entry['anchor_index'])} t={float(entry['anchor_time']):.3f}s "
-                f"p={float(entry['probability']):.6f}",
-                flush=True,
-            )
         metrics_payload = self._build_anchor_reset_probability_metrics(anchor_probabilities)
         if metrics_payload:
             self._log_metrics(metrics_payload)
+        artifacts = self._write_anchor_reset_probability_artifacts(anchor_probabilities, metrics_payload)
+        self._sync_anchor_reset_probability_summary_to_wandb(metrics_payload, artifacts)
+
+        print(
+            f"anchor reset probabilities after update {self.update_count}: "
+            f"max={metrics_payload['sampling/anchor_reset_probability/max']:.6f} "
+            f"active={int(metrics_payload['sampling/anchor_reset_probability/active_anchors'])} "
+            f"effective={metrics_payload['sampling/anchor_reset_probability/effective_anchors']:.2f} "
+            f"top20={metrics_payload['sampling/anchor_reset_probability/top20_mass']:.6f}",
+            flush=True,
+        )
+        top_entries = sorted(
+            anchor_probabilities,
+            key=lambda entry: float(entry["probability"]),
+            reverse=True,
+        )[:ANCHOR_CONSOLE_TOP_K]
+        for entry in top_entries:
+            print(
+                f"  {entry['motion_name']} A{int(entry['anchor_index'])} "
+                f"t={float(entry['anchor_time']):.3f}s p={float(entry['probability']):.6f}",
+                flush=True,
+            )
+        if latest_heatmap_path := artifacts.get("latest_heatmap_png"):
+            print(f"  latest heatmap: {latest_heatmap_path}", flush=True)
 
     @staticmethod
     def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -782,7 +1165,7 @@ class TrainRunner:
             }
         )
         self.update_count += 1
-        if self.update_count % 100 == 0:
+        if self.update_count % self.anchor_log_interval == 0:
             self._log_anchor_reset_probabilities()
 
     def save_checkpoint(self, name: str) -> Path:
@@ -843,6 +1226,9 @@ class TrainRunner:
             "num_updates": self.config.num_updates,
             "rollout_steps": self.steps,
             "checkpoint_interval": self.checkpoint_interval,
+            "anchor_log_interval": self.anchor_log_interval,
+            "anchor_heatmap_bins": self.anchor_heatmap_bins,
+            "anchor_probability_debug_dir": str(self.run_paths.debug_dir / "anchor_reset_probabilities"),
             "amp_requested": self.requested_amp,
             "amp_enabled": self.use_amp,
             "amp_dtype": self.amp_dtype,

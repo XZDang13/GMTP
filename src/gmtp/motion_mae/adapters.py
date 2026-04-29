@@ -49,9 +49,7 @@ def _build_segments(
         start_frame = min(max(start_frame, 0), num_frames)
         end_frame = min(max(end_frame, 0), num_frames)
         if end_frame <= start_frame:
-            raise ValueError(
-                f"Segment {index} collapsed after frame rounding/clipping: {start_frame}:{end_frame}."
-            )
+            continue
         segment_type = None if segment_types is None else int(segment_types[index])
         segments.append(
             MotionSegment(

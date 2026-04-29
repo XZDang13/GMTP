@@ -125,7 +125,7 @@ class ReferenceMotionMAE(nn.Module):
         return self.encoder(visible_tokens)
 
     def _pool_latent(self, encoded_visible: torch.Tensor) -> torch.Tensor:
-        pooled = encoded_visible.mean(dim=1)
+        pooled = encoded_visible[:, -1]
         return self.latent_proj(self.latent_norm(pooled))
 
     def encode(self, reference: torch.Tensor) -> torch.Tensor:

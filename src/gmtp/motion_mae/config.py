@@ -12,7 +12,7 @@ DEFAULT_END_EFFECTOR_BODY_NAMES = (
     "left_rubber_hand",
     "right_rubber_hand",
 )
-VALID_FEATURE_NAMES = {"root", "joint", "end_effector"}
+VALID_FEATURE_NAMES = {"root", "joint", "joint_pos", "joint_vel", "end_effector"}
 VALID_SPLIT_MODES = {"auto", "by_motion", "by_window"}
 VALID_RECONSTRUCTION_LOSSES = {"mse", "l1"}
 VALID_ADAPTER_NAMES = {"stageii_npz"}
@@ -36,7 +36,7 @@ def _to_int_tuple(value: Any, *, name: str) -> tuple[int, ...]:
 
 
 def _normalize_slice_weights(value: Any) -> dict[str, float]:
-    default = {"root": 1.0, "joint": 1.0, "end_effector": 1.0}
+    default = {"root": 1.0, "joint": 1.0, "joint_pos": 1.0, "joint_vel": 1.0, "end_effector": 1.0}
     if value is None:
         return default
     if not isinstance(value, dict):

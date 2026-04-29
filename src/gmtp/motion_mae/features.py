@@ -145,7 +145,9 @@ def build_motion_feature_bundle(
             sequence.length, 3
         )
         root_features = quat_apply_inverse(anchor_quat_w, gravity)
-        joint_features = torch.cat((sequence.joint_pos, sequence.joint_vel), dim=-1)
+        joint_pos_features = sequence.joint_pos
+        joint_vel_features = sequence.joint_vel
+        joint_features = torch.cat((joint_pos_features, joint_vel_features), dim=-1)
 
         end_effector_pos_w = sequence.body_pos_w[:, end_effector_body_indices]
         rel_end_effector_pos = quat_apply_inverse(
@@ -153,20 +155,18 @@ def build_motion_feature_bundle(
             end_effector_pos_w - anchor_pos_w[:, None, :],
         ).reshape(sequence.length, -1)
 
+        root_end = root_features.shape[-1]
+        joint_pos_end = root_end + joint_pos_features.shape[-1]
+        joint_vel_end = joint_pos_end + joint_vel_features.shape[-1]
+        end_effector_end = joint_vel_end + rel_end_effector_pos.shape[-1]
         base_slices = (
-            FeatureSliceSpec(name="root", start=0, end=root_features.shape[-1]),
-            FeatureSliceSpec(
-                name="joint",
-                start=root_features.shape[-1],
-                end=root_features.shape[-1] + joint_features.shape[-1],
-            ),
-            FeatureSliceSpec(
-                name="end_effector",
-                start=root_features.shape[-1] + joint_features.shape[-1],
-                end=root_features.shape[-1] + joint_features.shape[-1] + rel_end_effector_pos.shape[-1],
-            ),
+            FeatureSliceSpec(name="root", start=0, end=root_end),
+            FeatureSliceSpec(name="joint_pos", start=root_end, end=joint_pos_end),
+            FeatureSliceSpec(name="joint_vel", start=joint_pos_end, end=joint_vel_end),
+            FeatureSliceSpec(name="end_effector", start=joint_vel_end, end=end_effector_end),
         )
         base_slice_map = {item.name: item for item in base_slices}
+        base_slice_map["joint"] = FeatureSliceSpec(name="joint", start=root_end, end=joint_vel_end)
 
         full_features = torch.cat((root_features, joint_features, rel_end_effector_pos), dim=-1)
         reference_features = _select_feature_blocks(full_features, feature_config.reference_feature_names, base_slice_map)

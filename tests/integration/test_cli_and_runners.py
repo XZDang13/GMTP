@@ -362,12 +362,18 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.disable_amp is False
     assert args.disable_wandb is False
     assert args.motion_mae_encoder_checkpoint is None
+    assert args.anchor_log_interval == 100
+    assert args.anchor_heatmap_bins == 128
 
     with pytest.raises(SystemExit):
         parser.parse_args(["train", "--attn-block-size", "5"])
 
     args = parser.parse_args(["train", "--disable-amp"])
     assert args.disable_amp is True
+
+    args = parser.parse_args(["train", "--anchor-log-interval", "25", "--anchor-heatmap-bins", "64"])
+    assert args.anchor_log_interval == 25
+    assert args.anchor_heatmap_bins == 64
 
     args = parser.parse_args(["train", "--actor-fusion-type", "motion_residual"])
     assert args.actor_fusion_type == "motion_residual"
@@ -637,13 +643,18 @@ def test_train_runner_update_smoke_uses_cpu_fallback(monkeypatch):
     runner.env.close()
 
 
-def test_train_runner_logs_anchor_probabilities_every_hundred_updates(monkeypatch, capsys):
+def test_train_runner_logs_anchor_probability_summary_and_heatmap_every_configured_interval(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
     runner = TrainRunner(
         RunConfig(
             use_wandb=False,
             rollout_steps=1,
             num_updates=1,
+            output_root=str(tmp_path / "runs"),
         )
     )
     runner._collect_anchor_reset_probabilities = lambda: [
@@ -666,13 +677,18 @@ def test_train_runner_logs_anchor_probabilities_every_hundred_updates(monkeypatc
     output = capsys.readouterr().out
 
     assert "anchor reset probabilities after update 100:" in output
-    assert "motion=jump_anchor" in output
-    assert "A0 t=0.000s p=1.000000" in output
+    assert "max=1.000000" in output
+    assert "jump_anchor A0 t=0.000s p=1.000000" in output
     assert any(
-        payload.get("sampling/anchor_reset_probability/jump_anchor/A000") == 1.0
+        "sampling/anchor_reset_probability/jump_anchor/A000" not in payload
         and payload.get("sampling/anchor_reset_probability/max") == 1.0
+        and payload.get("sampling/anchor_reset_probability/top1_mass") == 1.0
         for payload in logged_payloads
     )
+    anchor_debug_dir = runner.run_paths.debug_dir / "anchor_reset_probabilities"
+    assert (anchor_debug_dir / "latest_heatmap.png").exists()
+    assert (anchor_debug_dir / "update_000100_heatmap.png").exists()
+    assert (anchor_debug_dir / "update_000100.npz").exists()
     runner.env.close()
 
 

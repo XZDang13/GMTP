@@ -1,0 +1,77 @@
+{
+  "data": {
+    "motion_files": [
+      "/home/troja/Desktop/mocap_data/CMU",
+      "/home/troja/Desktop/mocap_data/OMOMO"
+    ],
+    "adapter_name": "stageii_npz",
+    "past_frames": 10,
+    "future_frames": 15,
+    "split_mode": "by_motion",
+    "val_ratio": 0.2,
+    "batch_size": 1024,
+    "num_workers": 0,
+    "pin_memory": true,
+    "seed": 11,
+    "max_train_windows": null,
+    "max_val_windows": null
+  },
+  "feature": {
+    "anchor_body_name": "pelvis",
+    "end_effector_body_names": [
+      "left_ankle_roll_link",
+      "right_ankle_roll_link",
+      "left_rubber_hand",
+      "right_rubber_hand"
+    ],
+    "reference_feature_names": [
+      "root",
+      "joint_pos"
+    ],
+    "target_feature_names": [
+      "root",
+      "joint_pos"
+    ],
+    "policy_feature_names": [
+      "root",
+      "joint_pos"
+    ],
+    "gravity_vector": [
+      0.0,
+      0.0,
+      -1.0
+    ]
+  },
+  "model": {
+    "d_model": 256,
+    "latent_dim": 64,
+    "encoder_layers": 4,
+    "decoder_layers": 2,
+    "nhead": 8,
+    "dim_feedforward": 512,
+    "dropout": 0.05,
+    "activation": "gelu"
+  },
+  "loss": {
+    "reconstruction_loss": "mse",
+    "slice_weights": {
+      "root": 1.0,
+      "joint_pos": 1.0
+    }
+  },
+  "optimizer": {
+    "lr": 0.0003,
+    "weight_decay": 0.01
+  },
+  "training": {
+    "epochs": 60,
+    "device": "auto",
+    "grad_clip_norm": 1.0,
+    "log_interval": 9999
+  },
+  "export": {
+    "save_optimizer_state": true
+  },
+  "output_root": "runs",
+  "run_name": "motion_mae_actor_motion_obs_cmu_omomo_w10_f15"
+}

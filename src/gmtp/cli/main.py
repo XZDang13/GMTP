@@ -71,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--output-root", default="runs")
     train_parser.add_argument("--run-name", default=None)
     train_parser.add_argument("--disable-wandb", action="store_true")
+    train_parser.add_argument("--anchor-log-interval", type=int, default=100)
+    train_parser.add_argument("--anchor-heatmap-bins", type=int, default=256)
     _add_disable_amp_argument(train_parser)
     train_parser.add_argument("--headless", action="store_true")
 
@@ -183,6 +185,8 @@ def _run_train(args) -> int:
                 output_root=args.output_root,
                 run_name=args.run_name,
                 use_wandb=not args.disable_wandb,
+                anchor_log_interval=args.anchor_log_interval,
+                anchor_heatmap_bins=args.anchor_heatmap_bins,
             )
         ).train()
     finally:

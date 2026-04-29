@@ -71,6 +71,10 @@ def compute_motion_mae_losses(
         weighted_error = slice_error * float(slice_spec.weight)
         loss_dict[f"{slice_spec.name}_loss"] = slice_error
         loss_dict[f"{slice_spec.name}_weighted_loss"] = weighted_error
+        if slice_spec.name in {"joint_pos", "joint_vel"}:
+            loss_dict[f"{slice_spec.name}_error"] = torch.abs(
+                prediction[..., slice_spec.start : slice_spec.end] - target[..., slice_spec.start : slice_spec.end]
+            ).mean()
         reconstruction_total = reconstruction_total + weighted_error
 
     loss_dict["reconstruction_loss"] = reconstruction_total

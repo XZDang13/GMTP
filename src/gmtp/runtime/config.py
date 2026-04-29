@@ -19,6 +19,8 @@ class RunConfig:
     output_root: str = "runs"
     run_name: str | None = None
     use_wandb: bool = True
+    anchor_log_interval: int = 100
+    anchor_heatmap_bins: int = 128
 
 
 @dataclass(frozen=True)
