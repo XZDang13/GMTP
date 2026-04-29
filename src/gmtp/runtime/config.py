@@ -21,6 +21,18 @@ class RunConfig:
     use_wandb: bool = True
     anchor_log_interval: int = 100
     anchor_heatmap_bins: int = 128
+    sampling_schedule_enabled: bool = True
+    sampling_random_updates: int = 1000
+    adaptive_sampling_start_update: int = 5000
+    adaptive_sampling_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if self.sampling_random_updates < 0:
+            raise ValueError("sampling_random_updates must be non-negative.")
+        if self.adaptive_sampling_start_update < 0:
+            raise ValueError("adaptive_sampling_start_update must be non-negative.")
+        if self.adaptive_sampling_start_update < self.sampling_random_updates:
+            raise ValueError("adaptive_sampling_start_update must be >= sampling_random_updates.")
 
 
 @dataclass(frozen=True)

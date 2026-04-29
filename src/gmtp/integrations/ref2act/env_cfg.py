@@ -11,6 +11,7 @@ G1MotionTrackingEnvCfg = _REF2ACT.G1MotionTrackingEnvCfg
 G1TrainingEventCfg = _REF2ACT.G1TrainingEventCfg
 SamplingStrategy = _REF2ACT.SamplingStrategy
 SegmentSource = _REF2ACT.SegmentSource
+AdaptiveSamplerCfg = _REF2ACT.AdaptiveSamplerCfg
 _BASE_G1_ENV_CFG = G1MotionTrackingEnvCfg()
 
 
@@ -55,6 +56,27 @@ def _enable_quality_gate_without_fall_recovery(robust_tracking_cfg):
     return replace(robust_tracking_cfg, **updates)
 
 
+def _recommended_adaptive_sampler_cfg():
+    if AdaptiveSamplerCfg is None:
+        return None
+    return AdaptiveSamplerCfg(
+        enabled=False,
+        warmup_samples=96,
+        anchor_drop_fail_rate=0.97,
+        anchor_reenable_fail_rate=0.75,
+        anchor_cooldown_resets=500,
+        motion_min_samples=256,
+        motion_drop_fail_rate=0.98,
+        motion_drop_anchor_fraction=0.8,
+        motion_cooldown_resets=1000,
+        probe_probability=0.01,
+        mastered_fail_rate=0.05,
+        mastered_probability_scale=0.25,
+        min_live_motion_fraction=0.6,
+        min_live_anchor_fraction=0.5,
+    )
+
+
 @configclass
 class G1MultiMotionEnv(G1MotionTrackingEnvCfg):
     expert_motion_file = resolve_motion_files(DEFAULT_EXPERIMENT_MOTION_FILES)
@@ -75,5 +97,7 @@ class G1MultiMotionEnv(G1MotionTrackingEnvCfg):
 class G1MultiMotionTrainingEnv(G1MultiMotionEnv):
     sampling_strategy = SamplingStrategy.FailureWeighted
     segment_source = SegmentSource.Anchor
+    if AdaptiveSamplerCfg is not None:
+        adaptive_sampler = _recommended_adaptive_sampler_cfg()
     random_start = True
     events = G1TrainingEventCfg()

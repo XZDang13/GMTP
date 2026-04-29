@@ -54,6 +54,48 @@ def test_compute_anchor_reset_probabilities_aggregates_per_anchor_and_keeps_zero
     assert sum(entry["probability"] for entry in probabilities) == pytest.approx(1.0)
 
 
+def test_compute_anchor_reset_probabilities_applies_adaptive_quarantine_and_probe_mass():
+    sampler = types.SimpleNamespace(
+        failure_weight_uniform_mix=0.0,
+        failure_weight_exploration_bonus=0.0,
+        failure_weight_max_uniform_ratio=None,
+        adaptive_sampler=types.SimpleNamespace(
+            enabled=True,
+            mastered_probability_scale=0.25,
+            probe_probability=0.2,
+        ),
+        motion_lib=types.SimpleNamespace(
+            clips=[
+                types.SimpleNamespace(name="jump_anchor", anchor_times=torch.tensor([0.0, 1.0, 2.0])),
+            ]
+        ),
+        bin_fail_counts=[
+            torch.tensor([10.0, 1.0, 1.0]),
+        ],
+        bin_sample_counts=[
+            torch.tensor([10.0, 10.0, 10.0]),
+        ],
+        bin_reset_eligible=[
+            torch.tensor([True, True, True]),
+        ],
+        bin_reset_times=[
+            torch.tensor([0.0, 1.0, 2.0]),
+        ],
+        adaptive_motion_quarantined=torch.tensor([False]),
+        adaptive_motion_mastered=torch.tensor([False]),
+        adaptive_bin_quarantined=[
+            torch.tensor([True, False, False]),
+        ],
+        adaptive_bin_mastered=[
+            torch.tensor([False, False, False]),
+        ],
+    )
+
+    probabilities = TrainRunner._compute_anchor_reset_probabilities(sampler, temperature=1.0)
+
+    assert [entry["probability"] for entry in probabilities] == pytest.approx([0.2, 0.4, 0.4])
+
+
 def test_build_anchor_reset_probability_metrics_uses_low_cardinality_distribution_summaries():
     payload = TrainRunner._build_anchor_reset_probability_metrics(
         [

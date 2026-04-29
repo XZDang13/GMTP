@@ -18,6 +18,7 @@ class EnvCfgSymbols:
     G1TrainingEventCfg: type
     SamplingStrategy: type
     SegmentSource: type
+    AdaptiveSamplerCfg: type | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ def load_env_cfg_symbols() -> EnvCfgSymbols:
         G1TrainingEventCfg=g1_module.G1TrainingEventCfg,
         SamplingStrategy=sampling_module.SamplingStrategy,
         SegmentSource=sampling_module.SegmentSource,
+        AdaptiveSamplerCfg=getattr(sampling_module, "AdaptiveSamplerCfg", None),
     )
 
 

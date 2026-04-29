@@ -72,7 +72,29 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--run-name", default=None)
     train_parser.add_argument("--disable-wandb", action="store_true")
     train_parser.add_argument("--anchor-log-interval", type=int, default=100)
-    train_parser.add_argument("--anchor-heatmap-bins", type=int, default=256)
+    train_parser.add_argument("--anchor-heatmap-bins", type=int, default=128)
+    train_parser.add_argument(
+        "--disable-sampling-schedule",
+        action="store_true",
+        help="Keep the Ref2Act training env sampling config fixed for the whole run.",
+    )
+    train_parser.add_argument(
+        "--sampling-random-updates",
+        type=int,
+        default=1000,
+        help="Number of initial updates that use random reset sampling.",
+    )
+    train_parser.add_argument(
+        "--adaptive-sampling-start-update",
+        type=int,
+        default=5000,
+        help="Update at which failure-weighted reset sampling enables adaptive quarantine/probe behavior.",
+    )
+    train_parser.add_argument(
+        "--disable-adaptive-sampling",
+        action="store_true",
+        help="Keep adaptive sampling disabled after the failure-weighted warmup.",
+    )
     _add_disable_amp_argument(train_parser)
     train_parser.add_argument("--headless", action="store_true")
 
@@ -187,6 +209,10 @@ def _run_train(args) -> int:
                 use_wandb=not args.disable_wandb,
                 anchor_log_interval=args.anchor_log_interval,
                 anchor_heatmap_bins=args.anchor_heatmap_bins,
+                sampling_schedule_enabled=not args.disable_sampling_schedule,
+                sampling_random_updates=args.sampling_random_updates,
+                adaptive_sampling_start_update=args.adaptive_sampling_start_update,
+                adaptive_sampling_enabled=not args.disable_adaptive_sampling,
             )
         ).train()
     finally:

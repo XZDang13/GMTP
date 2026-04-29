@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import shutil
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -132,7 +133,12 @@ class TrainRunner:
             robot_window_length=config.robot_window_length,
             motion_window_length=config.motion_window_length,
         )
-        self.env, self.cfg = make_training_env(window_lengths=self.observation_window_lengths)
+        make_training_kwargs = self._build_make_training_env_kwargs(
+            make_training_env,
+            window_lengths=self.observation_window_lengths,
+            config=config,
+        )
+        self.env, self.cfg = make_training_env(**make_training_kwargs)
         self.device = normalize_device(self.env.unwrapped.device)
         self.requested_amp = bool(config.use_amp)
         self.use_amp = resolve_amp_enabled(self.requested_amp, self.device)
@@ -140,6 +146,7 @@ class TrainRunner:
         self.actor_type = ActorType.FILM_RES
         self.segment_source = self._normalize_choice_name(getattr(self.cfg, "segment_source", None))
         self.sampling_strategy = self._normalize_choice_name(getattr(self.cfg, "sampling_strategy", None))
+        self.adaptive_sampling_enabled = self._adaptive_sampler_enabled()
         self.motion_files = list(self.cfg.expert_motion_file)
         self.motion_name = motion_label(self.motion_files)
         resolved_motion_mae_checkpoint = resolve_motion_mae_checkpoint_path(
@@ -163,6 +170,8 @@ class TrainRunner:
         self.steps = config.rollout_steps
         self.global_step = 0
         self.update_count = 0
+        self._last_sampling_schedule_state: tuple[str | None, bool] | None = None
+        self._apply_sampling_schedule()
 
         write_json(self.run_paths.config_path, {"command": "train", "config": self.config})
 
@@ -274,6 +283,137 @@ class TrainRunner:
                 normalized.append("_")
             normalized.append(char.lower())
         return "".join(normalized)
+
+    @staticmethod
+    def _initial_sampling_schedule_state(config: RunConfig) -> tuple[str, bool] | None:
+        if not config.sampling_schedule_enabled:
+            return None
+        if config.sampling_random_updates > 0:
+            return "Random", False
+        adaptive_enabled = bool(config.adaptive_sampling_enabled) and config.adaptive_sampling_start_update <= 0
+        return "FailureWeighted", adaptive_enabled
+
+    @classmethod
+    def _build_make_training_env_kwargs(
+        cls,
+        make_training_env,
+        *,
+        window_lengths: Mapping[str, int],
+        config: RunConfig,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"window_lengths": window_lengths}
+        initial_state = cls._initial_sampling_schedule_state(config)
+        if initial_state is None:
+            return kwargs
+
+        try:
+            parameters = inspect.signature(make_training_env).parameters
+        except (TypeError, ValueError):
+            return kwargs
+
+        strategy_name, adaptive_enabled = initial_state
+        if "sampling_strategy" in parameters:
+            kwargs["sampling_strategy"] = strategy_name
+        if "adaptive_sampler_enabled" in parameters:
+            kwargs["adaptive_sampler_enabled"] = adaptive_enabled
+        return kwargs
+
+    @staticmethod
+    def _coerce_choice_like(current_value: Any, choice_name: str) -> Any:
+        if isinstance(current_value, str):
+            return choice_name
+
+        if current_value is not None:
+            choice_type = type(current_value)
+            members = getattr(choice_type, "__members__", None)
+            if isinstance(members, Mapping) and choice_name in members:
+                return members[choice_name]
+            if hasattr(choice_type, choice_name):
+                return getattr(choice_type, choice_name)
+
+        return choice_name
+
+    @staticmethod
+    def _replace_adaptive_sampler_enabled(adaptive_sampler: Any, enabled: bool) -> Any:
+        if adaptive_sampler is None or not hasattr(adaptive_sampler, "enabled"):
+            return adaptive_sampler
+        if bool(getattr(adaptive_sampler, "enabled")) == bool(enabled):
+            return adaptive_sampler
+        try:
+            return replace(adaptive_sampler, enabled=bool(enabled))
+        except (TypeError, ValueError):
+            try:
+                setattr(adaptive_sampler, "enabled", bool(enabled))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise TypeError("adaptive_sampler must support dataclasses.replace or writable enabled.") from exc
+            return adaptive_sampler
+
+    def _adaptive_sampler_enabled(self) -> bool:
+        adaptive_sampler = getattr(self.cfg, "adaptive_sampler", None)
+        return bool(getattr(adaptive_sampler, "enabled", False))
+
+    def _set_adaptive_sampler_enabled(self, enabled: bool) -> None:
+        adaptive_sampler = getattr(self.cfg, "adaptive_sampler", None)
+        if adaptive_sampler is None or not hasattr(adaptive_sampler, "enabled"):
+            self.adaptive_sampling_enabled = False
+            return
+
+        new_adaptive_sampler = self._replace_adaptive_sampler_enabled(adaptive_sampler, enabled)
+        if new_adaptive_sampler is not adaptive_sampler:
+            setattr(self.cfg, "adaptive_sampler", new_adaptive_sampler)
+
+        sampler = getattr(self.env.unwrapped, "sampler", None)
+        if sampler is not None and hasattr(sampler, "adaptive_sampler"):
+            previous_enabled = bool(getattr(getattr(sampler, "adaptive_sampler", None), "enabled", False))
+            setattr(sampler, "adaptive_sampler", new_adaptive_sampler)
+            init_adaptive_state = getattr(sampler, "_init_adaptive_state", None)
+            state_missing = bool(enabled) and getattr(sampler, "adaptive_bin_quarantined", None) is None
+            if callable(init_adaptive_state) and (previous_enabled != bool(enabled) or state_missing):
+                init_adaptive_state()
+
+        self.adaptive_sampling_enabled = self._adaptive_sampler_enabled()
+
+    def _set_sampling_strategy(self, strategy_name: str) -> None:
+        current_strategy = getattr(self.cfg, "sampling_strategy", None)
+        setattr(self.cfg, "sampling_strategy", self._coerce_choice_like(current_strategy, strategy_name))
+        self.sampling_strategy = self._normalize_choice_name(getattr(self.cfg, "sampling_strategy", None))
+
+    def _sampling_schedule_state_for_update(self, update_count: int) -> tuple[str | None, bool]:
+        if not self.config.sampling_schedule_enabled:
+            return (
+                self._normalize_choice_name(getattr(self.cfg, "sampling_strategy", None)),
+                self._adaptive_sampler_enabled(),
+            )
+        if update_count < self.config.sampling_random_updates:
+            return "random", False
+        adaptive_enabled = (
+            bool(self.config.adaptive_sampling_enabled)
+            and update_count >= self.config.adaptive_sampling_start_update
+        )
+        return "failure_weighted", adaptive_enabled
+
+    @staticmethod
+    def _sampling_strategy_choice_name(normalized_name: str | None) -> str | None:
+        if normalized_name is None:
+            return None
+        if normalized_name == "failure_weighted":
+            return "FailureWeighted"
+        if normalized_name == "random":
+            return "Random"
+        if normalized_name == "start":
+            return "Start"
+        return normalized_name
+
+    def _apply_sampling_schedule(self) -> None:
+        strategy_name, adaptive_enabled = self._sampling_schedule_state_for_update(self.update_count)
+        choice_name = self._sampling_strategy_choice_name(strategy_name)
+        if choice_name is not None:
+            self._set_sampling_strategy(choice_name)
+        self._set_adaptive_sampler_enabled(adaptive_enabled)
+
+        current_state = (self.sampling_strategy, self.adaptive_sampling_enabled)
+        if self._last_sampling_schedule_state != current_state:
+            self._last_sampling_schedule_state = current_state
 
     @staticmethod
     def _split_optimizer_param_groups(
@@ -432,17 +572,25 @@ class TrainRunner:
         sanitized = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(value)).strip("_")
         return sanitized or "unknown"
 
-    @staticmethod
+    @classmethod
     def _build_guarded_sampling_probabilities(
+        cls,
         fail_counts: torch.Tensor,
         sample_counts: torch.Tensor,
         *,
         temperature: float,
         uniform_mix: float,
         eligible_mask: torch.Tensor | None = None,
+        probability_scale: torch.Tensor | None = None,
+        probe_mask: torch.Tensor | None = None,
+        probe_probability: float = 0.0,
+        exploration_bonus: float = 0.0,
+        max_uniform_ratio: float | None = None,
     ) -> torch.Tensor:
         if temperature <= 0.0:
             raise ValueError("temperature must be > 0.")
+        if probe_probability < 0.0 or probe_probability > 1.0:
+            raise ValueError("probe_probability must be in [0, 1].")
 
         fail_counts = torch.as_tensor(fail_counts, dtype=torch.float32).reshape(-1)
         sample_counts = torch.as_tensor(sample_counts, dtype=torch.float32).reshape(-1)
@@ -456,14 +604,53 @@ class TrainRunner:
             if eligible.shape != fail_counts.shape:
                 raise ValueError("eligible_mask must have the same shape as fail_counts.")
 
+        if probability_scale is None:
+            scale = torch.ones_like(fail_counts, dtype=torch.float32)
+        else:
+            scale = torch.as_tensor(probability_scale, dtype=torch.float32).reshape(-1)
+            if scale.shape != fail_counts.shape:
+                raise ValueError("probability_scale must have the same shape as fail_counts.")
+            if not bool(torch.all(torch.isfinite(scale)).item()) or bool(torch.any(scale < 0.0).item()):
+                raise ValueError("probability_scale must contain finite non-negative values.")
+
+        if probe_mask is None:
+            probe = torch.zeros_like(eligible, dtype=torch.bool)
+        else:
+            probe = torch.as_tensor(probe_mask, dtype=torch.bool).reshape(-1)
+            if probe.shape != fail_counts.shape:
+                raise ValueError("probe_mask must have the same shape as fail_counts.")
+
+        probe_probs = probe.to(dtype=torch.float32)
+        probe_sum = torch.sum(probe_probs)
+        if float(probe_sum.item()) > 0.0:
+            probe_probs = probe_probs / probe_sum
+
         uniform_probs = eligible.to(dtype=torch.float32)
         uniform_sum = torch.sum(uniform_probs)
         if float(uniform_sum.item()) <= 0.0:
+            if float(probe_sum.item()) > 0.0:
+                return probe_probs
             raise ValueError("eligible_mask must include at least one entry.")
         uniform_probs = uniform_probs / uniform_sum
+        scaled_uniform_probs = torch.where(eligible, uniform_probs * scale, torch.zeros_like(uniform_probs))
+        scaled_uniform_sum = torch.sum(scaled_uniform_probs)
+        if float(scaled_uniform_sum.item()) > 0.0:
+            scaled_uniform_probs = scaled_uniform_probs / scaled_uniform_sum
+        else:
+            scaled_uniform_probs = uniform_probs
 
+        eligible_sample_counts = torch.where(
+            eligible,
+            torch.clamp(sample_counts, min=0.0),
+            torch.zeros_like(sample_counts),
+        )
+        eligible_count = torch.sum(eligible.to(dtype=torch.float32))
+        total_eligible_samples = torch.sum(eligible_sample_counts)
+        exploration_scale = torch.log(total_eligible_samples + eligible_count + 1.0)
+        exploration = torch.sqrt(exploration_scale / (eligible_sample_counts + 1.0))
         fail_rate = fail_counts / torch.clamp(sample_counts, min=1.0)
-        learned_weights = fail_rate.pow(1.0 / temperature)
+        score = fail_rate + float(exploration_bonus) * exploration
+        learned_weights = score.pow(1.0 / temperature)
         learned_weights = torch.where(eligible, learned_weights, torch.zeros_like(learned_weights))
 
         learned_sum = torch.sum(learned_weights)
@@ -473,7 +660,81 @@ class TrainRunner:
             learned_probs = uniform_probs
 
         probs = (1.0 - uniform_mix) * learned_probs + uniform_mix * uniform_probs
+        probs = torch.where(eligible, probs * scale, torch.zeros_like(probs))
+        probs_sum = torch.sum(probs)
+        if float(probs_sum.item()) > 0.0:
+            probs = probs / probs_sum
+        else:
+            probs = scaled_uniform_probs
+
+        probs = cls._apply_max_uniform_probability_cap(
+            probs,
+            eligible_mask=eligible,
+            uniform_probs=scaled_uniform_probs,
+            max_uniform_ratio=max_uniform_ratio,
+        )
+        if probe_probability > 0.0 and float(probe_sum.item()) > 0.0:
+            probs = (1.0 - probe_probability) * probs + probe_probability * probe_probs
         return probs / torch.clamp(torch.sum(probs), min=torch.finfo(probs.dtype).eps)
+
+    @staticmethod
+    def _apply_max_uniform_probability_cap(
+        probs: torch.Tensor,
+        *,
+        eligible_mask: torch.Tensor,
+        uniform_probs: torch.Tensor,
+        max_uniform_ratio: float | None,
+    ) -> torch.Tensor:
+        probs = torch.as_tensor(probs, dtype=torch.float32).reshape(-1)
+        eligible = torch.as_tensor(eligible_mask, dtype=torch.bool).reshape(-1)
+        uniform_probs = torch.as_tensor(uniform_probs, dtype=torch.float32).reshape(-1)
+        if probs.shape != eligible.shape or probs.shape != uniform_probs.shape:
+            raise ValueError("Probability cap inputs must have the same shape.")
+
+        probs = torch.where(eligible, probs, torch.zeros_like(probs))
+        probs = probs / torch.clamp(torch.sum(probs), min=torch.finfo(probs.dtype).eps)
+        if max_uniform_ratio is None:
+            return probs
+
+        resolved_max_uniform_ratio = float(max_uniform_ratio)
+        if resolved_max_uniform_ratio < 1.0:
+            raise ValueError("max_uniform_ratio must be None or >= 1.")
+
+        eligible_count = int(torch.sum(eligible).item())
+        if eligible_count == 0:
+            raise ValueError("eligible_mask must include at least one entry.")
+
+        max_prob = resolved_max_uniform_ratio / float(eligible_count)
+        if max_prob >= 1.0:
+            return probs
+
+        eps = torch.finfo(probs.dtype).eps
+        if not bool(torch.all(torch.isfinite(probs)).item()):
+            return uniform_probs
+        if float(torch.sum(probs).item()) <= eps:
+            return uniform_probs
+        if bool(torch.all(probs[eligible] <= max_prob + eps).item()):
+            return probs
+
+        eligible_probs = probs[eligible]
+        lower = torch.min(eligible_probs - max_prob)
+        upper = torch.max(eligible_probs)
+        for _ in range(64):
+            threshold = 0.5 * (lower + upper)
+            projected_probs = torch.clamp(eligible_probs - threshold, min=0.0, max=max_prob)
+            if float(torch.sum(projected_probs).item()) > 1.0:
+                lower = threshold
+            else:
+                upper = threshold
+
+        eligible_projected_probs = torch.clamp(eligible_probs - upper, min=0.0, max=max_prob)
+        projected_sum = torch.sum(eligible_projected_probs)
+        if not bool(torch.isfinite(projected_sum).item()) or float(projected_sum.item()) <= eps:
+            return uniform_probs
+
+        capped_probs = torch.zeros_like(probs)
+        capped_probs[eligible] = eligible_projected_probs
+        return capped_probs / projected_sum
 
     @staticmethod
     def _as_cpu_tensor(
@@ -485,6 +746,128 @@ class TrainRunner:
         if tensor.device.type != "cpu":
             tensor = tensor.detach().to(device="cpu")
         return tensor
+
+    @classmethod
+    def _build_sampler_sampling_probabilities(
+        cls,
+        sampler: Any,
+        fail_counts: torch.Tensor,
+        sample_counts: torch.Tensor,
+        *,
+        temperature: float,
+        eligible_mask: torch.Tensor | None = None,
+        probability_scale: torch.Tensor | None = None,
+        probe_mask: torch.Tensor | None = None,
+        probe_probability: float = 0.0,
+    ) -> torch.Tensor:
+        sampler_builder = getattr(sampler, "_build_guarded_sampling_probabilities", None)
+        if callable(sampler_builder):
+            kwargs = {
+                "temperature": temperature,
+                "eligible_mask": eligible_mask,
+                "probability_scale": probability_scale,
+                "probe_mask": probe_mask,
+                "probe_probability": probe_probability,
+            }
+            try:
+                probabilities = sampler_builder(fail_counts, sample_counts, **kwargs)
+                return cls._as_cpu_tensor(probabilities, dtype=torch.float32).reshape(-1)
+            except TypeError:
+                legacy_kwargs = {
+                    "temperature": temperature,
+                    "eligible_mask": eligible_mask,
+                }
+                probabilities = sampler_builder(fail_counts, sample_counts, **legacy_kwargs)
+                return cls._as_cpu_tensor(probabilities, dtype=torch.float32).reshape(-1)
+
+        return cls._build_guarded_sampling_probabilities(
+            fail_counts,
+            sample_counts,
+            temperature=temperature,
+            uniform_mix=float(getattr(sampler, "failure_weight_uniform_mix", 0.0)),
+            eligible_mask=None if eligible_mask is None else cls._as_cpu_tensor(eligible_mask, dtype=torch.bool),
+            probability_scale=(
+                None if probability_scale is None else cls._as_cpu_tensor(probability_scale, dtype=torch.float32)
+            ),
+            probe_mask=None if probe_mask is None else cls._as_cpu_tensor(probe_mask, dtype=torch.bool),
+            probe_probability=probe_probability,
+            exploration_bonus=float(getattr(sampler, "failure_weight_exploration_bonus", 0.0)),
+            max_uniform_ratio=getattr(sampler, "failure_weight_max_uniform_ratio", None),
+        )
+
+    @classmethod
+    def _adaptive_motion_probability_inputs(
+        cls,
+        sampler: Any,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, float]:
+        resolver = getattr(sampler, "_adaptive_motion_probability_inputs", None)
+        if callable(resolver):
+            return resolver()
+
+        adaptive_sampler = getattr(sampler, "adaptive_sampler", None)
+        motion_quarantined = getattr(sampler, "adaptive_motion_quarantined", None)
+        motion_mastered = getattr(sampler, "adaptive_motion_mastered", None)
+        if (
+            not bool(getattr(adaptive_sampler, "enabled", False))
+            or motion_quarantined is None
+            or motion_mastered is None
+        ):
+            return None, None, None, 0.0
+
+        quarantined = cls._as_cpu_tensor(motion_quarantined, dtype=torch.bool).reshape(-1)
+        mastered = cls._as_cpu_tensor(motion_mastered, dtype=torch.bool).reshape(-1)
+        scale = torch.where(
+            mastered,
+            torch.full(mastered.shape, float(getattr(adaptive_sampler, "mastered_probability_scale", 1.0))),
+            torch.ones(mastered.shape, dtype=torch.float32),
+        )
+        return ~quarantined, scale, quarantined, float(getattr(adaptive_sampler, "probe_probability", 0.0))
+
+    @classmethod
+    def _adaptive_bin_probability_inputs(
+        cls,
+        sampler: Any,
+        motion_index: int,
+        base_eligible: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, float]:
+        resolver = getattr(sampler, "_adaptive_bin_probability_inputs", None)
+        if callable(resolver):
+            return resolver(motion_index, base_eligible)
+
+        adaptive_sampler = getattr(sampler, "adaptive_sampler", None)
+        bin_quarantined = getattr(sampler, "adaptive_bin_quarantined", None)
+        bin_mastered = getattr(sampler, "adaptive_bin_mastered", None)
+        if (
+            not bool(getattr(adaptive_sampler, "enabled", False))
+            or bin_quarantined is None
+            or bin_mastered is None
+        ):
+            return base_eligible, None, None, 0.0
+
+        if base_eligible is None:
+            sample_counts = getattr(sampler, "bin_sample_counts", None)
+            if sample_counts is None:
+                return None, None, None, 0.0
+            resolved_base_eligible = torch.ones_like(
+                cls._as_cpu_tensor(sample_counts[motion_index], dtype=torch.float32),
+                dtype=torch.bool,
+            )
+        else:
+            resolved_base_eligible = cls._as_cpu_tensor(base_eligible, dtype=torch.bool).reshape(-1)
+        quarantined = cls._as_cpu_tensor(bin_quarantined[motion_index], dtype=torch.bool).reshape(-1)
+        mastered = cls._as_cpu_tensor(bin_mastered[motion_index], dtype=torch.bool).reshape(-1)
+        quarantined = quarantined & resolved_base_eligible
+        scale = torch.where(
+            mastered,
+            torch.full(mastered.shape, float(getattr(adaptive_sampler, "mastered_probability_scale", 1.0))),
+            torch.ones(mastered.shape, dtype=torch.float32),
+        )
+        return (
+            resolved_base_eligible & ~quarantined,
+            scale,
+            quarantined,
+            float(getattr(adaptive_sampler, "probe_probability", 0.0)),
+        )
 
     @staticmethod
     def _resolve_anchor_index(anchor_times: torch.Tensor, reset_time: torch.Tensor) -> int:
@@ -515,7 +898,6 @@ class TrainRunner:
         ):
             return []
 
-        uniform_mix = float(getattr(sampler, "failure_weight_uniform_mix", 0.0))
         motion_fail_counts = torch.stack(
             [cls._as_cpu_tensor(fail_counts, dtype=torch.float32).sum() for fail_counts in bin_fail_counts],
             dim=0,
@@ -524,11 +906,18 @@ class TrainRunner:
             [cls._as_cpu_tensor(sample_counts, dtype=torch.float32).sum() for sample_counts in bin_sample_counts],
             dim=0,
         )
-        motion_probs = cls._build_guarded_sampling_probabilities(
+        motion_eligible, motion_scale, motion_probe, motion_probe_probability = (
+            cls._adaptive_motion_probability_inputs(sampler)
+        )
+        motion_probs = cls._build_sampler_sampling_probabilities(
+            sampler,
             motion_fail_counts,
             motion_sample_counts,
             temperature=temperature,
-            uniform_mix=uniform_mix,
+            eligible_mask=motion_eligible,
+            probability_scale=motion_scale,
+            probe_mask=motion_probe,
+            probe_probability=motion_probe_probability,
         )
 
         results: list[dict[str, float | int | str]] = []
@@ -545,14 +934,22 @@ class TrainRunner:
                 sample_counts = cls._as_cpu_tensor(bin_sample_counts[motion_index], dtype=torch.float32).reshape(-1)
                 eligible_mask = cls._as_cpu_tensor(bin_reset_eligible[motion_index], dtype=torch.bool).reshape(-1)
                 reset_times = cls._as_cpu_tensor(bin_reset_times[motion_index], dtype=torch.float32).reshape(-1)
-                bin_probs = cls._build_guarded_sampling_probabilities(
+                eligible_mask, probability_scale, probe_mask, probe_probability = cls._adaptive_bin_probability_inputs(
+                    sampler,
+                    motion_index,
+                    eligible_mask,
+                )
+                bin_probs = cls._build_sampler_sampling_probabilities(
+                    sampler,
                     fail_counts,
                     sample_counts,
                     temperature=temperature,
-                    uniform_mix=uniform_mix,
                     eligible_mask=eligible_mask,
+                    probability_scale=probability_scale,
+                    probe_mask=probe_mask,
+                    probe_probability=probe_probability,
                 )
-                for bin_index in torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1).tolist():
+                for bin_index in torch.nonzero(bin_probs > 0.0, as_tuple=False).squeeze(-1).tolist():
                     anchor_index = cls._resolve_anchor_index(anchor_times, reset_times[bin_index])
                     anchor_probs[anchor_index] += motion_probs[motion_index] * bin_probs[bin_index]
 
@@ -1162,6 +1559,9 @@ class TrainRunner:
                 "update/avg_value_clip_fraction": self.tracker.get_mean("value_clip_fraction"),
                 "update/actor_lr": self._optimizer_lr(self.actor_optimizer),
                 "update/critic_lr": self._optimizer_lr(self.critic_optimizer),
+                "sampling/schedule_random_active": float(self.sampling_strategy == "random"),
+                "sampling/schedule_failure_weighted_active": float(self.sampling_strategy == "failure_weighted"),
+                "sampling/adaptive_enabled": float(self.adaptive_sampling_enabled),
             }
         )
         self.update_count += 1
@@ -1191,6 +1591,7 @@ class TrainRunner:
             anchor_body_name=getattr(self.cfg, "anchor_body_name", None),
             segment_source=self.segment_source,
             sampling_strategy=self.sampling_strategy,
+            adaptive_sampling_enabled=self.adaptive_sampling_enabled,
             motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
             observation_window_lengths=self.observation_window_lengths,
             artifacts={"run_dir": str(self.run_paths.root)},
@@ -1202,6 +1603,7 @@ class TrainRunner:
         final_checkpoint_path: Path | None = None
         try:
             for epoch in trange(self.config.num_updates):
+                self._apply_sampling_schedule()
                 obs = self.rollout(obs)
                 self.update()
                 if (epoch + 1) % self.checkpoint_interval == 0:
@@ -1222,6 +1624,10 @@ class TrainRunner:
             "motion_mae_encoder_checkpoint": self.motion_mae_encoder_checkpoint,
             "segment_source": self.segment_source,
             "sampling_strategy": self.sampling_strategy,
+            "adaptive_sampling_enabled": self.adaptive_sampling_enabled,
+            "sampling_schedule_enabled": self.config.sampling_schedule_enabled,
+            "sampling_random_updates": self.config.sampling_random_updates,
+            "adaptive_sampling_start_update": self.config.adaptive_sampling_start_update,
             "observation_window_lengths": self.observation_window_lengths,
             "num_updates": self.config.num_updates,
             "rollout_steps": self.steps,

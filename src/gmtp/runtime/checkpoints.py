@@ -99,6 +99,7 @@ def build_training_checkpoint(
     anchor_body_name: str | None,
     segment_source: str | None = None,
     sampling_strategy: str | None = None,
+    adaptive_sampling_enabled: bool | None = None,
     motion_mae_encoder_checkpoint: str | None = None,
     observation_window_lengths: dict[str, int] | None = None,
     artifacts: dict[str, Any] | None = None,
@@ -124,6 +125,8 @@ def build_training_checkpoint(
         env_payload["segment_source"] = segment_source
     if sampling_strategy is not None:
         env_payload["sampling_strategy"] = sampling_strategy
+    if adaptive_sampling_enabled is not None:
+        env_payload["adaptive_sampling_enabled"] = bool(adaptive_sampling_enabled)
     if observation_window_lengths is not None:
         env_payload["observation_window_lengths"] = resolved_window_lengths
 

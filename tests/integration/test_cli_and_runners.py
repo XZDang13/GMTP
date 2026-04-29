@@ -181,6 +181,7 @@ def _fake_train_module(env_cls=_DummyTrainEnv):
         anchor_body_name="torso_link",
         segment_source="Anchor",
         sampling_strategy="FailureWeighted",
+        adaptive_sampler=types.SimpleNamespace(enabled=False),
         failure_temperature=1.0,
     )
     return types.SimpleNamespace(
@@ -364,6 +365,10 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.motion_mae_encoder_checkpoint is None
     assert args.anchor_log_interval == 100
     assert args.anchor_heatmap_bins == 128
+    assert args.disable_sampling_schedule is False
+    assert args.sampling_random_updates == 1000
+    assert args.adaptive_sampling_start_update == 5000
+    assert args.disable_adaptive_sampling is False
 
     with pytest.raises(SystemExit):
         parser.parse_args(["train", "--attn-block-size", "5"])
@@ -374,6 +379,22 @@ def test_cli_parser_builds_train_and_eval_commands():
     args = parser.parse_args(["train", "--anchor-log-interval", "25", "--anchor-heatmap-bins", "64"])
     assert args.anchor_log_interval == 25
     assert args.anchor_heatmap_bins == 64
+
+    args = parser.parse_args(
+        [
+            "train",
+            "--disable-sampling-schedule",
+            "--sampling-random-updates",
+            "10",
+            "--adaptive-sampling-start-update",
+            "20",
+            "--disable-adaptive-sampling",
+        ]
+    )
+    assert args.disable_sampling_schedule is True
+    assert args.sampling_random_updates == 10
+    assert args.adaptive_sampling_start_update == 20
+    assert args.disable_adaptive_sampling is True
 
     args = parser.parse_args(["train", "--actor-fusion-type", "motion_residual"])
     assert args.actor_fusion_type == "motion_residual"
@@ -708,10 +729,40 @@ def test_train_runner_summary_and_checkpoint_record_anchor_sampler_metadata(tmp_
     checkpoint = load_checkpoint_v2(summary["final_checkpoint"])
 
     assert summary["segment_source"] == "anchor"
-    assert summary["sampling_strategy"] == "failure_weighted"
+    assert summary["sampling_strategy"] == "random"
+    assert summary["adaptive_sampling_enabled"] is False
     assert checkpoint.env["segment_source"] == "anchor"
-    assert checkpoint.env["sampling_strategy"] == "failure_weighted"
+    assert checkpoint.env["sampling_strategy"] == "random"
+    assert checkpoint.env["adaptive_sampling_enabled"] is False
     assert checkpoint.motion_files[0].endswith("jump_anchor.npz")
+
+
+def test_train_runner_sampling_schedule_switches_strategy_and_adaptive_state(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            sampling_random_updates=2,
+            adaptive_sampling_start_update=4,
+        )
+    )
+
+    assert runner.sampling_strategy == "random"
+    assert runner.adaptive_sampling_enabled is False
+    assert runner.cfg.sampling_strategy == "Random"
+
+    runner.update_count = 2
+    runner._apply_sampling_schedule()
+    assert runner.sampling_strategy == "failure_weighted"
+    assert runner.adaptive_sampling_enabled is False
+    assert runner.cfg.sampling_strategy == "FailureWeighted"
+
+    runner.update_count = 4
+    runner._apply_sampling_schedule()
+    assert runner.sampling_strategy == "failure_weighted"
+    assert runner.adaptive_sampling_enabled is True
+    assert runner.cfg.adaptive_sampler.enabled is True
+    runner.env.close()
 
 
 def test_isaac_eval_runner_dry_construction(tmp_path, monkeypatch):
