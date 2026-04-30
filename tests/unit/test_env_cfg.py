@@ -77,29 +77,11 @@ def _install_env_cfg_stubs(monkeypatch):
         Anchor = "Anchor"
 
     @dataclass(frozen=True)
-    class FakeAdaptiveSamplerCfg:
-        enabled: bool = False
-        warmup_samples: int = 96
-        anchor_drop_fail_rate: float = 0.97
-        anchor_reenable_fail_rate: float = 0.75
-        anchor_cooldown_resets: int = 500
-        motion_min_samples: int = 256
-        motion_drop_fail_rate: float = 0.98
-        motion_drop_anchor_fraction: float = 0.8
-        motion_cooldown_resets: int = 1000
-        probe_probability: float = 0.01
-        mastered_fail_rate: float = 0.05
-        mastered_probability_scale: float = 0.25
-        min_live_motion_fraction: float = 0.6
-        min_live_anchor_fraction: float = 0.5
-
-    @dataclass(frozen=True)
     class FakeEnvCfgSymbols:
         G1MotionTrackingEnvCfg: type
         G1TrainingEventCfg: type
         SamplingStrategy: type
         SegmentSource: type
-        AdaptiveSamplerCfg: type | None
 
     compat_mod = types.ModuleType("gmtp.integrations.ref2act.compat")
     compat_mod.load_env_cfg_symbols = lambda: FakeEnvCfgSymbols(
@@ -107,7 +89,6 @@ def _install_env_cfg_stubs(monkeypatch):
         G1TrainingEventCfg=FakeG1TrainingEventCfg,
         SamplingStrategy=FakeSamplingStrategy,
         SegmentSource=FakeSegmentSource,
-        AdaptiveSamplerCfg=FakeAdaptiveSamplerCfg,
     )
     compat_mod.load_mujoco_symbols = lambda: None
 
@@ -141,10 +122,12 @@ def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
 
         assert training_cfg.sampling_strategy == env_cfg.SamplingStrategy.FailureWeighted
         assert training_cfg.segment_source == env_cfg.SegmentSource.Anchor
-        assert training_cfg.adaptive_sampler.enabled is False
-        assert training_cfg.adaptive_sampler.probe_probability == 0.01
-        assert training_cfg.adaptive_sampler.min_live_anchor_fraction == 0.5
-        assert training_cfg.adaptive_sampler.min_live_motion_fraction == 0.6
+        assert training_cfg.init_failure_bins is True
+        assert training_cfg.failure_decay == 0.999
+        assert training_cfg.failure_weight_uniform_mix == 0.2
+        assert training_cfg.failure_weight_max_uniform_ratio == 4.0
+        assert training_cfg.failure_weight_exploration_bonus == 0.25
+        assert training_cfg.failure_temperature == 1.25
         assert training_cfg.recovery.enabled is False
         assert eval_cfg.recovery.enabled is False
         assert training_cfg.robust_tracking.enabled is True

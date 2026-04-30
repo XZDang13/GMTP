@@ -2,6 +2,8 @@ from pathlib import Path
 
 from gmtp.integrations.ref2act.motion import (
     DEFAULT_EXPERIMENT_MOTION_FILES,
+    DEFAULT_MOCAP_DATASET_NAMES,
+    MOCAP_DATA_DIR,
     infer_motion_files_from_checkpoint,
     motion_label,
     motion_names,
@@ -11,12 +13,12 @@ from gmtp.integrations.ref2act.motion import (
 )
 
 
-def test_default_experiment_motion_files_use_shipped_anchor_assets():
-    expected = tuple(f"env/assests/{path.name}" for path in sorted(Path("env/assests").glob("*_anchor.npz")))
+def test_default_experiment_motion_files_use_cmu_and_omomo_datasets():
+    expected = tuple(str((MOCAP_DATA_DIR / name).resolve()) for name in DEFAULT_MOCAP_DATASET_NAMES)
 
     assert DEFAULT_EXPERIMENT_MOTION_FILES == expected
-    assert expected
-    assert all(path.endswith("_anchor.npz") for path in DEFAULT_EXPERIMENT_MOTION_FILES)
+    assert {Path(path).name for path in DEFAULT_EXPERIMENT_MOTION_FILES} == {"CMU", "OMOMO"}
+    assert all(Path(path).is_dir() for path in DEFAULT_EXPERIMENT_MOTION_FILES)
 
 
 def test_motion_helpers_normalize_resolve_and_label():
@@ -28,6 +30,15 @@ def test_motion_helpers_normalize_resolve_and_label():
     assert motion_names(normalized) == ["jump_anchor", "walk_anchor"]
     assert motion_label(normalized) == "jump_anchor_walk_anchor"
     assert resolve_motion_file("jump_anchor").endswith("jump_anchor.npz")
+
+
+def test_motion_helpers_resolve_mocap_dataset_aliases_and_motion_names():
+    resolved = resolve_motion_files(["CMU", "OMOMO"])
+
+    assert any("/CMU/" in path for path in resolved)
+    assert any("/OMOMO/" in path for path in resolved)
+    assert motion_label(resolved) == "CMU_OMOMO"
+    assert resolve_motion_file("11_01_stageii").endswith("CMU/11/11_01_stageii.npz")
 
 
 def test_infer_motion_files_from_checkpoint_prefers_checkpoint_metadata():

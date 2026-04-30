@@ -171,21 +171,23 @@ def _window_length(window_lengths, prefix: str, default: int) -> int:
 
 
 def _fake_train_module(env_cls=_DummyTrainEnv):
-    cfg = types.SimpleNamespace(
-        scene=types.SimpleNamespace(num_envs=2),
-        action_space=2,
-        expert_motion_file=[DEFAULT_TEST_MOTION_FILE],
-        action=types.SimpleNamespace(mode="offset"),
-        action_mod="Offset",
-        root_link_name="torso_link",
-        anchor_body_name="torso_link",
-        segment_source="Anchor",
-        sampling_strategy="FailureWeighted",
-        adaptive_sampler=types.SimpleNamespace(enabled=False),
-        failure_temperature=1.0,
-    )
-    return types.SimpleNamespace(
-        make_training_env=lambda window_lengths=None: (
+    def make_training_env(
+        window_lengths=None,
+        motion_files=None,
+    ):
+        cfg = types.SimpleNamespace(
+            scene=types.SimpleNamespace(num_envs=2),
+            action_space=2,
+            expert_motion_file=list(motion_files or [DEFAULT_TEST_MOTION_FILE]),
+            action=types.SimpleNamespace(mode="offset"),
+            action_mod="Offset",
+            root_link_name="torso_link",
+            anchor_body_name="torso_link",
+            segment_source="Anchor",
+            sampling_strategy="FailureWeighted",
+            failure_temperature=1.0,
+        )
+        return (
             env_cls(
                 batch_size=2,
                 robot_window_length=_window_length(window_lengths, "projected_gravity", 4),
@@ -193,6 +195,9 @@ def _fake_train_module(env_cls=_DummyTrainEnv):
             ),
             cfg,
         )
+
+    return types.SimpleNamespace(
+        make_training_env=make_training_env,
     )
 
 
@@ -363,12 +368,10 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.disable_amp is False
     assert args.disable_wandb is False
     assert args.motion_mae_encoder_checkpoint is None
+    assert args.motion_files is None
+    assert args.resume_checkpoint_path is None
     assert args.anchor_log_interval == 100
     assert args.anchor_heatmap_bins == 128
-    assert args.disable_sampling_schedule is False
-    assert args.sampling_random_updates == 1000
-    assert args.adaptive_sampling_start_update == 5000
-    assert args.disable_adaptive_sampling is False
 
     with pytest.raises(SystemExit):
         parser.parse_args(["train", "--attn-block-size", "5"])
@@ -380,24 +383,14 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.anchor_log_interval == 25
     assert args.anchor_heatmap_bins == 64
 
-    args = parser.parse_args(
-        [
-            "train",
-            "--disable-sampling-schedule",
-            "--sampling-random-updates",
-            "10",
-            "--adaptive-sampling-start-update",
-            "20",
-            "--disable-adaptive-sampling",
-        ]
-    )
-    assert args.disable_sampling_schedule is True
-    assert args.sampling_random_updates == 10
-    assert args.adaptive_sampling_start_update == 20
-    assert args.disable_adaptive_sampling is True
-
     args = parser.parse_args(["train", "--actor-fusion-type", "motion_residual"])
     assert args.actor_fusion_type == "motion_residual"
+
+    args = parser.parse_args(["train", "--motion-files", "CMU/11/11_01_stageii.npz", "env/assests/jump_anchor.npz"])
+    assert args.motion_files == ["CMU/11/11_01_stageii.npz", "env/assests/jump_anchor.npz"]
+
+    args = parser.parse_args(["train", "--resume-checkpoint", "path/to/model_v2.pth"])
+    assert args.resume_checkpoint_path == "path/to/model_v2.pth"
 
     args = parser.parse_args(["eval", "isaac", "--checkpoint", "foo.pth", "--disable-amp"])
     assert args.command == "eval"
@@ -503,6 +496,18 @@ def test_train_runner_dry_construction(monkeypatch):
     assert runner.motion_files[0].endswith("jump_anchor.npz")
     config_payload = json.loads(runner.run_paths.config_path.read_text(encoding="utf-8"))
     assert config_payload["config"]["use_amp"] is True
+    runner.env.close()
+
+
+def test_train_runner_passes_motion_file_override_to_training_env(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+    motion_files = ["env/assests/walk_anchor.npz"]
+
+    runner = TrainRunner(RunConfig(use_wandb=False, motion_files=motion_files))
+
+    assert runner.motion_files == motion_files
+    config_payload = json.loads(runner.run_paths.config_path.read_text(encoding="utf-8"))
+    assert config_payload["config"]["motion_files"] == motion_files
     runner.env.close()
 
 
@@ -664,6 +669,99 @@ def test_train_runner_update_smoke_uses_cpu_fallback(monkeypatch):
     runner.env.close()
 
 
+def test_train_runner_warm_starts_from_checkpoint_without_trainer_state(tmp_path, monkeypatch, capsys):
+    checkpoint_path = _write_checkpoint(tmp_path, robot_window_length=1)
+    checkpoint = load_checkpoint_v2(checkpoint_path)
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            resume_checkpoint_path=str(checkpoint_path),
+            output_root=str(tmp_path / "runs"),
+        )
+    )
+    output = capsys.readouterr().out
+
+    assert "warm-starting actor/critic" in output
+    assert runner.resume_mode == "warm_start"
+    assert runner.resume_trainer_state_restored is False
+    assert runner.update_count == 0
+    assert runner.global_step == 0
+    assert runner.actor_kwargs == checkpoint.actor_kwargs
+    assert runner.motion_files == checkpoint.motion_files
+    for key, value in checkpoint.model["actor"].items():
+        assert torch.equal(runner.actor.state_dict()[key].detach().cpu(), value)
+    for key, value in checkpoint.model["critic"].items():
+        assert torch.equal(runner.critic.state_dict()[key].detach().cpu(), value)
+    runner.env.close()
+
+
+def test_train_runner_restores_full_trainer_state_and_runs_additional_updates(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+    source_runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=1,
+            num_updates=1,
+            output_root=str(tmp_path / "source_runs"),
+        )
+    )
+    source_runner.rollout(source_runner.initial_obs)
+    source_runner.update()
+    checkpoint_path = source_runner.save_checkpoint(str(source_runner.update_count))
+    source_runner.env.close()
+    checkpoint = load_checkpoint_v2(checkpoint_path)
+
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=1,
+            num_updates=2,
+            checkpoint_interval=1000,
+            resume_checkpoint_path=str(checkpoint_path),
+            output_root=str(tmp_path / "resume_runs"),
+        )
+    )
+
+    assert runner.resume_mode == "full_state"
+    assert runner.resume_trainer_state_restored is True
+    assert runner.start_update_count == 1
+    assert runner.start_global_step == 1
+    assert runner.update_count == checkpoint.training["update_count"]
+    assert runner.global_step == checkpoint.training["global_step"]
+    assert runner.lr_scheduler.state_dict() == checkpoint.training["lr_scheduler"]
+    assert runner.grad_scaler.state_dict() == checkpoint.training["grad_scaler"]
+
+    restored_actor_optimizer = runner.actor_optimizer.state_dict()["optimizers"][0]["state"]
+    checkpoint_actor_optimizer = checkpoint.training["actor_optimizer"]["optimizers"][0]["state"]
+    assert restored_actor_optimizer.keys() == checkpoint_actor_optimizer.keys()
+    first_state_key = next(iter(checkpoint_actor_optimizer))
+    for state_name, checkpoint_state_value in checkpoint_actor_optimizer[first_state_key].items():
+        if torch.is_tensor(checkpoint_state_value):
+            assert torch.equal(
+                restored_actor_optimizer[first_state_key][state_name].detach().cpu(),
+                checkpoint_state_value.detach().cpu(),
+            )
+            break
+    else:
+        raise AssertionError("Expected at least one tensor optimizer state value.")
+
+    summary = runner.train()
+    final_checkpoint = load_checkpoint_v2(summary["final_checkpoint"])
+
+    assert summary["resume_checkpoint"] == str(checkpoint_path.resolve())
+    assert summary["resume_mode"] == "full_state"
+    assert summary["resume_trainer_state_restored"] is True
+    assert summary["num_updates"] == 2
+    assert summary["start_update_count"] == 1
+    assert summary["final_update_count"] == 3
+    assert summary["start_global_step"] == 1
+    assert summary["final_global_step"] == 3
+    assert final_checkpoint.training["update_count"] == 3
+    assert final_checkpoint.training["global_step"] == 3
+
+
 def test_train_runner_logs_anchor_probability_summary_and_heatmap_every_configured_interval(
     tmp_path,
     monkeypatch,
@@ -687,9 +785,9 @@ def test_train_runner_logs_anchor_probability_summary_and_heatmap_every_configur
     capsys.readouterr()
     runner.rollout(runner.initial_obs)
     runner.update()
-    assert "anchor reset probabilities after update" not in capsys.readouterr().out
+    assert "sampler snapshot after update" not in capsys.readouterr().out
     assert not any(
-        "sampling/anchor_reset_probability/jump_anchor/A000" in payload for payload in logged_payloads
+        "sampler/reset_distribution/anchors/jump_anchor/A000" in payload for payload in logged_payloads
     )
 
     runner.update_count = 99
@@ -697,13 +795,15 @@ def test_train_runner_logs_anchor_probability_summary_and_heatmap_every_configur
     runner.update()
     output = capsys.readouterr().out
 
-    assert "anchor reset probabilities after update 100:" in output
-    assert "max=1.000000" in output
+    assert "sampler snapshot after update 100" in output
+    assert "max_p=1.000000" in output
+    assert "reset anchors:" in output
+    assert "reset motions:" in output
     assert "jump_anchor A0 t=0.000s p=1.000000" in output
     assert any(
-        "sampling/anchor_reset_probability/jump_anchor/A000" not in payload
-        and payload.get("sampling/anchor_reset_probability/max") == 1.0
-        and payload.get("sampling/anchor_reset_probability/top1_mass") == 1.0
+        "sampler/reset_distribution/anchors/jump_anchor/A000" not in payload
+        and payload.get("sampler/reset_distribution/anchors/max_probability") == 1.0
+        and payload.get("sampler/reset_distribution/anchors/top1_mass") == 1.0
         for payload in logged_payloads
     )
     anchor_debug_dir = runner.run_paths.debug_dir / "anchor_reset_probabilities"
@@ -729,39 +829,18 @@ def test_train_runner_summary_and_checkpoint_record_anchor_sampler_metadata(tmp_
     checkpoint = load_checkpoint_v2(summary["final_checkpoint"])
 
     assert summary["segment_source"] == "anchor"
-    assert summary["sampling_strategy"] == "random"
-    assert summary["adaptive_sampling_enabled"] is False
+    assert summary["sampling_strategy"] == "failure_weighted"
     assert checkpoint.env["segment_source"] == "anchor"
-    assert checkpoint.env["sampling_strategy"] == "random"
-    assert checkpoint.env["adaptive_sampling_enabled"] is False
+    assert checkpoint.env["sampling_strategy"] == "failure_weighted"
     assert checkpoint.motion_files[0].endswith("jump_anchor.npz")
 
 
-def test_train_runner_sampling_schedule_switches_strategy_and_adaptive_state(monkeypatch):
+def test_train_runner_uses_failure_weighted_sampling_from_start(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
-    runner = TrainRunner(
-        RunConfig(
-            use_wandb=False,
-            sampling_random_updates=2,
-            adaptive_sampling_start_update=4,
-        )
-    )
+    runner = TrainRunner(RunConfig(use_wandb=False))
 
-    assert runner.sampling_strategy == "random"
-    assert runner.adaptive_sampling_enabled is False
-    assert runner.cfg.sampling_strategy == "Random"
-
-    runner.update_count = 2
-    runner._apply_sampling_schedule()
     assert runner.sampling_strategy == "failure_weighted"
-    assert runner.adaptive_sampling_enabled is False
     assert runner.cfg.sampling_strategy == "FailureWeighted"
-
-    runner.update_count = 4
-    runner._apply_sampling_schedule()
-    assert runner.sampling_strategy == "failure_weighted"
-    assert runner.adaptive_sampling_enabled is True
-    assert runner.cfg.adaptive_sampler.enabled is True
     runner.env.close()
 
 

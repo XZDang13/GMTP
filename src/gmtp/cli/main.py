@@ -65,6 +65,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_motion_encoder_type_argument(train_parser, default="transformer")
     _add_actor_fusion_type_argument(train_parser)
     _add_motion_mae_encoder_checkpoint_argument(train_parser)
+    train_parser.add_argument(
+        "--motion-files",
+        nargs="+",
+        default=None,
+        help="Override training motions. Accepts files, directories, or CMU/OMOMO dataset aliases.",
+    )
+    train_parser.add_argument(
+        "--resume-checkpoint",
+        dest="resume_checkpoint_path",
+        default=None,
+        help="Load a CheckpointV2 policy checkpoint and continue training in a new run directory.",
+    )
     train_parser.add_argument("--rollout-steps", type=int, default=20)
     train_parser.add_argument("--num-updates", type=int, default=1000)
     train_parser.add_argument("--checkpoint-interval", type=int, default=4000)
@@ -73,28 +85,6 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--disable-wandb", action="store_true")
     train_parser.add_argument("--anchor-log-interval", type=int, default=100)
     train_parser.add_argument("--anchor-heatmap-bins", type=int, default=128)
-    train_parser.add_argument(
-        "--disable-sampling-schedule",
-        action="store_true",
-        help="Keep the Ref2Act training env sampling config fixed for the whole run.",
-    )
-    train_parser.add_argument(
-        "--sampling-random-updates",
-        type=int,
-        default=1000,
-        help="Number of initial updates that use random reset sampling.",
-    )
-    train_parser.add_argument(
-        "--adaptive-sampling-start-update",
-        type=int,
-        default=5000,
-        help="Update at which failure-weighted reset sampling enables adaptive quarantine/probe behavior.",
-    )
-    train_parser.add_argument(
-        "--disable-adaptive-sampling",
-        action="store_true",
-        help="Keep adaptive sampling disabled after the failure-weighted warmup.",
-    )
     _add_disable_amp_argument(train_parser)
     train_parser.add_argument("--headless", action="store_true")
 
@@ -200,6 +190,8 @@ def _run_train(args) -> int:
                 motion_encoder_type=args.motion_encoder_type,
                 actor_fusion_type=args.actor_fusion_type,
                 motion_mae_encoder_checkpoint=args.motion_mae_encoder_checkpoint,
+                motion_files=args.motion_files,
+                resume_checkpoint_path=args.resume_checkpoint_path,
                 use_amp=not args.disable_amp,
                 rollout_steps=args.rollout_steps,
                 num_updates=args.num_updates,
@@ -209,10 +201,6 @@ def _run_train(args) -> int:
                 use_wandb=not args.disable_wandb,
                 anchor_log_interval=args.anchor_log_interval,
                 anchor_heatmap_bins=args.anchor_heatmap_bins,
-                sampling_schedule_enabled=not args.disable_sampling_schedule,
-                sampling_random_updates=args.sampling_random_updates,
-                adaptive_sampling_start_update=args.adaptive_sampling_start_update,
-                adaptive_sampling_enabled=not args.disable_adaptive_sampling,
             )
         ).train()
     finally:

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import inspect
 import json
+import random
 import re
 import shutil
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -31,12 +32,12 @@ from gmtp.models import (
     get_policy_records,
     get_policy_storage_specs,
 )
-from gmtp.runtime.checkpoints import build_training_checkpoint, save_checkpoint_v2
+from gmtp.runtime.checkpoints import CheckpointV2, build_training_checkpoint, load_checkpoint_v2, save_checkpoint_v2
 from gmtp.runtime.amp import AMP_DTYPE_NAME, autocast_context, build_grad_scaler, normalize_device, resolve_amp_enabled
 from gmtp.runtime.config import RunConfig
 from gmtp.runtime.io import build_run_paths, write_json
 from gmtp.runtime.observations import infer_env_observation_dims, structure_env_observation
-from gmtp.runtime.policy import resolve_motion_mae_checkpoint_path
+from gmtp.runtime.policy import resolve_checkpoint_actor_spec, resolve_motion_mae_checkpoint_path
 
 RECOVERY_METRIC_LOG_NAMES = {
     "fall_recovery/active_rate": "recovery/active_rate",
@@ -52,8 +53,18 @@ RECOVERY_TIMEOUT_RATE_KEY = "fall_recovery/timeout_rate"
 RECOVERY_RATIO_EPS = 1.0e-8
 PPO_CLIP_RATIO = 0.2
 ENTROPY_COEF = 0.005
-ANCHOR_HEATMAP_TOP_LABELS = 30
-ANCHOR_CONSOLE_TOP_K = 10
+ANCHOR_CONSOLE_TOP_K = 20
+ANCHOR_DASHBOARD_MAX_RANK_BANDS = 80
+ANCHOR_DASHBOARD_TOP_K = 20
+ANCHOR_DASHBOARD_LABEL_CHARS = 34
+REQUIRED_TRAINER_STATE_KEYS = (
+    "actor_optimizer",
+    "critic_optimizer",
+    "lr_scheduler",
+    "grad_scaler",
+    "update_count",
+    "global_step",
+)
 
 
 @dataclass(frozen=True)
@@ -66,12 +77,21 @@ class AnchorProbabilityArrays:
 
 
 @dataclass(frozen=True)
-class AnchorHeatmapGrid:
+class AnchorRankBandGrid:
     values: np.ndarray
-    motion_indices: np.ndarray
-    motion_names: list[str]
-    motion_probabilities: np.ndarray
     num_bins: int
+    num_motions: int
+    num_rank_bands: int
+
+
+class StartupTimer:
+    def __init__(self, *, prefix: str = "train startup") -> None:
+        self.prefix = prefix
+        self.start_time = perf_counter()
+
+    def log(self, message: str) -> None:
+        elapsed = perf_counter() - self.start_time
+        print(f"{self.prefix} [{elapsed:7.2f}s]: {message}", flush=True)
 
 
 class OptimizerCollection(torch.optim.Optimizer):
@@ -127,29 +147,50 @@ class OptimizerCollection(torch.optim.Optimizer):
 class TrainRunner:
     def __init__(self, config: RunConfig):
         self.config = config
+        startup_timer = StartupTimer()
+        self.resume_checkpoint_path = (
+            None if config.resume_checkpoint_path is None else Path(config.resume_checkpoint_path).expanduser().resolve()
+        )
+        self.resume_checkpoint: CheckpointV2 | None = None
+        self.resume_mode = "none"
+        self.resume_trainer_state_restored = False
+        if self.resume_checkpoint_path is not None:
+            startup_timer.log(f"loading resume checkpoint {self.resume_checkpoint_path}")
+            self.resume_checkpoint = load_checkpoint_v2(self.resume_checkpoint_path)
+
+        self.actor_type, self.actor_config_kwargs = self._resolve_actor_config(config, self.resume_checkpoint)
+        self.motion_file_inputs = self._resolve_motion_file_inputs(config, self.resume_checkpoint)
+
+        startup_timer.log("importing Isaac/Ref2Act training environment")
         from gmtp.integrations.ref2act.isaac_env import make_training_env
 
+        startup_timer.log("configuring training environment")
         self.observation_window_lengths = resolve_observation_window_lengths(
-            robot_window_length=config.robot_window_length,
-            motion_window_length=config.motion_window_length,
+            robot_window_length=int(self.actor_config_kwargs["robot_window_length"]),
+            motion_window_length=int(self.actor_config_kwargs["motion_window_length"]),
         )
         make_training_kwargs = self._build_make_training_env_kwargs(
             make_training_env,
             window_lengths=self.observation_window_lengths,
-            config=config,
+            motion_files=self.motion_file_inputs,
         )
+        if self.motion_file_inputs is None:
+            startup_timer.log("creating training environment with default motion set")
+        else:
+            startup_timer.log(f"creating training environment with {len(self.motion_file_inputs)} motion input(s)")
         self.env, self.cfg = make_training_env(**make_training_kwargs)
+        startup_timer.log(f"training environment ready with {len(self.cfg.expert_motion_file)} resolved motion clip(s)")
         self.device = normalize_device(self.env.unwrapped.device)
         self.requested_amp = bool(config.use_amp)
         self.use_amp = resolve_amp_enabled(self.requested_amp, self.device)
         self.amp_dtype = AMP_DTYPE_NAME
-        self.actor_type = ActorType.FILM_RES
         self.segment_source = self._normalize_choice_name(getattr(self.cfg, "segment_source", None))
         self.sampling_strategy = self._normalize_choice_name(getattr(self.cfg, "sampling_strategy", None))
-        self.adaptive_sampling_enabled = self._adaptive_sampler_enabled()
         self.motion_files = list(self.cfg.expert_motion_file)
         self.motion_name = motion_label(self.motion_files)
+        startup_timer.log(self._format_sampler_config_summary())
         resolved_motion_mae_checkpoint = resolve_motion_mae_checkpoint_path(
+            self.resume_checkpoint,
             override=config.motion_mae_encoder_checkpoint,
         )
         self.motion_mae_encoder_checkpoint = (
@@ -157,7 +198,10 @@ class TrainRunner:
         )
         self.run_date = datetime.now().strftime("%Y%m%d")
         self.checkpoint_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_name = config.run_name or f"G1_{len(self.motion_files)}_{self.run_date}"
+        default_run_name = f"G1_{len(self.motion_files)}_{self.run_date}"
+        if self.resume_checkpoint_path is not None:
+            default_run_name = f"{default_run_name}_resume"
+        self.run_name = config.run_name or default_run_name
         self.run_paths = build_run_paths(config.output_root, "train", self.run_name)
         self.checkpoint_interval = config.checkpoint_interval
         if config.anchor_log_interval < 1:
@@ -170,17 +214,17 @@ class TrainRunner:
         self.steps = config.rollout_steps
         self.global_step = 0
         self.update_count = 0
-        self._last_sampling_schedule_state: tuple[str | None, bool] | None = None
-        self._apply_sampling_schedule()
 
         write_json(self.run_paths.config_path, {"command": "train", "config": self.config})
 
+        startup_timer.log("resetting training environment")
         self.initial_obs, _ = self.env.reset()
         self.initial_obs = structure_env_observation(
             self.initial_obs,
             action_dim=self.cfg.action_space,
             observation_window_lengths=self.observation_window_lengths,
         )
+        startup_timer.log("building policy and value models")
         self.raw_obs_dims = infer_env_observation_dims(self.initial_obs)
         self.obs_dims = self.raw_obs_dims
         self.actor = build_actor(
@@ -193,6 +237,7 @@ class TrainRunner:
         ).to(self.device)
         self.actor_kwargs = get_actor_kwargs(self.actor, self.actor_type)
         self.critic = Critic(self.obs_dims["critic"], action_dim=self.cfg.action_space).to(self.device)
+        startup_timer.log("creating optimizers and rollout storage")
 
         self.actor_optimizer, actor_optimizer_stats = self._build_optimizer_collection(
             {"actor": self.actor},
@@ -204,6 +249,9 @@ class TrainRunner:
         )
         self.grad_scaler = build_grad_scaler(self.use_amp)
         self.lr_scheduler = KLAdaptiveLR(self.actor_optimizer, 0.01)
+        self._restore_resume_checkpoint(startup_timer)
+        self.start_update_count = int(self.update_count)
+        self.start_global_step = int(self.global_step)
 
         self.rollout_buffer = ReplayBuffer(self.cfg.scene.num_envs, self.steps)
         self.policy_storage_specs = get_policy_storage_specs(
@@ -248,7 +296,9 @@ class TrainRunner:
 
         self.use_wandb = bool(config.use_wandb)
         if self.use_wandb:
+            startup_timer.log("initializing W&B logger")
             WandbLogger.init_project("Mimic", self.run_name)
+        startup_timer.log("ready to enter PPO loop")
 
         print(
             "actor optimizer split:",
@@ -261,15 +311,60 @@ class TrainRunner:
             f"AdamW={critic_optimizer_stats['adamw_tensors']} tensors / {critic_optimizer_stats['adamw_numel']} params",
         )
 
-    def _build_actor_kwargs(self) -> dict[str, int | str]:
+    @staticmethod
+    def _build_config_actor_kwargs(config: RunConfig) -> dict[str, int | str]:
         return {
-            "num_blocks": self.config.num_blocks,
-            "robot_window_length": self.config.robot_window_length,
-            "robot_encoder_type": self.config.robot_encoder_type,
-            "motion_window_length": self.config.motion_window_length,
-            "motion_encoder_type": self.config.motion_encoder_type,
-            "actor_fusion_type": self.config.actor_fusion_type,
+            "num_blocks": config.num_blocks,
+            "robot_window_length": config.robot_window_length,
+            "robot_encoder_type": config.robot_encoder_type,
+            "motion_window_length": config.motion_window_length,
+            "motion_encoder_type": config.motion_encoder_type,
+            "actor_fusion_type": config.actor_fusion_type,
         }
+
+    @classmethod
+    def _resolve_actor_config(
+        cls,
+        config: RunConfig,
+        checkpoint: CheckpointV2 | None,
+    ) -> tuple[ActorType, dict[str, int | str]]:
+        if checkpoint is None:
+            return ActorType.FILM_RES, cls._build_config_actor_kwargs(config)
+
+        return resolve_checkpoint_actor_spec(checkpoint)
+
+    @staticmethod
+    def _resolve_motion_file_inputs(
+        config: RunConfig,
+        checkpoint: CheckpointV2 | None,
+    ) -> list[str] | None:
+        if config.motion_files is not None:
+            return list(config.motion_files)
+        if checkpoint is None:
+            return None
+        checkpoint_motion_files = checkpoint.motion_files
+        return checkpoint_motion_files or None
+
+    def _build_actor_kwargs(self) -> dict[str, int | str]:
+        return dict(self.actor_config_kwargs)
+
+    def _format_sampler_config_summary(self) -> str:
+        env_unwrapped = getattr(getattr(self, "env", None), "unwrapped", None)
+        sampler = getattr(env_unwrapped, "sampler", None)
+        num_anchors = getattr(sampler, "num_bins", None)
+        num_anchors_text = "unknown" if num_anchors is None else str(int(num_anchors))
+        return (
+            "sampler ready: "
+            f"strategy={self.sampling_strategy} "
+            f"source={self.segment_source} "
+            f"motions={len(self.motion_files)} "
+            f"anchors={num_anchors_text} "
+            f"temperature={float(getattr(self.cfg, 'failure_temperature', 1.0)):.3g} "
+            f"uniform_mix={float(getattr(self.cfg, 'failure_weight_uniform_mix', 0.0)):.3g} "
+            f"max_uniform_ratio={getattr(self.cfg, 'failure_weight_max_uniform_ratio', None)} "
+            f"exploration_bonus={float(getattr(self.cfg, 'failure_weight_exploration_bonus', 0.0)):.3g} "
+            f"decay={float(getattr(self.cfg, 'failure_decay', 1.0)):.5g}"
+        )
 
     @staticmethod
     def _normalize_choice_name(value: Any) -> str | None:
@@ -285,135 +380,18 @@ class TrainRunner:
         return "".join(normalized)
 
     @staticmethod
-    def _initial_sampling_schedule_state(config: RunConfig) -> tuple[str, bool] | None:
-        if not config.sampling_schedule_enabled:
-            return None
-        if config.sampling_random_updates > 0:
-            return "Random", False
-        adaptive_enabled = bool(config.adaptive_sampling_enabled) and config.adaptive_sampling_start_update <= 0
-        return "FailureWeighted", adaptive_enabled
-
-    @classmethod
     def _build_make_training_env_kwargs(
-        cls,
         make_training_env,
         *,
         window_lengths: Mapping[str, int],
-        config: RunConfig,
+        motion_files: list[str] | None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"window_lengths": window_lengths}
-        initial_state = cls._initial_sampling_schedule_state(config)
-        if initial_state is None:
+        if motion_files is None:
             return kwargs
 
-        try:
-            parameters = inspect.signature(make_training_env).parameters
-        except (TypeError, ValueError):
-            return kwargs
-
-        strategy_name, adaptive_enabled = initial_state
-        if "sampling_strategy" in parameters:
-            kwargs["sampling_strategy"] = strategy_name
-        if "adaptive_sampler_enabled" in parameters:
-            kwargs["adaptive_sampler_enabled"] = adaptive_enabled
+        kwargs["motion_files"] = motion_files
         return kwargs
-
-    @staticmethod
-    def _coerce_choice_like(current_value: Any, choice_name: str) -> Any:
-        if isinstance(current_value, str):
-            return choice_name
-
-        if current_value is not None:
-            choice_type = type(current_value)
-            members = getattr(choice_type, "__members__", None)
-            if isinstance(members, Mapping) and choice_name in members:
-                return members[choice_name]
-            if hasattr(choice_type, choice_name):
-                return getattr(choice_type, choice_name)
-
-        return choice_name
-
-    @staticmethod
-    def _replace_adaptive_sampler_enabled(adaptive_sampler: Any, enabled: bool) -> Any:
-        if adaptive_sampler is None or not hasattr(adaptive_sampler, "enabled"):
-            return adaptive_sampler
-        if bool(getattr(adaptive_sampler, "enabled")) == bool(enabled):
-            return adaptive_sampler
-        try:
-            return replace(adaptive_sampler, enabled=bool(enabled))
-        except (TypeError, ValueError):
-            try:
-                setattr(adaptive_sampler, "enabled", bool(enabled))
-            except (AttributeError, TypeError, ValueError) as exc:
-                raise TypeError("adaptive_sampler must support dataclasses.replace or writable enabled.") from exc
-            return adaptive_sampler
-
-    def _adaptive_sampler_enabled(self) -> bool:
-        adaptive_sampler = getattr(self.cfg, "adaptive_sampler", None)
-        return bool(getattr(adaptive_sampler, "enabled", False))
-
-    def _set_adaptive_sampler_enabled(self, enabled: bool) -> None:
-        adaptive_sampler = getattr(self.cfg, "adaptive_sampler", None)
-        if adaptive_sampler is None or not hasattr(adaptive_sampler, "enabled"):
-            self.adaptive_sampling_enabled = False
-            return
-
-        new_adaptive_sampler = self._replace_adaptive_sampler_enabled(adaptive_sampler, enabled)
-        if new_adaptive_sampler is not adaptive_sampler:
-            setattr(self.cfg, "adaptive_sampler", new_adaptive_sampler)
-
-        sampler = getattr(self.env.unwrapped, "sampler", None)
-        if sampler is not None and hasattr(sampler, "adaptive_sampler"):
-            previous_enabled = bool(getattr(getattr(sampler, "adaptive_sampler", None), "enabled", False))
-            setattr(sampler, "adaptive_sampler", new_adaptive_sampler)
-            init_adaptive_state = getattr(sampler, "_init_adaptive_state", None)
-            state_missing = bool(enabled) and getattr(sampler, "adaptive_bin_quarantined", None) is None
-            if callable(init_adaptive_state) and (previous_enabled != bool(enabled) or state_missing):
-                init_adaptive_state()
-
-        self.adaptive_sampling_enabled = self._adaptive_sampler_enabled()
-
-    def _set_sampling_strategy(self, strategy_name: str) -> None:
-        current_strategy = getattr(self.cfg, "sampling_strategy", None)
-        setattr(self.cfg, "sampling_strategy", self._coerce_choice_like(current_strategy, strategy_name))
-        self.sampling_strategy = self._normalize_choice_name(getattr(self.cfg, "sampling_strategy", None))
-
-    def _sampling_schedule_state_for_update(self, update_count: int) -> tuple[str | None, bool]:
-        if not self.config.sampling_schedule_enabled:
-            return (
-                self._normalize_choice_name(getattr(self.cfg, "sampling_strategy", None)),
-                self._adaptive_sampler_enabled(),
-            )
-        if update_count < self.config.sampling_random_updates:
-            return "random", False
-        adaptive_enabled = (
-            bool(self.config.adaptive_sampling_enabled)
-            and update_count >= self.config.adaptive_sampling_start_update
-        )
-        return "failure_weighted", adaptive_enabled
-
-    @staticmethod
-    def _sampling_strategy_choice_name(normalized_name: str | None) -> str | None:
-        if normalized_name is None:
-            return None
-        if normalized_name == "failure_weighted":
-            return "FailureWeighted"
-        if normalized_name == "random":
-            return "Random"
-        if normalized_name == "start":
-            return "Start"
-        return normalized_name
-
-    def _apply_sampling_schedule(self) -> None:
-        strategy_name, adaptive_enabled = self._sampling_schedule_state_for_update(self.update_count)
-        choice_name = self._sampling_strategy_choice_name(strategy_name)
-        if choice_name is not None:
-            self._set_sampling_strategy(choice_name)
-        self._set_adaptive_sampler_enabled(adaptive_enabled)
-
-        current_state = (self.sampling_strategy, self.adaptive_sampling_enabled)
-        if self._last_sampling_schedule_state != current_state:
-            self._last_sampling_schedule_state = current_state
 
     @staticmethod
     def _split_optimizer_param_groups(
@@ -476,6 +454,123 @@ class TrainRunner:
         if not optimizer.param_groups:
             return 0.0
         return float(optimizer.param_groups[0]["lr"])
+
+    @staticmethod
+    def _training_state_missing_keys(training_state: Mapping[str, Any]) -> list[str]:
+        return [key for key in REQUIRED_TRAINER_STATE_KEYS if key not in training_state]
+
+    @staticmethod
+    def _list_to_tuple(value: Any) -> Any:
+        if isinstance(value, list):
+            return tuple(TrainRunner._list_to_tuple(item) for item in value)
+        return value
+
+    @staticmethod
+    def _capture_rng_state() -> dict[str, Any]:
+        rng_state: dict[str, Any] = {
+            "torch_cpu": torch.get_rng_state(),
+            "python": random.getstate(),
+        }
+
+        numpy_state = np.random.get_state()
+        rng_state["numpy"] = {
+            "algorithm": str(numpy_state[0]),
+            "state": numpy_state[1].astype(np.uint32, copy=False).tolist(),
+            "pos": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        }
+
+        if torch.cuda.is_available():
+            rng_state["torch_cuda"] = torch.cuda.get_rng_state_all()
+
+        return rng_state
+
+    @staticmethod
+    def _restore_rng_state(rng_state: Mapping[str, Any] | None) -> None:
+        if not isinstance(rng_state, Mapping):
+            return
+
+        torch_cpu_state = rng_state.get("torch_cpu")
+        if torch_cpu_state is not None:
+            torch.set_rng_state(torch.as_tensor(torch_cpu_state, dtype=torch.uint8).cpu())
+
+        torch_cuda_state = rng_state.get("torch_cuda")
+        if torch_cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(
+                [torch.as_tensor(state, dtype=torch.uint8).cpu() for state in torch_cuda_state]
+            )
+
+        numpy_state = rng_state.get("numpy")
+        if isinstance(numpy_state, Mapping):
+            np.random.set_state(
+                (
+                    str(numpy_state["algorithm"]),
+                    np.asarray(numpy_state["state"], dtype=np.uint32),
+                    int(numpy_state["pos"]),
+                    int(numpy_state["has_gauss"]),
+                    float(numpy_state["cached_gaussian"]),
+                )
+            )
+
+        python_state = rng_state.get("python")
+        if python_state is not None:
+            random.setstate(TrainRunner._list_to_tuple(python_state))
+
+    def _build_training_state(self) -> dict[str, Any]:
+        return {
+            "update_count": int(self.update_count),
+            "global_step": int(self.global_step),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "lr_scheduler": self.lr_scheduler.state_dict(),
+            "grad_scaler": self.grad_scaler.state_dict(),
+            "amp": {
+                "requested": bool(self.requested_amp),
+                "enabled": bool(self.use_amp),
+                "dtype": self.amp_dtype,
+            },
+            "rng_state": self._capture_rng_state(),
+        }
+
+    def _restore_resume_checkpoint(self, startup_timer: StartupTimer) -> None:
+        if self.resume_checkpoint is None:
+            return
+
+        checkpoint = self.resume_checkpoint
+        startup_timer.log("restoring actor and critic weights from resume checkpoint")
+        self.actor.load_state_dict(checkpoint.model["actor"])
+        self.critic.load_state_dict(checkpoint.model["critic"])
+
+        training_state = dict(checkpoint.training)
+        if not training_state:
+            self.resume_mode = "warm_start"
+            print(
+                "resume checkpoint does not contain trainer state; warm-starting actor/critic with fresh "
+                "optimizers, scheduler, scaler, and counters.",
+                flush=True,
+            )
+            return
+
+        missing_keys = self._training_state_missing_keys(training_state)
+        if missing_keys:
+            raise ValueError(
+                "Resume checkpoint contains incomplete trainer state. "
+                f"Missing keys: {', '.join(missing_keys)}."
+            )
+
+        self.actor_optimizer.load_state_dict(training_state["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(training_state["critic_optimizer"])
+        self.lr_scheduler.load_state_dict(training_state["lr_scheduler"])
+        self.grad_scaler.load_state_dict(training_state["grad_scaler"])
+        self.update_count = int(training_state["update_count"])
+        self.global_step = int(training_state["global_step"])
+        self._restore_rng_state(training_state.get("rng_state"))
+        self.resume_mode = "full_state"
+        self.resume_trainer_state_restored = True
+        startup_timer.log(
+            f"restored trainer state at update={self.update_count} global_step={self.global_step}"
+        )
 
     def _log_metrics(self, payload: dict[str, float]) -> None:
         if self.use_wandb:
@@ -581,16 +676,11 @@ class TrainRunner:
         temperature: float,
         uniform_mix: float,
         eligible_mask: torch.Tensor | None = None,
-        probability_scale: torch.Tensor | None = None,
-        probe_mask: torch.Tensor | None = None,
-        probe_probability: float = 0.0,
         exploration_bonus: float = 0.0,
         max_uniform_ratio: float | None = None,
     ) -> torch.Tensor:
         if temperature <= 0.0:
             raise ValueError("temperature must be > 0.")
-        if probe_probability < 0.0 or probe_probability > 1.0:
-            raise ValueError("probe_probability must be in [0, 1].")
 
         fail_counts = torch.as_tensor(fail_counts, dtype=torch.float32).reshape(-1)
         sample_counts = torch.as_tensor(sample_counts, dtype=torch.float32).reshape(-1)
@@ -604,40 +694,11 @@ class TrainRunner:
             if eligible.shape != fail_counts.shape:
                 raise ValueError("eligible_mask must have the same shape as fail_counts.")
 
-        if probability_scale is None:
-            scale = torch.ones_like(fail_counts, dtype=torch.float32)
-        else:
-            scale = torch.as_tensor(probability_scale, dtype=torch.float32).reshape(-1)
-            if scale.shape != fail_counts.shape:
-                raise ValueError("probability_scale must have the same shape as fail_counts.")
-            if not bool(torch.all(torch.isfinite(scale)).item()) or bool(torch.any(scale < 0.0).item()):
-                raise ValueError("probability_scale must contain finite non-negative values.")
-
-        if probe_mask is None:
-            probe = torch.zeros_like(eligible, dtype=torch.bool)
-        else:
-            probe = torch.as_tensor(probe_mask, dtype=torch.bool).reshape(-1)
-            if probe.shape != fail_counts.shape:
-                raise ValueError("probe_mask must have the same shape as fail_counts.")
-
-        probe_probs = probe.to(dtype=torch.float32)
-        probe_sum = torch.sum(probe_probs)
-        if float(probe_sum.item()) > 0.0:
-            probe_probs = probe_probs / probe_sum
-
         uniform_probs = eligible.to(dtype=torch.float32)
         uniform_sum = torch.sum(uniform_probs)
         if float(uniform_sum.item()) <= 0.0:
-            if float(probe_sum.item()) > 0.0:
-                return probe_probs
             raise ValueError("eligible_mask must include at least one entry.")
         uniform_probs = uniform_probs / uniform_sum
-        scaled_uniform_probs = torch.where(eligible, uniform_probs * scale, torch.zeros_like(uniform_probs))
-        scaled_uniform_sum = torch.sum(scaled_uniform_probs)
-        if float(scaled_uniform_sum.item()) > 0.0:
-            scaled_uniform_probs = scaled_uniform_probs / scaled_uniform_sum
-        else:
-            scaled_uniform_probs = uniform_probs
 
         eligible_sample_counts = torch.where(
             eligible,
@@ -660,21 +721,19 @@ class TrainRunner:
             learned_probs = uniform_probs
 
         probs = (1.0 - uniform_mix) * learned_probs + uniform_mix * uniform_probs
-        probs = torch.where(eligible, probs * scale, torch.zeros_like(probs))
+        probs = torch.where(eligible, probs, torch.zeros_like(probs))
         probs_sum = torch.sum(probs)
         if float(probs_sum.item()) > 0.0:
             probs = probs / probs_sum
         else:
-            probs = scaled_uniform_probs
+            probs = uniform_probs
 
         probs = cls._apply_max_uniform_probability_cap(
             probs,
             eligible_mask=eligible,
-            uniform_probs=scaled_uniform_probs,
+            uniform_probs=uniform_probs,
             max_uniform_ratio=max_uniform_ratio,
         )
-        if probe_probability > 0.0 and float(probe_sum.item()) > 0.0:
-            probs = (1.0 - probe_probability) * probs + probe_probability * probe_probs
         return probs / torch.clamp(torch.sum(probs), min=torch.finfo(probs.dtype).eps)
 
     @staticmethod
@@ -756,29 +815,16 @@ class TrainRunner:
         *,
         temperature: float,
         eligible_mask: torch.Tensor | None = None,
-        probability_scale: torch.Tensor | None = None,
-        probe_mask: torch.Tensor | None = None,
-        probe_probability: float = 0.0,
     ) -> torch.Tensor:
         sampler_builder = getattr(sampler, "_build_guarded_sampling_probabilities", None)
         if callable(sampler_builder):
-            kwargs = {
-                "temperature": temperature,
-                "eligible_mask": eligible_mask,
-                "probability_scale": probability_scale,
-                "probe_mask": probe_mask,
-                "probe_probability": probe_probability,
-            }
-            try:
-                probabilities = sampler_builder(fail_counts, sample_counts, **kwargs)
-                return cls._as_cpu_tensor(probabilities, dtype=torch.float32).reshape(-1)
-            except TypeError:
-                legacy_kwargs = {
-                    "temperature": temperature,
-                    "eligible_mask": eligible_mask,
-                }
-                probabilities = sampler_builder(fail_counts, sample_counts, **legacy_kwargs)
-                return cls._as_cpu_tensor(probabilities, dtype=torch.float32).reshape(-1)
+            probabilities = sampler_builder(
+                fail_counts,
+                sample_counts,
+                temperature=temperature,
+                eligible_mask=eligible_mask,
+            )
+            return cls._as_cpu_tensor(probabilities, dtype=torch.float32).reshape(-1)
 
         return cls._build_guarded_sampling_probabilities(
             fail_counts,
@@ -786,87 +832,8 @@ class TrainRunner:
             temperature=temperature,
             uniform_mix=float(getattr(sampler, "failure_weight_uniform_mix", 0.0)),
             eligible_mask=None if eligible_mask is None else cls._as_cpu_tensor(eligible_mask, dtype=torch.bool),
-            probability_scale=(
-                None if probability_scale is None else cls._as_cpu_tensor(probability_scale, dtype=torch.float32)
-            ),
-            probe_mask=None if probe_mask is None else cls._as_cpu_tensor(probe_mask, dtype=torch.bool),
-            probe_probability=probe_probability,
             exploration_bonus=float(getattr(sampler, "failure_weight_exploration_bonus", 0.0)),
             max_uniform_ratio=getattr(sampler, "failure_weight_max_uniform_ratio", None),
-        )
-
-    @classmethod
-    def _adaptive_motion_probability_inputs(
-        cls,
-        sampler: Any,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, float]:
-        resolver = getattr(sampler, "_adaptive_motion_probability_inputs", None)
-        if callable(resolver):
-            return resolver()
-
-        adaptive_sampler = getattr(sampler, "adaptive_sampler", None)
-        motion_quarantined = getattr(sampler, "adaptive_motion_quarantined", None)
-        motion_mastered = getattr(sampler, "adaptive_motion_mastered", None)
-        if (
-            not bool(getattr(adaptive_sampler, "enabled", False))
-            or motion_quarantined is None
-            or motion_mastered is None
-        ):
-            return None, None, None, 0.0
-
-        quarantined = cls._as_cpu_tensor(motion_quarantined, dtype=torch.bool).reshape(-1)
-        mastered = cls._as_cpu_tensor(motion_mastered, dtype=torch.bool).reshape(-1)
-        scale = torch.where(
-            mastered,
-            torch.full(mastered.shape, float(getattr(adaptive_sampler, "mastered_probability_scale", 1.0))),
-            torch.ones(mastered.shape, dtype=torch.float32),
-        )
-        return ~quarantined, scale, quarantined, float(getattr(adaptive_sampler, "probe_probability", 0.0))
-
-    @classmethod
-    def _adaptive_bin_probability_inputs(
-        cls,
-        sampler: Any,
-        motion_index: int,
-        base_eligible: torch.Tensor | None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, float]:
-        resolver = getattr(sampler, "_adaptive_bin_probability_inputs", None)
-        if callable(resolver):
-            return resolver(motion_index, base_eligible)
-
-        adaptive_sampler = getattr(sampler, "adaptive_sampler", None)
-        bin_quarantined = getattr(sampler, "adaptive_bin_quarantined", None)
-        bin_mastered = getattr(sampler, "adaptive_bin_mastered", None)
-        if (
-            not bool(getattr(adaptive_sampler, "enabled", False))
-            or bin_quarantined is None
-            or bin_mastered is None
-        ):
-            return base_eligible, None, None, 0.0
-
-        if base_eligible is None:
-            sample_counts = getattr(sampler, "bin_sample_counts", None)
-            if sample_counts is None:
-                return None, None, None, 0.0
-            resolved_base_eligible = torch.ones_like(
-                cls._as_cpu_tensor(sample_counts[motion_index], dtype=torch.float32),
-                dtype=torch.bool,
-            )
-        else:
-            resolved_base_eligible = cls._as_cpu_tensor(base_eligible, dtype=torch.bool).reshape(-1)
-        quarantined = cls._as_cpu_tensor(bin_quarantined[motion_index], dtype=torch.bool).reshape(-1)
-        mastered = cls._as_cpu_tensor(bin_mastered[motion_index], dtype=torch.bool).reshape(-1)
-        quarantined = quarantined & resolved_base_eligible
-        scale = torch.where(
-            mastered,
-            torch.full(mastered.shape, float(getattr(adaptive_sampler, "mastered_probability_scale", 1.0))),
-            torch.ones(mastered.shape, dtype=torch.float32),
-        )
-        return (
-            resolved_base_eligible & ~quarantined,
-            scale,
-            quarantined,
-            float(getattr(adaptive_sampler, "probe_probability", 0.0)),
         )
 
     @staticmethod
@@ -906,18 +873,11 @@ class TrainRunner:
             [cls._as_cpu_tensor(sample_counts, dtype=torch.float32).sum() for sample_counts in bin_sample_counts],
             dim=0,
         )
-        motion_eligible, motion_scale, motion_probe, motion_probe_probability = (
-            cls._adaptive_motion_probability_inputs(sampler)
-        )
         motion_probs = cls._build_sampler_sampling_probabilities(
             sampler,
             motion_fail_counts,
             motion_sample_counts,
             temperature=temperature,
-            eligible_mask=motion_eligible,
-            probability_scale=motion_scale,
-            probe_mask=motion_probe,
-            probe_probability=motion_probe_probability,
         )
 
         results: list[dict[str, float | int | str]] = []
@@ -934,20 +894,12 @@ class TrainRunner:
                 sample_counts = cls._as_cpu_tensor(bin_sample_counts[motion_index], dtype=torch.float32).reshape(-1)
                 eligible_mask = cls._as_cpu_tensor(bin_reset_eligible[motion_index], dtype=torch.bool).reshape(-1)
                 reset_times = cls._as_cpu_tensor(bin_reset_times[motion_index], dtype=torch.float32).reshape(-1)
-                eligible_mask, probability_scale, probe_mask, probe_probability = cls._adaptive_bin_probability_inputs(
-                    sampler,
-                    motion_index,
-                    eligible_mask,
-                )
                 bin_probs = cls._build_sampler_sampling_probabilities(
                     sampler,
                     fail_counts,
                     sample_counts,
                     temperature=temperature,
                     eligible_mask=eligible_mask,
-                    probability_scale=probability_scale,
-                    probe_mask=probe_mask,
-                    probe_probability=probe_probability,
                 )
                 for bin_index in torch.nonzero(bin_probs > 0.0, as_tuple=False).squeeze(-1).tolist():
                     anchor_index = cls._resolve_anchor_index(anchor_times, reset_times[bin_index])
@@ -968,7 +920,8 @@ class TrainRunner:
         return results
 
     def _collect_anchor_reset_probabilities(self) -> list[dict[str, float | int | str]]:
-        sampler = getattr(self.env.unwrapped, "sampler", None)
+        env_unwrapped = getattr(getattr(self, "env", None), "unwrapped", None)
+        sampler = getattr(env_unwrapped, "sampler", None)
         if sampler is None:
             return []
         if self._normalize_choice_name(getattr(sampler, "segment_source", self.segment_source)) != "anchor":
@@ -986,29 +939,196 @@ class TrainRunner:
         arrays = cls._build_anchor_probability_arrays(anchor_probabilities)
         probabilities = np.maximum(arrays.probability.astype(np.float64, copy=False), 0.0)
         motion_probabilities = cls._aggregate_probabilities_by_motion(arrays)
+        active_anchors = float(np.count_nonzero(probabilities > 0.0))
+        num_anchors = float(probabilities.size)
+        active_motions = float(np.count_nonzero(motion_probabilities > 0.0))
+        num_motions = float(motion_probabilities.size)
+        effective_anchors = cls._effective_probability_count(probabilities)
+        effective_motions = cls._effective_probability_count(motion_probabilities)
 
         return {
-            "sampling/anchor_reset_probability/sum": float(np.sum(probabilities)),
-            "sampling/anchor_reset_probability/max": float(np.max(probabilities)) if probabilities.size else 0.0,
-            "sampling/anchor_reset_probability/entropy": cls._probability_entropy(probabilities),
-            "sampling/anchor_reset_probability/effective_anchors": cls._effective_probability_count(probabilities),
-            "sampling/anchor_reset_probability/active_anchors": float(np.count_nonzero(probabilities > 0.0)),
-            "sampling/anchor_reset_probability/num_anchors": float(probabilities.size),
-            "sampling/anchor_reset_probability/top1_mass": cls._top_probability_mass(probabilities, 1),
-            "sampling/anchor_reset_probability/top5_mass": cls._top_probability_mass(probabilities, 5),
-            "sampling/anchor_reset_probability/top20_mass": cls._top_probability_mass(probabilities, 20),
-            "sampling/motion_reset_probability/max": (
+            "sampler/reset_distribution/anchors/probability_sum": float(np.sum(probabilities)),
+            "sampler/reset_distribution/anchors/max_probability": (
+                float(np.max(probabilities)) if probabilities.size else 0.0
+            ),
+            "sampler/reset_distribution/anchors/entropy": cls._probability_entropy(probabilities),
+            "sampler/reset_distribution/anchors/effective_count": effective_anchors,
+            "sampler/reset_distribution/anchors/effective_fraction": cls._safe_fraction(
+                effective_anchors,
+                num_anchors,
+            ),
+            "sampler/reset_distribution/anchors/active_count": active_anchors,
+            "sampler/reset_distribution/anchors/total_count": num_anchors,
+            "sampler/reset_distribution/anchors/active_fraction": cls._safe_fraction(active_anchors, num_anchors),
+            "sampler/reset_distribution/anchors/top1_mass": cls._top_probability_mass(probabilities, 1),
+            "sampler/reset_distribution/anchors/top5_mass": cls._top_probability_mass(probabilities, 5),
+            "sampler/reset_distribution/anchors/top20_mass": cls._top_probability_mass(probabilities, 20),
+            "sampler/reset_distribution/motions/max_probability": (
                 float(np.max(motion_probabilities)) if motion_probabilities.size else 0.0
             ),
-            "sampling/motion_reset_probability/entropy": cls._probability_entropy(motion_probabilities),
-            "sampling/motion_reset_probability/effective_motions": cls._effective_probability_count(
-                motion_probabilities
+            "sampler/reset_distribution/motions/entropy": cls._probability_entropy(motion_probabilities),
+            "sampler/reset_distribution/motions/effective_count": effective_motions,
+            "sampler/reset_distribution/motions/effective_fraction": cls._safe_fraction(
+                effective_motions,
+                num_motions,
             ),
-            "sampling/motion_reset_probability/active_motions": float(np.count_nonzero(motion_probabilities > 0.0)),
-            "sampling/motion_reset_probability/num_motions": float(motion_probabilities.size),
-            "sampling/motion_reset_probability/top1_mass": cls._top_probability_mass(motion_probabilities, 1),
-            "sampling/motion_reset_probability/top5_mass": cls._top_probability_mass(motion_probabilities, 5),
-            "sampling/motion_reset_probability/top10_mass": cls._top_probability_mass(motion_probabilities, 10),
+            "sampler/reset_distribution/motions/active_count": active_motions,
+            "sampler/reset_distribution/motions/total_count": num_motions,
+            "sampler/reset_distribution/motions/active_fraction": cls._safe_fraction(active_motions, num_motions),
+            "sampler/reset_distribution/motions/top1_mass": cls._top_probability_mass(motion_probabilities, 1),
+            "sampler/reset_distribution/motions/top5_mass": cls._top_probability_mass(motion_probabilities, 5),
+            "sampler/reset_distribution/motions/top10_mass": cls._top_probability_mass(motion_probabilities, 10),
+        }
+
+    @staticmethod
+    def _safe_fraction(numerator: float, denominator: float) -> float:
+        if denominator <= 0.0:
+            return 0.0
+        return float(numerator) / float(denominator)
+
+    def _build_sampler_config_metrics(self) -> dict[str, float]:
+        env_unwrapped = getattr(getattr(self, "env", None), "unwrapped", None)
+        sampler = getattr(env_unwrapped, "sampler", None)
+        cfg = getattr(self, "cfg", None)
+        max_uniform_ratio = getattr(cfg, "failure_weight_max_uniform_ratio", None)
+        metrics = {
+            "sampler/config/uses_failure_weighted": float(
+                getattr(self, "sampling_strategy", None) == "failure_weighted"
+            ),
+            "sampler/config/uses_anchor_source": float(getattr(self, "segment_source", None) == "anchor"),
+            "sampler/config/motion_count": float(len(getattr(self, "motion_files", []))),
+            "sampler/config/anchor_bin_count": float(getattr(sampler, "num_bins", 0) or 0),
+            "sampler/config/failure_temperature": float(getattr(cfg, "failure_temperature", 1.0)),
+            "sampler/config/uniform_mix": float(getattr(cfg, "failure_weight_uniform_mix", 0.0)),
+            "sampler/config/exploration_bonus": float(getattr(cfg, "failure_weight_exploration_bonus", 0.0)),
+            "sampler/config/failure_decay": float(getattr(cfg, "failure_decay", 1.0)),
+        }
+        if max_uniform_ratio is not None:
+            metrics["sampler/config/max_uniform_ratio"] = float(max_uniform_ratio)
+        return metrics
+
+    @classmethod
+    def _build_sampler_failure_stats(cls, sampler: Any) -> dict[str, float]:
+        bin_fail_counts = getattr(sampler, "bin_fail_counts", None)
+        bin_sample_counts = getattr(sampler, "bin_sample_counts", None)
+        if bin_fail_counts is None or bin_sample_counts is None:
+            return {}
+
+        bin_reset_eligible = getattr(sampler, "bin_reset_eligible", None)
+        anchor_failures_by_motion: list[torch.Tensor] = []
+        anchor_samples_by_motion: list[torch.Tensor] = []
+        for motion_index, (fail_counts, sample_counts) in enumerate(
+            zip(bin_fail_counts, bin_sample_counts, strict=False)
+        ):
+            fail_tensor = cls._as_cpu_tensor(fail_counts, dtype=torch.float32).reshape(-1)
+            sample_tensor = cls._as_cpu_tensor(sample_counts, dtype=torch.float32).reshape(-1)
+            if fail_tensor.shape != sample_tensor.shape:
+                return {}
+            if bin_reset_eligible is None:
+                eligible = torch.ones_like(sample_tensor, dtype=torch.bool)
+            else:
+                eligible = cls._as_cpu_tensor(bin_reset_eligible[motion_index], dtype=torch.bool).reshape(-1)
+                if eligible.shape != sample_tensor.shape:
+                    return {}
+            anchor_failures_by_motion.append(fail_tensor[eligible])
+            anchor_samples_by_motion.append(sample_tensor[eligible])
+
+        if not anchor_samples_by_motion:
+            return {}
+
+        anchor_samples = torch.cat(anchor_samples_by_motion) if anchor_samples_by_motion else torch.empty(0)
+        anchor_failures = torch.cat(anchor_failures_by_motion) if anchor_failures_by_motion else torch.empty(0)
+        motion_samples = torch.as_tensor(
+            [float(samples.sum().item()) for samples in anchor_samples_by_motion],
+            dtype=torch.float32,
+        )
+        motion_failures = torch.as_tensor(
+            [float(failures.sum().item()) for failures in anchor_failures_by_motion],
+            dtype=torch.float32,
+        )
+        return cls._build_sampler_failure_stats_from_counts(
+            anchor_samples=anchor_samples,
+            anchor_failures=anchor_failures,
+            motion_samples=motion_samples,
+            motion_failures=motion_failures,
+        )
+
+    @classmethod
+    def _build_sampler_failure_stats_from_counts(
+        cls,
+        *,
+        anchor_samples: torch.Tensor,
+        anchor_failures: torch.Tensor,
+        motion_samples: torch.Tensor,
+        motion_failures: torch.Tensor,
+    ) -> dict[str, float]:
+        anchor_samples = cls._as_cpu_tensor(anchor_samples, dtype=torch.float32).reshape(-1)
+        anchor_failures = cls._as_cpu_tensor(anchor_failures, dtype=torch.float32).reshape(-1)
+        motion_samples = cls._as_cpu_tensor(motion_samples, dtype=torch.float32).reshape(-1)
+        motion_failures = cls._as_cpu_tensor(motion_failures, dtype=torch.float32).reshape(-1)
+
+        if anchor_samples.shape != anchor_failures.shape or motion_samples.shape != motion_failures.shape:
+            raise ValueError("sample and failure count tensors must have matching shapes.")
+
+        total_samples = float(torch.sum(anchor_samples).item()) if anchor_samples.numel() else 0.0
+        total_failures = float(torch.sum(anchor_failures).item()) if anchor_failures.numel() else 0.0
+        anchor_sampled = anchor_samples > 0.0
+        anchor_failed = anchor_failures > 0.0
+        motion_sampled = motion_samples > 0.0
+        motion_failed = motion_failures > 0.0
+
+        anchor_failure_rates = torch.zeros_like(anchor_samples)
+        if bool(torch.any(anchor_sampled).item()):
+            anchor_failure_rates[anchor_sampled] = anchor_failures[anchor_sampled] / torch.clamp(
+                anchor_samples[anchor_sampled],
+                min=torch.finfo(anchor_samples.dtype).eps,
+            )
+        motion_failure_rates = torch.zeros_like(motion_samples)
+        if bool(torch.any(motion_sampled).item()):
+            motion_failure_rates[motion_sampled] = motion_failures[motion_sampled] / torch.clamp(
+                motion_samples[motion_sampled],
+                min=torch.finfo(motion_samples.dtype).eps,
+            )
+
+        sampled_anchor_count = float(torch.sum(anchor_sampled.to(dtype=torch.float32)).item())
+        sampled_motion_count = float(torch.sum(motion_sampled.to(dtype=torch.float32)).item())
+        total_anchor_count = float(anchor_samples.numel())
+        total_motion_count = float(motion_samples.numel())
+        return {
+            "sampler/failure_stats/effective_sample_count_sum": total_samples,
+            "sampler/failure_stats/effective_failure_count_sum": total_failures,
+            "sampler/failure_stats/failure_rate": cls._safe_fraction(total_failures, total_samples),
+            "sampler/failure_stats/anchors/total_count": total_anchor_count,
+            "sampler/failure_stats/anchors/sampled_count": sampled_anchor_count,
+            "sampler/failure_stats/anchors/sampled_fraction": cls._safe_fraction(
+                sampled_anchor_count,
+                total_anchor_count,
+            ),
+            "sampler/failure_stats/anchors/failed_count": float(torch.sum(anchor_failed.to(dtype=torch.float32)).item()),
+            "sampler/failure_stats/anchors/max_sample_count": (
+                float(torch.max(anchor_samples).item()) if anchor_samples.numel() else 0.0
+            ),
+            "sampler/failure_stats/anchors/max_failure_rate": (
+                float(torch.max(anchor_failure_rates).item()) if anchor_failure_rates.numel() else 0.0
+            ),
+            "sampler/failure_stats/anchors/mean_failure_rate_sampled": (
+                float(torch.mean(anchor_failure_rates[anchor_sampled]).item())
+                if bool(torch.any(anchor_sampled).item())
+                else 0.0
+            ),
+            "sampler/failure_stats/motions/total_count": total_motion_count,
+            "sampler/failure_stats/motions/sampled_count": sampled_motion_count,
+            "sampler/failure_stats/motions/sampled_fraction": cls._safe_fraction(
+                sampled_motion_count,
+                total_motion_count,
+            ),
+            "sampler/failure_stats/motions/failed_count": float(torch.sum(motion_failed.to(dtype=torch.float32)).item()),
+            "sampler/failure_stats/motions/max_sample_count": (
+                float(torch.max(motion_samples).item()) if motion_samples.numel() else 0.0
+            ),
+            "sampler/failure_stats/motions/max_failure_rate": (
+                float(torch.max(motion_failure_rates).item()) if motion_failure_rates.numel() else 0.0
+            ),
         }
 
     @staticmethod
@@ -1078,24 +1198,29 @@ class TrainRunner:
             motion_probabilities.append(float(np.sum(np.maximum(arrays.probability[mask], 0.0))))
         return np.asarray(motion_probabilities, dtype=np.float64)
 
+    @staticmethod
+    def _truncate_dashboard_label(value: str, *, max_chars: int = ANCHOR_DASHBOARD_LABEL_CHARS) -> str:
+        if len(value) <= max_chars:
+            return value
+        if max_chars <= 3:
+            return value[:max_chars]
+        return value[: max_chars - 3] + "..."
+
     @classmethod
-    def _build_anchor_reset_probability_heatmap_grid(
+    def _build_anchor_motion_time_grid(
         cls,
-        anchor_probabilities: list[dict[str, float | int | str]],
+        arrays: AnchorProbabilityArrays,
         *,
         num_bins: int,
-    ) -> AnchorHeatmapGrid:
+    ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
         if num_bins < 1:
             raise ValueError("num_bins must be positive.")
-
-        arrays = cls._build_anchor_probability_arrays(anchor_probabilities)
         if arrays.motion_index.size == 0:
-            return AnchorHeatmapGrid(
-                values=np.zeros((0, num_bins), dtype=np.float32),
-                motion_indices=np.asarray([], dtype=np.int64),
-                motion_names=[],
-                motion_probabilities=np.asarray([], dtype=np.float32),
-                num_bins=num_bins,
+            return (
+                np.zeros((0, num_bins), dtype=np.float32),
+                np.asarray([], dtype=np.int64),
+                [],
+                np.asarray([], dtype=np.float32),
             )
 
         rows: list[np.ndarray] = []
@@ -1127,13 +1252,142 @@ class TrainRunner:
             motion_probabilities.append(float(np.sum(probabilities)))
 
         order = sorted(range(len(rows)), key=lambda index: (-motion_probabilities[index], motion_indices[index]))
-        return AnchorHeatmapGrid(
-            values=np.stack([rows[index] for index in order], axis=0),
-            motion_indices=np.asarray([motion_indices[index] for index in order], dtype=np.int64),
-            motion_names=[motion_names_list[index] for index in order],
-            motion_probabilities=np.asarray([motion_probabilities[index] for index in order], dtype=np.float32),
-            num_bins=num_bins,
+        return (
+            np.stack([rows[index] for index in order], axis=0),
+            np.asarray([motion_indices[index] for index in order], dtype=np.int64),
+            [motion_names_list[index] for index in order],
+            np.asarray([motion_probabilities[index] for index in order], dtype=np.float32),
         )
+
+    @classmethod
+    def _build_anchor_rank_band_heatmap_grid(
+        cls,
+        anchor_probabilities: list[dict[str, float | int | str]],
+        *,
+        num_bins: int,
+        max_rank_bands: int = ANCHOR_DASHBOARD_MAX_RANK_BANDS,
+    ) -> AnchorRankBandGrid:
+        arrays = cls._build_anchor_probability_arrays(anchor_probabilities)
+        motion_time_grid, _, _, _ = cls._build_anchor_motion_time_grid(arrays, num_bins=num_bins)
+        num_motions = int(motion_time_grid.shape[0])
+        if num_motions == 0:
+            return AnchorRankBandGrid(
+                values=np.zeros((0, num_bins), dtype=np.float32),
+                num_bins=num_bins,
+                num_motions=0,
+                num_rank_bands=0,
+            )
+
+        rank_band_count = min(max(1, int(max_rank_bands)), num_motions)
+        rank_bands = np.array_split(np.arange(num_motions), rank_band_count)
+        values = np.stack(
+            [np.sum(motion_time_grid[rank_band], axis=0) for rank_band in rank_bands],
+            axis=0,
+        ).astype(np.float32)
+        return AnchorRankBandGrid(
+            values=values,
+            num_bins=num_bins,
+            num_motions=num_motions,
+            num_rank_bands=rank_band_count,
+        )
+
+    @classmethod
+    def _build_top_motion_rows(
+        cls,
+        anchor_probabilities: list[dict[str, float | int | str]],
+        *,
+        limit: int = ANCHOR_DASHBOARD_TOP_K,
+        max_name_chars: int = ANCHOR_DASHBOARD_LABEL_CHARS,
+    ) -> list[dict[str, float | int | str]]:
+        arrays = cls._build_anchor_probability_arrays(anchor_probabilities)
+        _, motion_indices, motion_names_list, motion_probabilities = cls._build_anchor_motion_time_grid(
+            arrays,
+            num_bins=1,
+        )
+        rows: list[dict[str, float | int | str]] = []
+        for rank, (motion_index, motion_name, probability) in enumerate(
+            zip(motion_indices[:limit], motion_names_list[:limit], motion_probabilities[:limit], strict=False),
+            start=1,
+        ):
+            anchor_count = int(np.count_nonzero(arrays.motion_index == int(motion_index)))
+            rows.append(
+                {
+                    "rank": rank,
+                    "motion_index": int(motion_index),
+                    "motion_name": cls._truncate_dashboard_label(str(motion_name), max_chars=max_name_chars),
+                    "full_motion_name": str(motion_name),
+                    "anchor_count": anchor_count,
+                    "probability": float(probability),
+                }
+            )
+        return rows
+
+    @classmethod
+    def _build_top_anchor_rows(
+        cls,
+        anchor_probabilities: list[dict[str, float | int | str]],
+        *,
+        limit: int = ANCHOR_DASHBOARD_TOP_K,
+        max_name_chars: int = ANCHOR_DASHBOARD_LABEL_CHARS,
+    ) -> list[dict[str, float | int | str]]:
+        arrays = cls._build_anchor_probability_arrays(anchor_probabilities)
+        probabilities = np.maximum(arrays.probability.astype(np.float64, copy=False), 0.0)
+        if probabilities.size == 0:
+            return []
+
+        total_probability = float(np.sum(probabilities))
+        uniform_probability = total_probability / float(probabilities.size) if total_probability > 0.0 else 0.0
+        order = np.lexsort((arrays.anchor_index, arrays.motion_index, -probabilities))
+        rows: list[dict[str, float | int | str]] = []
+        for rank, entry_index in enumerate(order[:limit], start=1):
+            probability = float(probabilities[entry_index])
+            uniform_ratio = probability / uniform_probability if uniform_probability > 0.0 else 0.0
+            motion_name = str(arrays.motion_name[entry_index])
+            rows.append(
+                {
+                    "rank": rank,
+                    "motion_index": int(arrays.motion_index[entry_index]),
+                    "motion_name": cls._truncate_dashboard_label(motion_name, max_chars=max_name_chars),
+                    "full_motion_name": motion_name,
+                    "anchor_index": int(arrays.anchor_index[entry_index]),
+                    "anchor_time": float(arrays.anchor_time[entry_index]),
+                    "probability": probability,
+                    "uniform_ratio": float(uniform_ratio),
+                }
+            )
+        return rows
+
+    @classmethod
+    def _build_anchor_cumulative_mass_curve(
+        cls,
+        anchor_probabilities: list[dict[str, float | int | str]],
+        *,
+        checkpoints: tuple[int, ...] = (1, 5, 20, 100, 1000),
+    ) -> dict[str, np.ndarray]:
+        arrays = cls._build_anchor_probability_arrays(anchor_probabilities)
+        probabilities = np.maximum(arrays.probability.astype(np.float64, copy=False), 0.0)
+        if probabilities.size == 0:
+            return {
+                "anchor_count": np.asarray([], dtype=np.int64),
+                "mass": np.asarray([], dtype=np.float64),
+                "uniform_mass": np.asarray([], dtype=np.float64),
+            }
+
+        total_probability = float(np.sum(probabilities))
+        counts = sorted({min(int(checkpoint), probabilities.size) for checkpoint in checkpoints if checkpoint > 0})
+        if probabilities.size not in counts:
+            counts.append(int(probabilities.size))
+
+        sorted_probabilities = np.sort(probabilities)[::-1]
+        cumulative = np.cumsum(sorted_probabilities)
+        anchor_counts = np.asarray(counts, dtype=np.int64)
+        mass = np.asarray([float(cumulative[count - 1]) for count in counts], dtype=np.float64)
+        uniform_mass = total_probability * anchor_counts.astype(np.float64) / float(probabilities.size)
+        return {
+            "anchor_count": anchor_counts,
+            "mass": mass,
+            "uniform_mass": uniform_mass,
+        }
 
     @staticmethod
     def _build_anchor_probability_metadata(
@@ -1163,7 +1417,10 @@ class TrainRunner:
 
     @staticmethod
     def _write_anchor_probability_heatmap(
-        grid: AnchorHeatmapGrid,
+        grid: AnchorRankBandGrid,
+        top_motion_rows: list[dict[str, float | int | str]],
+        top_anchor_rows: list[dict[str, float | int | str]],
+        cumulative_curve: dict[str, np.ndarray],
         metrics_payload: dict[str, float],
         output_path: Path,
         *,
@@ -1177,9 +1434,18 @@ class TrainRunner:
         from matplotlib.colors import LogNorm
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        num_motions = max(1, len(grid.motion_names))
-        figure_height = min(18.0, max(6.0, 3.0 + num_motions * 0.018))
-        figure, axis = plt.subplots(figsize=(14.0, figure_height))
+        figure = plt.figure(figsize=(18.0, 12.0))
+        grid_spec = figure.add_gridspec(
+            2,
+            2,
+            width_ratios=(2.15, 1.25),
+            height_ratios=(1.2, 1.0),
+        )
+        axis_heatmap = figure.add_subplot(grid_spec[0, 0])
+        axis_curve = figure.add_subplot(grid_spec[0, 1])
+        axis_motion = figure.add_subplot(grid_spec[1, 0])
+        axis_anchor = figure.add_subplot(grid_spec[1, 1])
+        figure.subplots_adjust(left=0.08, right=0.97, bottom=0.07, top=0.84, wspace=0.28, hspace=0.38)
 
         values = np.asarray(grid.values, dtype=np.float32)
         if values.size == 0:
@@ -1187,44 +1453,137 @@ class TrainRunner:
         masked_values = np.ma.masked_less_equal(values, 0.0)
         positive_values = values[values > 0.0]
 
-        color_map = plt.get_cmap("magma").copy()
+        color_map = plt.get_cmap("viridis").copy()
         color_map.set_bad("#f0f0f0")
+        image_extent = [0.0, 1.0, 100.0, 0.0]
         if positive_values.size:
             max_probability = float(np.max(positive_values))
             min_probability = float(np.min(positive_values))
             if min_probability >= max_probability:
                 min_probability = max_probability * 0.1
-            image = axis.imshow(
+            image = axis_heatmap.imshow(
                 masked_values,
                 aspect="auto",
                 interpolation="nearest",
                 cmap=color_map,
                 norm=LogNorm(vmin=max(min_probability, 1.0e-12), vmax=max_probability),
+                extent=image_extent,
             )
         else:
-            image = axis.imshow(values, aspect="auto", interpolation="nearest", cmap=color_map, vmin=0.0, vmax=1.0)
+            image = axis_heatmap.imshow(
+                values,
+                aspect="auto",
+                interpolation="nearest",
+                cmap=color_map,
+                vmin=0.0,
+                vmax=1.0,
+                extent=image_extent,
+            )
 
-        axis.set_xlabel("normalized motion time")
-        axis.set_ylabel("motion rank by reset probability")
-        last_bin_index = max(0, grid.num_bins - 1)
-        axis.set_xticks(
-            [0, last_bin_index * 0.25, last_bin_index * 0.5, last_bin_index * 0.75, last_bin_index],
-            ["0.00", "0.25", "0.50", "0.75", "1.00"],
-        )
-        label_count = min(ANCHOR_HEATMAP_TOP_LABELS, len(grid.motion_names))
-        axis.set_yticks(np.arange(label_count), grid.motion_names[:label_count])
+        axis_heatmap.set_title(f"Reset mass by rank band ({grid.num_rank_bands} bands, {grid.num_motions} motions)")
+        axis_heatmap.set_xlabel("normalized motion time")
+        axis_heatmap.set_ylabel("motion reset-probability rank percentile")
+        axis_heatmap.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0], ["0.00", "0.25", "0.50", "0.75", "1.00"])
+        axis_heatmap.set_yticks([0, 25, 50, 75, 100], ["top", "25", "50", "75", "bottom"])
+        figure.colorbar(image, ax=axis_heatmap, label="reset probability mass", fraction=0.046, pad=0.025)
 
-        active_anchors = int(metrics_payload.get("sampling/anchor_reset_probability/active_anchors", 0.0))
-        effective_anchors = metrics_payload.get("sampling/anchor_reset_probability/effective_anchors", 0.0)
-        entropy = metrics_payload.get("sampling/anchor_reset_probability/entropy", 0.0)
-        max_probability = metrics_payload.get("sampling/anchor_reset_probability/max", 0.0)
-        axis.set_title(
-            "Motion anchor reset probability heatmap\n"
-            f"update={update_count} step={global_step} active={active_anchors} "
-            f"max={max_probability:.3g} entropy={entropy:.3f} effective={effective_anchors:.1f}"
+        anchor_counts = cumulative_curve.get("anchor_count", np.asarray([], dtype=np.int64))
+        cumulative_mass = cumulative_curve.get("mass", np.asarray([], dtype=np.float64))
+        uniform_mass = cumulative_curve.get("uniform_mass", np.asarray([], dtype=np.float64))
+        if anchor_counts.size > 0:
+            axis_curve.plot(anchor_counts, cumulative_mass, marker="o", linewidth=2.0, label="sampler")
+            axis_curve.plot(anchor_counts, uniform_mass, marker="o", linestyle="--", linewidth=1.5, label="uniform")
+            if int(np.max(anchor_counts)) > 1:
+                axis_curve.set_xscale("log")
+            axis_curve.set_xticks(anchor_counts)
+            axis_curve.set_xticklabels([str(int(count)) for count in anchor_counts], rotation=30, ha="right")
+            y_max = max(float(np.max(cumulative_mass)), float(np.max(uniform_mass)), 1.0e-8)
+            axis_curve.set_ylim(0.0, min(1.0, y_max * 1.15))
+            axis_curve.grid(True, alpha=0.25)
+            axis_curve.legend(loc="upper left", fontsize=8)
+        else:
+            axis_curve.text(0.5, 0.5, "no anchor probabilities", ha="center", va="center")
+            axis_curve.set_xticks([])
+            axis_curve.set_yticks([])
+        axis_curve.set_title("Top-k anchor mass")
+        axis_curve.set_xlabel("top k anchors")
+        axis_curve.set_ylabel("cumulative mass")
+
+        if top_motion_rows:
+            motion_rows = list(reversed(top_motion_rows))
+            y_positions = np.arange(len(motion_rows))
+            axis_motion.barh(
+                y_positions,
+                [float(row["probability"]) for row in motion_rows],
+                color="#4477aa",
+            )
+            axis_motion.set_yticks(
+                y_positions,
+                [f"{int(row['rank']):02d}. {row['motion_name']}" for row in motion_rows],
+                fontsize=8,
+            )
+            axis_motion.grid(True, axis="x", alpha=0.25)
+            axis_motion.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+        else:
+            axis_motion.text(0.5, 0.5, "no motion probabilities", ha="center", va="center")
+            axis_motion.set_xticks([])
+            axis_motion.set_yticks([])
+        axis_motion.set_title(f"Top {min(ANCHOR_DASHBOARD_TOP_K, len(top_motion_rows))} motions by reset mass")
+        axis_motion.set_xlabel("reset probability mass")
+
+        axis_anchor.axis("off")
+        axis_anchor.set_title(f"Top {min(ANCHOR_DASHBOARD_TOP_K, len(top_anchor_rows))} anchors", pad=8)
+        if top_anchor_rows:
+            cell_text = [
+                [
+                    str(int(row["rank"])),
+                    str(row["motion_name"]),
+                    f"A{int(row['anchor_index'])}",
+                    f"{float(row['anchor_time']):.2f}",
+                    f"{float(row['probability']):.2e}",
+                    f"{float(row['uniform_ratio']):.1f}x",
+                ]
+                for row in top_anchor_rows
+            ]
+            table = axis_anchor.table(
+                cellText=cell_text,
+                colLabels=["#", "motion", "anchor", "time", "p", "vs uniform"],
+                cellLoc="left",
+                colLoc="left",
+                colWidths=[0.06, 0.42, 0.11, 0.12, 0.14, 0.15],
+                bbox=[0.0, 0.0, 1.0, 0.94],
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(6)
+            for (row_index, _column_index), cell in table.get_celld().items():
+                if row_index == 0:
+                    cell.set_text_props(weight="bold")
+                    cell.set_facecolor("#e8e8e8")
+                else:
+                    cell.set_facecolor("#ffffff" if row_index % 2 else "#f7f7f7")
+        else:
+            axis_anchor.text(0.5, 0.5, "no anchor probabilities", ha="center", va="center")
+
+        active_anchors = int(metrics_payload.get("sampler/reset_distribution/anchors/active_count", 0.0))
+        total_anchors = int(metrics_payload.get("sampler/reset_distribution/anchors/total_count", 0.0))
+        active_motions = int(metrics_payload.get("sampler/reset_distribution/motions/active_count", 0.0))
+        total_motions = int(metrics_payload.get("sampler/reset_distribution/motions/total_count", 0.0))
+        effective_anchors = metrics_payload.get("sampler/reset_distribution/anchors/effective_count", 0.0)
+        effective_anchor_fraction = metrics_payload.get("sampler/reset_distribution/anchors/effective_fraction", 0.0)
+        effective_motions = metrics_payload.get("sampler/reset_distribution/motions/effective_count", 0.0)
+        effective_motion_fraction = metrics_payload.get("sampler/reset_distribution/motions/effective_fraction", 0.0)
+        max_probability = metrics_payload.get("sampler/reset_distribution/anchors/max_probability", 0.0)
+        top20_mass = metrics_payload.get("sampler/reset_distribution/anchors/top20_mass", 0.0)
+        figure.suptitle(
+            "Sampler reset dashboard\n"
+            f"update={update_count} step={global_step} | "
+            f"anchors active={active_anchors}/{total_anchors} effective={effective_anchors:.0f} "
+            f"({effective_anchor_fraction:.1%}) | "
+            f"motions active={active_motions}/{total_motions} effective={effective_motions:.0f} "
+            f"({effective_motion_fraction:.1%}) | "
+            f"max_p={max_probability:.3g} top20={top20_mass:.3g}",
+            fontsize=14,
         )
-        figure.colorbar(image, ax=axis, label="reset probability mass")
-        figure.tight_layout()
         figure.savefig(output_path, dpi=120)
         plt.close(figure)
         return output_path
@@ -1271,15 +1630,21 @@ class TrainRunner:
             "snapshot_npz": str(npz_path),
         }
 
-        grid = self._build_anchor_reset_probability_heatmap_grid(
+        grid = self._build_anchor_rank_band_heatmap_grid(
             anchor_probabilities,
             num_bins=self.anchor_heatmap_bins,
         )
+        top_motion_rows = self._build_top_motion_rows(anchor_probabilities)
+        top_anchor_rows = self._build_top_anchor_rows(anchor_probabilities)
+        cumulative_curve = self._build_anchor_cumulative_mass_curve(anchor_probabilities)
         heatmap_path = output_dir / f"{snapshot_stem}_heatmap.png"
         latest_heatmap_path = output_dir / "latest_heatmap.png"
         try:
             self._write_anchor_probability_heatmap(
                 grid,
+                top_motion_rows,
+                top_anchor_rows,
+                cumulative_curve,
                 metrics_payload,
                 heatmap_path,
                 update_count=self.update_count,
@@ -1314,17 +1679,17 @@ class TrainRunner:
 
         for metric_name, value in metrics_payload.items():
             run.summary[metric_name] = float(value)
-        run.summary["sampling/anchor_reset_probability/latest_update"] = int(self.update_count)
-        run.summary["sampling/anchor_reset_probability/latest_global_step"] = int(self.global_step)
+        run.summary["sampler/reset_distribution/latest_update"] = int(self.update_count)
+        run.summary["sampler/reset_distribution/latest_global_step"] = int(self.global_step)
 
         latest_heatmap_path = artifacts.get("latest_heatmap_png")
         if latest_heatmap_path is None:
             return
 
         try:
-            run.summary["sampling/anchor_reset_probability/latest_heatmap"] = wandb.Image(
+            run.summary["sampler/reset_distribution/latest_heatmap"] = wandb.Image(
                 latest_heatmap_path,
-                caption=f"anchor reset probabilities update={self.update_count} step={self.global_step}",
+                caption=f"sampler reset distribution update={self.update_count} step={self.global_step}",
             )
         except Exception as exc:
             print(f"failed to update W&B anchor heatmap summary: {exc}", flush=True)
@@ -1339,20 +1704,59 @@ class TrainRunner:
         if not anchor_probabilities:
             return
 
-        metrics_payload = self._build_anchor_reset_probability_metrics(anchor_probabilities)
+        env_unwrapped = getattr(getattr(self, "env", None), "unwrapped", None)
+        sampler = getattr(env_unwrapped, "sampler", None)
+        metrics_payload = self._build_sampler_config_metrics()
+        metrics_payload.update(self._build_anchor_reset_probability_metrics(anchor_probabilities))
+        if sampler is not None:
+            metrics_payload.update(self._build_sampler_failure_stats(sampler))
         if metrics_payload:
             self._log_metrics(metrics_payload)
         artifacts = self._write_anchor_reset_probability_artifacts(anchor_probabilities, metrics_payload)
         self._sync_anchor_reset_probability_summary_to_wandb(metrics_payload, artifacts)
 
+        anchor_total = int(metrics_payload.get("sampler/reset_distribution/anchors/total_count", 0.0))
+        anchor_active = int(metrics_payload.get("sampler/reset_distribution/anchors/active_count", 0.0))
+        motion_total = int(metrics_payload.get("sampler/reset_distribution/motions/total_count", 0.0))
+        motion_active = int(metrics_payload.get("sampler/reset_distribution/motions/active_count", 0.0))
         print(
-            f"anchor reset probabilities after update {self.update_count}: "
-            f"max={metrics_payload['sampling/anchor_reset_probability/max']:.6f} "
-            f"active={int(metrics_payload['sampling/anchor_reset_probability/active_anchors'])} "
-            f"effective={metrics_payload['sampling/anchor_reset_probability/effective_anchors']:.2f} "
-            f"top20={metrics_payload['sampling/anchor_reset_probability/top20_mass']:.6f}",
+            f"sampler snapshot after update {self.update_count} step={self.global_step}: "
+            f"strategy={self.sampling_strategy} source={self.segment_source} "
+            f"temperature={metrics_payload['sampler/config/failure_temperature']:.3g} "
+            f"uniform_mix={metrics_payload['sampler/config/uniform_mix']:.3g}",
             flush=True,
         )
+        print(
+            "  reset anchors: "
+            f"active={anchor_active}/{anchor_total} "
+            f"effective={metrics_payload['sampler/reset_distribution/anchors/effective_count']:.2f} "
+            f"max_p={metrics_payload['sampler/reset_distribution/anchors/max_probability']:.6f} "
+            f"top20={metrics_payload['sampler/reset_distribution/anchors/top20_mass']:.6f}",
+            flush=True,
+        )
+        print(
+            "  reset motions: "
+            f"active={motion_active}/{motion_total} "
+            f"effective={metrics_payload['sampler/reset_distribution/motions/effective_count']:.2f} "
+            f"max_p={metrics_payload['sampler/reset_distribution/motions/max_probability']:.6f} "
+            f"top10={metrics_payload['sampler/reset_distribution/motions/top10_mass']:.6f}",
+            flush=True,
+        )
+        if "sampler/failure_stats/effective_sample_count_sum" in metrics_payload:
+            sampled_anchor_count = int(metrics_payload.get("sampler/failure_stats/anchors/sampled_count", 0.0))
+            failure_anchor_total = int(metrics_payload.get("sampler/failure_stats/anchors/total_count", 0.0))
+            sampled_motion_count = int(metrics_payload.get("sampler/failure_stats/motions/sampled_count", 0.0))
+            failure_motion_total = int(metrics_payload.get("sampler/failure_stats/motions/total_count", 0.0))
+            print(
+                "  failure stats: "
+                f"effective_samples={metrics_payload['sampler/failure_stats/effective_sample_count_sum']:.1f} "
+                f"effective_failures={metrics_payload['sampler/failure_stats/effective_failure_count_sum']:.1f} "
+                f"fail_rate={metrics_payload['sampler/failure_stats/failure_rate']:.4f} "
+                f"sampled_anchors={sampled_anchor_count}/{failure_anchor_total} "
+                f"sampled_motions={sampled_motion_count}/{failure_motion_total}",
+                flush=True,
+            )
+        print("  top reset anchors:", flush=True)
         top_entries = sorted(
             anchor_probabilities,
             key=lambda entry: float(entry["probability"]),
@@ -1559,9 +1963,6 @@ class TrainRunner:
                 "update/avg_value_clip_fraction": self.tracker.get_mean("value_clip_fraction"),
                 "update/actor_lr": self._optimizer_lr(self.actor_optimizer),
                 "update/critic_lr": self._optimizer_lr(self.critic_optimizer),
-                "sampling/schedule_random_active": float(self.sampling_strategy == "random"),
-                "sampling/schedule_failure_weighted_active": float(self.sampling_strategy == "failure_weighted"),
-                "sampling/adaptive_enabled": float(self.adaptive_sampling_enabled),
             }
         )
         self.update_count += 1
@@ -1581,6 +1982,10 @@ class TrainRunner:
         if action_mode is not None:
             action_mode = str(action_mode).replace("-", "_").lower()
 
+        checkpoint_artifacts = {"run_dir": str(self.run_paths.root)}
+        if self.resume_checkpoint_path is not None:
+            checkpoint_artifacts["resume_checkpoint"] = str(self.resume_checkpoint_path)
+
         checkpoint = build_training_checkpoint(
             actor=self.actor,
             critic=self.critic,
@@ -1591,10 +1996,10 @@ class TrainRunner:
             anchor_body_name=getattr(self.cfg, "anchor_body_name", None),
             segment_source=self.segment_source,
             sampling_strategy=self.sampling_strategy,
-            adaptive_sampling_enabled=self.adaptive_sampling_enabled,
             motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
             observation_window_lengths=self.observation_window_lengths,
-            artifacts={"run_dir": str(self.run_paths.root)},
+            artifacts=checkpoint_artifacts,
+            training=self._build_training_state(),
         )
         return save_checkpoint_v2(checkpoint, self.run_paths.checkpoints_dir / f"{checkpoint_name}.pth")
 
@@ -1602,14 +2007,13 @@ class TrainRunner:
         obs = self.initial_obs
         final_checkpoint_path: Path | None = None
         try:
-            for epoch in trange(self.config.num_updates):
-                self._apply_sampling_schedule()
+            for _ in trange(self.config.num_updates):
                 obs = self.rollout(obs)
                 self.update()
-                if (epoch + 1) % self.checkpoint_interval == 0:
-                    final_checkpoint_path = self.save_checkpoint(str(epoch + 1))
+                if self.checkpoint_interval > 0 and self.update_count % self.checkpoint_interval == 0:
+                    final_checkpoint_path = self.save_checkpoint(str(self.update_count))
 
-            final_checkpoint_path = self.save_checkpoint("final")
+            final_checkpoint_path = self.save_checkpoint(f"{self.update_count}_final")
         finally:
             self.env.close()
             if self.use_wandb:
@@ -1621,15 +2025,19 @@ class TrainRunner:
             "motion_files": self.motion_files,
             "motion_names": motion_names(self.motion_files),
             "motion_label": self.motion_name,
+            "motion_file_inputs": self.motion_file_inputs,
             "motion_mae_encoder_checkpoint": self.motion_mae_encoder_checkpoint,
+            "resume_checkpoint": str(self.resume_checkpoint_path) if self.resume_checkpoint_path is not None else None,
+            "resume_mode": self.resume_mode,
+            "resume_trainer_state_restored": self.resume_trainer_state_restored,
             "segment_source": self.segment_source,
             "sampling_strategy": self.sampling_strategy,
-            "adaptive_sampling_enabled": self.adaptive_sampling_enabled,
-            "sampling_schedule_enabled": self.config.sampling_schedule_enabled,
-            "sampling_random_updates": self.config.sampling_random_updates,
-            "adaptive_sampling_start_update": self.config.adaptive_sampling_start_update,
             "observation_window_lengths": self.observation_window_lengths,
             "num_updates": self.config.num_updates,
+            "start_update_count": self.start_update_count,
+            "final_update_count": self.update_count,
+            "start_global_step": self.start_global_step,
+            "final_global_step": self.global_step,
             "rollout_steps": self.steps,
             "checkpoint_interval": self.checkpoint_interval,
             "anchor_log_interval": self.anchor_log_interval,

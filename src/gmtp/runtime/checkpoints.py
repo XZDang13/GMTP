@@ -20,6 +20,7 @@ class CheckpointV2:
     model: dict[str, Any]
     env: dict[str, Any]
     artifacts: dict[str, Any] = field(default_factory=dict)
+    training: dict[str, Any] = field(default_factory=dict)
     checkpoint_version: int = CHECKPOINT_VERSION
 
     @classmethod
@@ -36,6 +37,7 @@ class CheckpointV2:
             model=dict(payload["model"]),
             env=dict(payload["env"]),
             artifacts=dict(payload["artifacts"]),
+            training=dict(payload.get("training", {})),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -45,6 +47,7 @@ class CheckpointV2:
             "model": self.model,
             "env": self.env,
             "artifacts": self.artifacts,
+            "training": self.training,
         }
 
     @property
@@ -99,10 +102,10 @@ def build_training_checkpoint(
     anchor_body_name: str | None,
     segment_source: str | None = None,
     sampling_strategy: str | None = None,
-    adaptive_sampling_enabled: bool | None = None,
     motion_mae_encoder_checkpoint: str | None = None,
     observation_window_lengths: dict[str, int] | None = None,
     artifacts: dict[str, Any] | None = None,
+    training: dict[str, Any] | None = None,
     created_at: str | None = None,
 ) -> CheckpointV2:
     resolved_motion_files = resolve_motion_files(motion_files)
@@ -125,8 +128,6 @@ def build_training_checkpoint(
         env_payload["segment_source"] = segment_source
     if sampling_strategy is not None:
         env_payload["sampling_strategy"] = sampling_strategy
-    if adaptive_sampling_enabled is not None:
-        env_payload["adaptive_sampling_enabled"] = bool(adaptive_sampling_enabled)
     if observation_window_lengths is not None:
         env_payload["observation_window_lengths"] = resolved_window_lengths
 
@@ -149,4 +150,5 @@ def build_training_checkpoint(
         },
         env=env_payload,
         artifacts=checkpoint_artifacts,
+        training=dict(training or {}),
     )

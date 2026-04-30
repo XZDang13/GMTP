@@ -6,6 +6,7 @@ from gmtp.models.motion_encoder import build_motion_window_layout
 from gmtp.models.robot_encoder import build_robot_window_layout
 from gmtp.runtime.checkpoints import (
     CHECKPOINT_VERSION,
+    CheckpointV2,
     build_training_checkpoint,
     load_checkpoint_v2,
     save_checkpoint_v2,
@@ -57,6 +58,7 @@ def test_checkpoint_v2_roundtrip(tmp_path):
         motion_mae_encoder_checkpoint=str(motion_mae_encoder_checkpoint),
         observation_window_lengths=build_robot_policy_window_lengths(4),
         artifacts={"run_dir": "runs/train/demo"},
+        training={"update_count": 7, "global_step": 140, "amp": {"enabled": False}},
     )
 
     path = save_checkpoint_v2(checkpoint, tmp_path / "model_v2.pth")
@@ -81,6 +83,7 @@ def test_checkpoint_v2_roundtrip(tmp_path):
     assert loaded.motion_mae_encoder_checkpoint == str(motion_mae_encoder_checkpoint.resolve())
     assert loaded.observation_window_lengths == build_robot_policy_window_lengths(4)
     assert loaded.motion_files[0].endswith("jump_anchor.npz")
+    assert loaded.training == {"update_count": 7, "global_step": 140, "amp": {"enabled": False}}
 
 
 def test_checkpoint_v2_defaults_to_legacy_single_frame_window_lengths_when_missing():
@@ -96,6 +99,28 @@ def test_checkpoint_v2_defaults_to_legacy_single_frame_window_lengths_when_missi
     )
 
     assert checkpoint.observation_window_lengths == {}
+
+
+def test_checkpoint_v2_defaults_missing_training_state_to_empty(tmp_path):
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2)
+    checkpoint = build_training_checkpoint(
+        actor=FiLMResActor(robot_obs_dim=robot_obs_dim, motion_obs_dim=motion_obs_dim, action_dim=2, num_blocks=4),
+        critic=Critic(obs_dim=5),
+        motion_files=["env/assests/jump_anchor.npz"],
+        joint_params=_joint_params(),
+        action_mode="offset",
+        root_name="torso_link",
+        anchor_body_name="torso_link",
+    )
+    payload = checkpoint.to_dict()
+    payload.pop("training")
+    path = tmp_path / "legacy_v2_without_training.pth"
+    torch.save(payload, path)
+
+    loaded = load_checkpoint_v2(path)
+
+    assert isinstance(loaded, CheckpointV2)
+    assert loaded.training == {}
 
 
 def test_load_checkpoint_v2_rejects_non_v2_payload(tmp_path):
