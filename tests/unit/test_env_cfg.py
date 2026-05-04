@@ -43,13 +43,21 @@ def _install_env_cfg_stubs(monkeypatch):
         enabled: bool = False
 
     @dataclass
+    class SceneCfg:
+        num_envs: int = 4096
+
+    @dataclass
     class FallRecoveryCfg:
         enabled: bool = False
         reference_time_scale: float = 0.25
 
     @dataclass
+    class FallGuardCfg:
+        enabled: bool = True
+
+    @dataclass
     class QualityGateCfg:
-        enabled: bool = False
+        enabled: bool = True
         soft_threshold: float = 1.0
         recovery_enter_threshold: float = 1.8
         hard_tracking_threshold: float | None = 4.0
@@ -59,12 +67,34 @@ def _install_env_cfg_stubs(monkeypatch):
         enabled: bool = False
         quality_gate: QualityGateCfg = field(default_factory=QualityGateCfg)
         fall_recovery: FallRecoveryCfg = field(default_factory=FallRecoveryCfg)
+        fall_guard: FallGuardCfg = field(default_factory=FallGuardCfg)
+
+    @dataclass(frozen=True)
+    class RewardTermCfg:
+        id: str
+        type: str
+        weight: float
+
+    @dataclass(frozen=True)
+    class RewardSpec:
+        terms: tuple[RewardTermCfg, ...] = field(
+            default_factory=lambda: (
+                RewardTermCfg(id="multi_scale_tracking", type="multi_scale_tracking", weight=1.0),
+                RewardTermCfg(
+                    id="tracking_recovery_penalty",
+                    type="tracking_recovery_penalty",
+                    weight=-0.25,
+                ),
+            )
+        )
 
     @_configclass
     class FakeG1MotionTrackingEnvCfg:
         action = ActionCfg()
+        scene = SceneCfg()
         recovery = RecoveryCfg()
         robust_tracking = RobustTrackingCfg()
+        rewards = RewardSpec()
 
     @_configclass
     class FakeG1TrainingEventCfg:
@@ -109,6 +139,10 @@ def _install_env_cfg_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.observation_history", observation_mod)
 
 
+def _reward_term_weight(env_cfg, term_id: str) -> float:
+    return next(term.weight for term in env_cfg.rewards.terms if term.id == term_id)
+
+
 def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
     _install_env_cfg_stubs(monkeypatch)
     sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
@@ -124,20 +158,26 @@ def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
         assert training_cfg.segment_source == env_cfg.SegmentSource.Anchor
         assert training_cfg.init_failure_bins is True
         assert training_cfg.failure_decay == 0.999
-        assert training_cfg.failure_weight_uniform_mix == 0.2
-        assert training_cfg.failure_weight_max_uniform_ratio == 4.0
-        assert training_cfg.failure_weight_exploration_bonus == 0.25
-        assert training_cfg.failure_temperature == 1.25
+        assert training_cfg.failure_weight_uniform_mix == 0.05
+        assert training_cfg.failure_weight_max_uniform_ratio == 8.0
+        assert training_cfg.failure_weight_exploration_bonus == 0.10
+        assert training_cfg.failure_temperature == 0.75
+        assert training_cfg.scene.num_envs == 8192
+        assert eval_cfg.scene.num_envs == 4096
         assert training_cfg.recovery.enabled is False
         assert eval_cfg.recovery.enabled is False
         assert training_cfg.robust_tracking.enabled is True
         assert eval_cfg.robust_tracking.enabled is True
-        assert training_cfg.robust_tracking.quality_gate.enabled is True
-        assert eval_cfg.robust_tracking.quality_gate.enabled is True
-        assert training_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 1.8
-        assert eval_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 1.8
+        assert training_cfg.robust_tracking.quality_gate.enabled is False
+        assert eval_cfg.robust_tracking.quality_gate.enabled is False
+        assert training_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 4.0
+        assert eval_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 4.0
         assert training_cfg.robust_tracking.fall_recovery.enabled is False
         assert eval_cfg.robust_tracking.fall_recovery.enabled is False
+        assert training_cfg.robust_tracking.fall_guard.enabled is False
+        assert eval_cfg.robust_tracking.fall_guard.enabled is False
+        assert _reward_term_weight(training_cfg, "tracking_recovery_penalty") == -2.0
+        assert _reward_term_weight(eval_cfg, "tracking_recovery_penalty") == -2.0
     finally:
         sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
         sys.modules.pop("gmtp.integrations.ref2act", None)

@@ -17,6 +17,36 @@ def test_build_episode_metrics_payload_separates_return_and_length_namespaces():
     }
 
 
+def test_train_prints_failure_reason_and_reraises(capsys):
+    class CloseTrackingEnv:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    runner = TrainRunner.__new__(TrainRunner)
+    runner.initial_obs = object()
+    runner.config = types.SimpleNamespace(num_updates=1)
+    runner.update_count = 2
+    runner.global_step = 40
+    runner.checkpoint_interval = 0
+    runner.env = CloseTrackingEnv()
+    runner.use_wandb = False
+
+    def failing_rollout(_obs):
+        raise RuntimeError("env exploded")
+
+    runner.rollout = failing_rollout
+
+    with pytest.raises(RuntimeError, match="env exploded"):
+        runner.train()
+
+    output = capsys.readouterr().out
+    assert "training script failed during rollout update 3: RuntimeError: env exploded" in output
+    assert runner.env.closed is True
+
+
 def test_compute_anchor_reset_probabilities_aggregates_per_anchor_and_keeps_zero_entries():
     sampler = types.SimpleNamespace(
         failure_weight_uniform_mix=0.0,
@@ -65,6 +95,13 @@ def test_build_anchor_reset_probability_metrics_uses_low_cardinality_distributio
                 "probability": 0.25,
             },
             {
+                "motion_index": 0,
+                "motion_name": "jump/anchor 01",
+                "anchor_index": 3,
+                "anchor_time": 1.0,
+                "probability": 0.0,
+            },
+            {
                 "motion_index": 1,
                 "motion_name": "walk.anchor",
                 "anchor_index": 0,
@@ -79,14 +116,18 @@ def test_build_anchor_reset_probability_metrics_uses_low_cardinality_distributio
     assert payload["sampler/reset_distribution/anchors/probability_sum"] == pytest.approx(1.0)
     assert payload["sampler/reset_distribution/anchors/max_probability"] == pytest.approx(0.75)
     assert payload["sampler/reset_distribution/anchors/active_count"] == 2.0
-    assert payload["sampler/reset_distribution/anchors/active_fraction"] == pytest.approx(1.0)
+    assert payload["sampler/reset_distribution/anchors/active_fraction"] == pytest.approx(2.0 / 3.0)
     assert payload["sampler/reset_distribution/anchors/top1_mass"] == pytest.approx(0.75)
     assert payload["sampler/reset_distribution/anchors/top5_mass"] == pytest.approx(1.0)
+    assert payload["sampler/reset_distribution/anchors/top20_anchor0_count"] == 1.0
+    assert payload["sampler/reset_distribution/anchors/top20_single_anchor_motion_count"] == 1.0
     assert payload["sampler/reset_distribution/anchors/effective_count"] == pytest.approx(
         np.exp(-(0.25 * np.log(0.25) + 0.75 * np.log(0.75)))
     )
     assert payload["sampler/reset_distribution/motions/active_count"] == 2.0
     assert payload["sampler/reset_distribution/motions/top10_mass"] == pytest.approx(1.0)
+    assert payload["sampler/reset_distribution/motions/single_anchor_count"] == 1.0
+    assert payload["sampler/reset_distribution/motions/single_anchor_fraction"] == pytest.approx(0.5)
 
 
 def test_build_sampler_failure_stats_reports_coverage_and_failure_rate():
@@ -141,14 +182,23 @@ def test_log_anchor_reset_probabilities_prints_only_top_twenty(capsys):
     output = capsys.readouterr().out
 
     assert ANCHOR_CONSOLE_TOP_K == 20
-    assert output.count("  motion_") == 20
+    motion_lines = [line for line in output.splitlines() if line.startswith("  motion_")]
+    assert len(motion_lines) == 40
+    assert sum(" anchors=" in line for line in motion_lines) == 20
+    assert sum(" A" in line for line in motion_lines) == 20
     assert "sampler snapshot after update 100 step=2000:" in output
     assert "reset anchors:" in output
     assert "reset motions:" in output
+    assert "top reset motions:" in output
     assert "top reset anchors:" in output
+    assert "top multi-anchor phase biases:" not in output
+    assert "motion_00 p=25.000000 anchors=1" in output
     assert "motion_00 A0" in output
+    assert "motion_19 p=6.000000 anchors=1" in output
     assert "motion_19 A19" in output
+    assert "motion_20 p=" not in output
     assert "motion_20 A20" not in output
+    assert "motion_24 p=" not in output
     assert "motion_24 A24" not in output
 
 

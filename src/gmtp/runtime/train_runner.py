@@ -945,6 +945,14 @@ class TrainRunner:
         num_motions = float(motion_probabilities.size)
         effective_anchors = cls._effective_probability_count(probabilities)
         effective_motions = cls._effective_probability_count(motion_probabilities)
+        anchor_counts_by_motion = cls._anchor_counts_by_motion(arrays)
+        top_anchor_indices = np.argsort(-probabilities)[: min(ANCHOR_CONSOLE_TOP_K, probabilities.size)]
+        top_anchor_counts = np.asarray(
+            [anchor_counts_by_motion.get(int(arrays.motion_index[index]), 0) for index in top_anchor_indices],
+            dtype=np.int64,
+        )
+        top_anchor_ids = arrays.anchor_index[top_anchor_indices] if top_anchor_indices.size else np.asarray([])
+        single_anchor_motion_count = float(sum(1 for count in anchor_counts_by_motion.values() if count == 1))
 
         return {
             "sampler/reset_distribution/anchors/probability_sum": float(np.sum(probabilities)),
@@ -963,6 +971,12 @@ class TrainRunner:
             "sampler/reset_distribution/anchors/top1_mass": cls._top_probability_mass(probabilities, 1),
             "sampler/reset_distribution/anchors/top5_mass": cls._top_probability_mass(probabilities, 5),
             "sampler/reset_distribution/anchors/top20_mass": cls._top_probability_mass(probabilities, 20),
+            "sampler/reset_distribution/anchors/top20_anchor0_count": (
+                float(np.count_nonzero(top_anchor_ids == 0)) if top_anchor_ids.size else 0.0
+            ),
+            "sampler/reset_distribution/anchors/top20_single_anchor_motion_count": (
+                float(np.count_nonzero(top_anchor_counts == 1)) if top_anchor_counts.size else 0.0
+            ),
             "sampler/reset_distribution/motions/max_probability": (
                 float(np.max(motion_probabilities)) if motion_probabilities.size else 0.0
             ),
@@ -978,6 +992,11 @@ class TrainRunner:
             "sampler/reset_distribution/motions/top1_mass": cls._top_probability_mass(motion_probabilities, 1),
             "sampler/reset_distribution/motions/top5_mass": cls._top_probability_mass(motion_probabilities, 5),
             "sampler/reset_distribution/motions/top10_mass": cls._top_probability_mass(motion_probabilities, 10),
+            "sampler/reset_distribution/motions/single_anchor_count": single_anchor_motion_count,
+            "sampler/reset_distribution/motions/single_anchor_fraction": cls._safe_fraction(
+                single_anchor_motion_count,
+                num_motions,
+            ),
         }
 
     @staticmethod
@@ -1197,6 +1216,13 @@ class TrainRunner:
             mask = arrays.motion_index == motion_index
             motion_probabilities.append(float(np.sum(np.maximum(arrays.probability[mask], 0.0))))
         return np.asarray(motion_probabilities, dtype=np.float64)
+
+    @staticmethod
+    def _anchor_counts_by_motion(arrays: AnchorProbabilityArrays) -> dict[int, int]:
+        return {
+            int(motion_index): int(np.count_nonzero(arrays.motion_index == motion_index))
+            for motion_index in np.unique(arrays.motion_index)
+        }
 
     @staticmethod
     def _truncate_dashboard_label(value: str, *, max_chars: int = ANCHOR_DASHBOARD_LABEL_CHARS) -> str:
@@ -1533,21 +1559,23 @@ class TrainRunner:
 
         axis_anchor.axis("off")
         axis_anchor.set_title(f"Top {min(ANCHOR_DASHBOARD_TOP_K, len(top_anchor_rows))} anchors", pad=8)
-        if top_anchor_rows:
-            cell_text = [
-                [
-                    str(int(row["rank"])),
-                    str(row["motion_name"]),
-                    f"A{int(row['anchor_index'])}",
-                    f"{float(row['anchor_time']):.2f}",
-                    f"{float(row['probability']):.2e}",
-                    f"{float(row['uniform_ratio']):.1f}x",
-                ]
-                for row in top_anchor_rows
+        cell_text = [
+            [
+                str(int(row["rank"])),
+                str(row["motion_name"]),
+                f"A{int(row['anchor_index'])}",
+                f"{float(row['anchor_time']):.2f}",
+                f"{float(row['probability']):.2e}",
+                f"{float(row['uniform_ratio']):.1f}x",
             ]
+            for row in top_anchor_rows
+        ]
+        column_labels = ["#", "motion", "anchor", "time", "p", "vs uniform"]
+
+        if cell_text:
             table = axis_anchor.table(
                 cellText=cell_text,
-                colLabels=["#", "motion", "anchor", "time", "p", "vs uniform"],
+                colLabels=column_labels,
                 cellLoc="left",
                 colLoc="left",
                 colWidths=[0.06, 0.42, 0.11, 0.12, 0.14, 0.15],
@@ -1717,8 +1745,17 @@ class TrainRunner:
 
         anchor_total = int(metrics_payload.get("sampler/reset_distribution/anchors/total_count", 0.0))
         anchor_active = int(metrics_payload.get("sampler/reset_distribution/anchors/active_count", 0.0))
+        top20_anchor0_count = int(
+            metrics_payload.get("sampler/reset_distribution/anchors/top20_anchor0_count", 0.0)
+        )
+        top20_single_anchor_motion_count = int(
+            metrics_payload.get("sampler/reset_distribution/anchors/top20_single_anchor_motion_count", 0.0)
+        )
         motion_total = int(metrics_payload.get("sampler/reset_distribution/motions/total_count", 0.0))
         motion_active = int(metrics_payload.get("sampler/reset_distribution/motions/active_count", 0.0))
+        single_anchor_motion_count = int(
+            metrics_payload.get("sampler/reset_distribution/motions/single_anchor_count", 0.0)
+        )
         print(
             f"sampler snapshot after update {self.update_count} step={self.global_step}: "
             f"strategy={self.sampling_strategy} source={self.segment_source} "
@@ -1731,7 +1768,9 @@ class TrainRunner:
             f"active={anchor_active}/{anchor_total} "
             f"effective={metrics_payload['sampler/reset_distribution/anchors/effective_count']:.2f} "
             f"max_p={metrics_payload['sampler/reset_distribution/anchors/max_probability']:.6f} "
-            f"top20={metrics_payload['sampler/reset_distribution/anchors/top20_mass']:.6f}",
+            f"top20={metrics_payload['sampler/reset_distribution/anchors/top20_mass']:.6f} "
+            f"top20_a0={top20_anchor0_count} "
+            f"top20_single_anchor_motions={top20_single_anchor_motion_count}",
             flush=True,
         )
         print(
@@ -1739,7 +1778,8 @@ class TrainRunner:
             f"active={motion_active}/{motion_total} "
             f"effective={metrics_payload['sampler/reset_distribution/motions/effective_count']:.2f} "
             f"max_p={metrics_payload['sampler/reset_distribution/motions/max_probability']:.6f} "
-            f"top10={metrics_payload['sampler/reset_distribution/motions/top10_mass']:.6f}",
+            f"top10={metrics_payload['sampler/reset_distribution/motions/top10_mass']:.6f} "
+            f"single_anchor_motions={single_anchor_motion_count}/{motion_total}",
             flush=True,
         )
         if "sampler/failure_stats/effective_sample_count_sum" in metrics_payload:
@@ -1756,15 +1796,27 @@ class TrainRunner:
                 f"sampled_motions={sampled_motion_count}/{failure_motion_total}",
                 flush=True,
             )
-        print("  top reset anchors:", flush=True)
-        top_entries = sorted(
+        print("  top reset motions:", flush=True)
+        top_motion_entries = self._build_top_motion_rows(
             anchor_probabilities,
-            key=lambda entry: float(entry["probability"]),
-            reverse=True,
-        )[:ANCHOR_CONSOLE_TOP_K]
-        for entry in top_entries:
+            limit=ANCHOR_CONSOLE_TOP_K,
+            max_name_chars=10_000,
+        )
+        for entry in top_motion_entries:
             print(
-                f"  {entry['motion_name']} A{int(entry['anchor_index'])} "
+                f"  {entry['full_motion_name']} "
+                f"p={float(entry['probability']):.6f} anchors={int(entry['anchor_count'])}",
+                flush=True,
+            )
+        print("  top reset anchors:", flush=True)
+        top_anchor_entries = self._build_top_anchor_rows(
+            anchor_probabilities,
+            limit=ANCHOR_CONSOLE_TOP_K,
+            max_name_chars=10_000,
+        )
+        for entry in top_anchor_entries:
+            print(
+                f"  {entry['full_motion_name']} A{int(entry['anchor_index'])} "
                 f"t={float(entry['anchor_time']):.3f}s p={float(entry['probability']):.6f}",
                 flush=True,
             )
@@ -1879,7 +1931,7 @@ class TrainRunner:
         self.tracker.reset("value_clip_fraction")
 
         for _ in range(5):
-            batch_iter = self.rollout_buffer.sample_batchs(self.batch_keys, 4096 * 10)
+            batch_iter = self.rollout_buffer.sample_batchs(self.batch_keys, 6000 * 10)
 
             for batch in batch_iter:
                 policy_obs_batch = get_policy_batch(batch, self.actor_type, self.device)
@@ -2003,17 +2055,32 @@ class TrainRunner:
         )
         return save_checkpoint_v2(checkpoint, self.run_paths.checkpoints_dir / f"{checkpoint_name}.pth")
 
+    @staticmethod
+    def _format_failure_reason(exc: BaseException) -> str:
+        message = str(exc).strip()
+        if not message:
+            return type(exc).__name__
+        return f"{type(exc).__name__}: {message}"
+
     def train(self):
         obs = self.initial_obs
         final_checkpoint_path: Path | None = None
+        failure_stage = "startup"
         try:
             for _ in trange(self.config.num_updates):
+                failure_stage = f"rollout update {self.update_count + 1}"
                 obs = self.rollout(obs)
+                failure_stage = f"policy update {self.update_count + 1}"
                 self.update()
                 if self.checkpoint_interval > 0 and self.update_count % self.checkpoint_interval == 0:
+                    failure_stage = f"checkpoint update {self.update_count}"
                     final_checkpoint_path = self.save_checkpoint(str(self.update_count))
 
+            failure_stage = "final checkpoint"
             final_checkpoint_path = self.save_checkpoint(f"{self.update_count}_final")
+        except Exception as exc:
+            print(f"training script failed during {failure_stage}: {self._format_failure_reason(exc)}", flush=True)
+            raise
         finally:
             self.env.close()
             if self.use_wandb:
