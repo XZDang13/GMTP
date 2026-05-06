@@ -90,6 +90,7 @@ Common training options:
 | `--run-name NAME` | auto-generated | Human-readable run suffix. |
 | `--disable-wandb` | off | Disable W&B logging. |
 | `--disable-amp` | off | Disable CUDA automatic mixed precision. |
+| `--disable-quality-gate` | off | Disable the Ref2Act terminal tracking quality gate during training. |
 | `--anchor-log-interval N` | `100` | Log anchor reset sampler diagnostics every N updates. |
 | `--anchor-heatmap-bins N` | `128` | Number of time bins for anchor reset heatmap artifacts. |
 | `--headless` | off | Passed to Isaac Lab AppLauncher for non-GUI runs. |

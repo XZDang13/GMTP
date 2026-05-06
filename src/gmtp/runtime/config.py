@@ -15,6 +15,7 @@ class RunConfig:
     motion_files: list[str] | None = None
     resume_checkpoint_path: str | None = None
     use_amp: bool = True
+    disable_quality_gate: bool = False
     rollout_steps: int = 20
     num_updates: int = 1000
     checkpoint_interval: int = 4000

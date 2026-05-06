@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import gymnasium
 
-from .env_cfg import G1MultiMotionEnv, G1MultiMotionTrainingEnv
+from .env_cfg import G1MultiMotionEnv, G1MultiMotionTrainingEnv, set_robust_tracking_quality_gate_enabled
 from .motion import resolve_motion_files
 from .observation_history import build_gmtp_observation_spec
 
@@ -18,8 +18,11 @@ def make_training_env(
     *,
     window_lengths: Mapping[str, int] | None = None,
     motion_files: list[str] | None = None,
+    disable_quality_gate: bool = False,
 ):
     cfg = G1MultiMotionTrainingEnv()
+    if disable_quality_gate and hasattr(cfg, "robust_tracking"):
+        cfg.robust_tracking = set_robust_tracking_quality_gate_enabled(cfg.robust_tracking, False)
     motion_file_inputs = motion_files if motion_files is not None else cfg.expert_motion_file
     cfg.expert_motion_file = resolve_motion_files(motion_file_inputs)
     cfg.observation = build_gmtp_observation_spec(add_noise=True, window_lengths=window_lengths)

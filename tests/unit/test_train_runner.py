@@ -17,6 +17,64 @@ def test_build_episode_metrics_payload_separates_return_and_length_namespaces():
     }
 
 
+def test_extract_relative_anchor_pos_sample_uses_gmtp_privilege_term_order():
+    privilege = torch.tensor(
+        [
+            [0.0, 0.1, 0.2, 1.0, 1.1, 2.0, 2.1, 3.0, 4.0, 12.0],
+            [0.3, 0.4, 0.5, 1.2, 1.3, 2.2, 2.3, 0.0, 0.0, -2.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    relative_anchor_pos = TrainRunner._extract_relative_anchor_pos_sample(privilege, action_dim=2)
+
+    assert relative_anchor_pos is not None
+    torch.testing.assert_close(relative_anchor_pos, torch.tensor([[3.0, 4.0, 12.0], [0.0, 0.0, -2.0]]))
+
+
+def test_extract_relative_anchor_pos_sample_skips_unavailable_or_nonfinite_privilege_obs():
+    assert TrainRunner._extract_relative_anchor_pos_sample(torch.zeros(2, 9), action_dim=2) is None
+    assert TrainRunner._extract_relative_anchor_pos_sample(torch.zeros(2, 10), action_dim=0) is None
+
+    nonfinite_privilege = torch.zeros(2, 10)
+    nonfinite_privilege[0, 8] = float("nan")
+
+    assert TrainRunner._extract_relative_anchor_pos_sample(nonfinite_privilege, action_dim=2) is None
+
+
+def test_build_location_tracking_metrics_reports_full_xy_z_p95_and_max_errors():
+    relative_anchor_pos_samples = [
+        torch.tensor([[3.0, 4.0, 12.0], [0.0, 0.0, 2.0]], dtype=torch.float32),
+        torch.tensor([[1.0, 2.0, 2.0], [0.0, 0.0, 0.0]], dtype=torch.float32),
+    ]
+
+    payload = TrainRunner._build_location_tracking_metrics(relative_anchor_pos_samples)
+
+    relative_anchor_pos = torch.cat(relative_anchor_pos_samples, dim=0)
+    location_error = torch.linalg.vector_norm(relative_anchor_pos, dim=-1)
+    xy_error = torch.linalg.vector_norm(relative_anchor_pos[:, :2], dim=-1)
+    z_error = torch.abs(relative_anchor_pos[:, 2])
+    assert payload == pytest.approx(
+        {
+            "tracking/location_error_m": float(location_error.mean().item()),
+            "tracking/location_error_xy_m": float(xy_error.mean().item()),
+            "tracking/location_error_z_m": float(z_error.mean().item()),
+            "tracking/location_error_p95_m": float(torch.quantile(location_error, 0.95).item()),
+            "tracking/location_error_max_m": float(location_error.max().item()),
+        }
+    )
+
+
+def test_build_location_tracking_metrics_skips_invalid_samples():
+    assert TrainRunner._build_location_tracking_metrics([]) == {}
+    assert TrainRunner._build_location_tracking_metrics([torch.zeros(2, 2)]) == {}
+
+    nonfinite_sample = torch.zeros(2, 3)
+    nonfinite_sample[0, 0] = float("inf")
+
+    assert TrainRunner._build_location_tracking_metrics([nonfinite_sample]) == {}
+
+
 def test_train_prints_failure_reason_and_reraises(capsys):
     class CloseTrackingEnv:
         def __init__(self):
@@ -184,7 +242,7 @@ def test_log_anchor_reset_probabilities_prints_only_top_twenty(capsys):
     assert ANCHOR_CONSOLE_TOP_K == 20
     motion_lines = [line for line in output.splitlines() if line.startswith("  motion_")]
     assert len(motion_lines) == 40
-    assert sum(" anchors=" in line for line in motion_lines) == 20
+    assert sum(" active_anchors=" in line for line in motion_lines) == 20
     assert sum(" A" in line for line in motion_lines) == 20
     assert "sampler snapshot after update 100 step=2000:" in output
     assert "reset anchors:" in output
@@ -192,13 +250,19 @@ def test_log_anchor_reset_probabilities_prints_only_top_twenty(capsys):
     assert "top reset motions:" in output
     assert "top reset anchors:" in output
     assert "top multi-anchor phase biases:" not in output
-    assert "motion_00 p=25.000000 anchors=1" in output
-    assert "motion_00 A0" in output
-    assert "motion_19 p=6.000000 anchors=1" in output
-    assert "motion_19 A19" in output
-    assert "motion_20 p=" not in output
+    assert (
+        "motion_00 motion_p=25.000000 active_anchors=1/1 "
+        "max_anchor=A0@0.000s max_anchor_p=25.000000"
+    ) in output
+    assert "motion_00 A0 t=0.000s anchor_p=25.000000 motion_p=25.000000 anchor_share=100.0%" in output
+    assert (
+        "motion_19 motion_p=6.000000 active_anchors=1/1 "
+        "max_anchor=A19@19.000s max_anchor_p=6.000000"
+    ) in output
+    assert "motion_19 A19 t=19.000s anchor_p=6.000000 motion_p=6.000000 anchor_share=100.0%" in output
+    assert "motion_20 motion_p=" not in output
     assert "motion_20 A20" not in output
-    assert "motion_24 p=" not in output
+    assert "motion_24 motion_p=" not in output
     assert "motion_24 A24" not in output
 
 
@@ -275,8 +339,17 @@ def test_sampler_dashboard_rows_are_sorted_and_truncate_long_motion_names():
     assert [row["full_motion_name"] for row in top_motions] == [long_motion_name, "walk"]
     assert top_motions[0]["probability"] == pytest.approx(0.60)
     assert top_motions[0]["motion_name"] == "very_long..."
+    assert top_motions[0]["anchor_count"] == 2
+    assert top_motions[0]["active_anchor_count"] == 2
+    assert top_motions[0]["max_anchor_index"] == 0
+    assert top_motions[0]["max_anchor_time"] == pytest.approx(0.0)
+    assert top_motions[0]["max_anchor_probability"] == pytest.approx(0.35)
     assert [row["probability"] for row in top_anchors] == pytest.approx([0.35, 0.30, 0.25])
     assert top_anchors[0]["motion_name"] == "very_long..."
+    assert top_anchors[0]["motion_probability"] == pytest.approx(0.60)
+    assert top_anchors[0]["anchor_share"] == pytest.approx(0.35 / 0.60)
+    assert top_anchors[1]["motion_probability"] == pytest.approx(0.30)
+    assert top_anchors[1]["anchor_share"] == pytest.approx(1.0)
     assert top_anchors[0]["uniform_ratio"] == pytest.approx(1.4)
     assert curve["anchor_count"].tolist() == [1, 2, 4]
     assert curve["mass"].tolist() == pytest.approx([0.35, 0.65, 1.0])

@@ -51,8 +51,9 @@ RECOVERY_ENTRY_RATE_KEY = "fall_recovery/entry_rate"
 RECOVERY_EXIT_RATE_KEY = "fall_recovery/exit_rate"
 RECOVERY_TIMEOUT_RATE_KEY = "fall_recovery/timeout_rate"
 RECOVERY_RATIO_EPS = 1.0e-8
+RELATIVE_ANCHOR_POS_DIM = 3
 PPO_CLIP_RATIO = 0.2
-ENTROPY_COEF = 0.005
+ENTROPY_COEF = 0.01
 ANCHOR_CONSOLE_TOP_K = 20
 ANCHOR_DASHBOARD_MAX_RANK_BANDS = 80
 ANCHOR_DASHBOARD_TOP_K = 20
@@ -173,6 +174,7 @@ class TrainRunner:
             make_training_env,
             window_lengths=self.observation_window_lengths,
             motion_files=self.motion_file_inputs,
+            disable_quality_gate=config.disable_quality_gate,
         )
         if self.motion_file_inputs is None:
             startup_timer.log("creating training environment with default motion set")
@@ -248,7 +250,7 @@ class TrainRunner:
             prefer_muon=self.device.type == "cuda",
         )
         self.grad_scaler = build_grad_scaler(self.use_amp)
-        self.lr_scheduler = KLAdaptiveLR(self.actor_optimizer, 0.01)
+        self.lr_scheduler = KLAdaptiveLR(self.actor_optimizer, 0.01, min_lr = 5e-6)
         self._restore_resume_checkpoint(startup_timer)
         self.start_update_count = int(self.update_count)
         self.start_global_step = int(self.global_step)
@@ -385,12 +387,14 @@ class TrainRunner:
         *,
         window_lengths: Mapping[str, int],
         motion_files: list[str] | None,
+        disable_quality_gate: bool = False,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"window_lengths": window_lengths}
-        if motion_files is None:
-            return kwargs
+        if disable_quality_gate:
+            kwargs["disable_quality_gate"] = True
 
-        kwargs["motion_files"] = motion_files
+        if motion_files is not None:
+            kwargs["motion_files"] = motion_files
         return kwargs
 
     @staticmethod
@@ -660,6 +664,76 @@ class TrainRunner:
         return {
             "episode/returns": float(mean_return),
             "episode/lengths": float(mean_length),
+        }
+
+    @staticmethod
+    def _extract_relative_anchor_pos_sample(
+        privilege_obs: Any,
+        *,
+        action_dim: int,
+    ) -> torch.Tensor | None:
+        try:
+            privilege = torch.as_tensor(privilege_obs)
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        if privilege.ndim < 1:
+            return None
+
+        try:
+            resolved_action_dim = int(action_dim)
+        except (TypeError, ValueError):
+            return None
+        if resolved_action_dim < 1:
+            return None
+
+        # GMTP privilege order: target projected gravity, target joint pos, target joint vel, relative anchor pos.
+        relative_anchor_pos_start = 3 + 2 * resolved_action_dim
+        relative_anchor_pos_stop = relative_anchor_pos_start + RELATIVE_ANCHOR_POS_DIM
+        if int(privilege.shape[-1]) < relative_anchor_pos_stop:
+            return None
+
+        relative_anchor_pos = privilege[..., relative_anchor_pos_start:relative_anchor_pos_stop].detach()
+        if relative_anchor_pos.numel() == 0:
+            return None
+        if not bool(torch.isfinite(relative_anchor_pos).all().item()):
+            return None
+        return relative_anchor_pos
+
+    @staticmethod
+    def _build_location_tracking_metrics(relative_anchor_pos_samples: list[torch.Tensor]) -> dict[str, float]:
+        if not relative_anchor_pos_samples:
+            return {}
+
+        flattened_samples: list[torch.Tensor] = []
+        for sample in relative_anchor_pos_samples:
+            sample = sample.detach()
+            if sample.ndim < 1 or int(sample.shape[-1]) != RELATIVE_ANCHOR_POS_DIM or sample.numel() == 0:
+                return {}
+            if not bool(torch.isfinite(sample).all().item()):
+                return {}
+            flattened_samples.append(sample.reshape(-1, RELATIVE_ANCHOR_POS_DIM).to(dtype=torch.float32))
+
+        if not flattened_samples:
+            return {}
+
+        relative_anchor_pos = torch.cat(flattened_samples, dim=0)
+        if relative_anchor_pos.numel() == 0:
+            return {}
+
+        location_error = torch.linalg.vector_norm(relative_anchor_pos, dim=-1)
+        if location_error.numel() == 0 or not bool(torch.isfinite(location_error).all().item()):
+            return {}
+
+        xy_error = torch.linalg.vector_norm(relative_anchor_pos[:, :2], dim=-1)
+        z_error = torch.abs(relative_anchor_pos[:, 2])
+        return {
+            "tracking/location_error_m": float(location_error.mean().detach().to(device="cpu").item()),
+            "tracking/location_error_xy_m": float(xy_error.mean().detach().to(device="cpu").item()),
+            "tracking/location_error_z_m": float(z_error.mean().detach().to(device="cpu").item()),
+            "tracking/location_error_p95_m": float(
+                torch.quantile(location_error, 0.95).detach().to(device="cpu").item()
+            ),
+            "tracking/location_error_max_m": float(location_error.max().detach().to(device="cpu").item()),
         }
 
     @staticmethod
@@ -1335,7 +1409,25 @@ class TrainRunner:
             zip(motion_indices[:limit], motion_names_list[:limit], motion_probabilities[:limit], strict=False),
             start=1,
         ):
-            anchor_count = int(np.count_nonzero(arrays.motion_index == int(motion_index)))
+            motion_mask = arrays.motion_index == int(motion_index)
+            motion_entry_indices = np.nonzero(motion_mask)[0]
+            anchor_count = int(motion_entry_indices.size)
+            motion_anchor_probabilities = np.maximum(
+                arrays.probability[motion_entry_indices].astype(np.float64, copy=False),
+                0.0,
+            )
+            active_anchor_count = int(np.count_nonzero(motion_anchor_probabilities > 0.0))
+            max_anchor_entry_index = int(motion_entry_indices[0])
+            max_anchor_probability = 0.0
+            if motion_entry_indices.size > 0:
+                max_anchor_order = np.lexsort(
+                    (
+                        arrays.anchor_index[motion_entry_indices],
+                        -motion_anchor_probabilities,
+                    )
+                )
+                max_anchor_entry_index = int(motion_entry_indices[int(max_anchor_order[0])])
+                max_anchor_probability = float(motion_anchor_probabilities[int(max_anchor_order[0])])
             rows.append(
                 {
                     "rank": rank,
@@ -1343,6 +1435,10 @@ class TrainRunner:
                     "motion_name": cls._truncate_dashboard_label(str(motion_name), max_chars=max_name_chars),
                     "full_motion_name": str(motion_name),
                     "anchor_count": anchor_count,
+                    "active_anchor_count": active_anchor_count,
+                    "max_anchor_index": int(arrays.anchor_index[max_anchor_entry_index]),
+                    "max_anchor_time": float(arrays.anchor_time[max_anchor_entry_index]),
+                    "max_anchor_probability": max_anchor_probability,
                     "probability": float(probability),
                 }
             )
@@ -1363,11 +1459,17 @@ class TrainRunner:
 
         total_probability = float(np.sum(probabilities))
         uniform_probability = total_probability / float(probabilities.size) if total_probability > 0.0 else 0.0
+        motion_probabilities_by_index: dict[int, float] = {}
+        for motion_index in np.unique(arrays.motion_index):
+            motion_mask = arrays.motion_index == int(motion_index)
+            motion_probabilities_by_index[int(motion_index)] = float(np.sum(probabilities[motion_mask]))
         order = np.lexsort((arrays.anchor_index, arrays.motion_index, -probabilities))
         rows: list[dict[str, float | int | str]] = []
         for rank, entry_index in enumerate(order[:limit], start=1):
             probability = float(probabilities[entry_index])
             uniform_ratio = probability / uniform_probability if uniform_probability > 0.0 else 0.0
+            motion_probability = motion_probabilities_by_index.get(int(arrays.motion_index[entry_index]), 0.0)
+            anchor_share = probability / motion_probability if motion_probability > 0.0 else 0.0
             motion_name = str(arrays.motion_name[entry_index])
             rows.append(
                 {
@@ -1378,6 +1480,8 @@ class TrainRunner:
                     "anchor_index": int(arrays.anchor_index[entry_index]),
                     "anchor_time": float(arrays.anchor_time[entry_index]),
                     "probability": probability,
+                    "motion_probability": float(motion_probability),
+                    "anchor_share": float(anchor_share),
                     "uniform_ratio": float(uniform_ratio),
                 }
             )
@@ -1767,7 +1871,7 @@ class TrainRunner:
             "  reset anchors: "
             f"active={anchor_active}/{anchor_total} "
             f"effective={metrics_payload['sampler/reset_distribution/anchors/effective_count']:.2f} "
-            f"max_p={metrics_payload['sampler/reset_distribution/anchors/max_probability']:.6f} "
+            f"max_anchor_p={metrics_payload['sampler/reset_distribution/anchors/max_probability']:.6f} "
             f"top20={metrics_payload['sampler/reset_distribution/anchors/top20_mass']:.6f} "
             f"top20_a0={top20_anchor0_count} "
             f"top20_single_anchor_motions={top20_single_anchor_motion_count}",
@@ -1777,7 +1881,7 @@ class TrainRunner:
             "  reset motions: "
             f"active={motion_active}/{motion_total} "
             f"effective={metrics_payload['sampler/reset_distribution/motions/effective_count']:.2f} "
-            f"max_p={metrics_payload['sampler/reset_distribution/motions/max_probability']:.6f} "
+            f"max_motion_p={metrics_payload['sampler/reset_distribution/motions/max_probability']:.6f} "
             f"top10={metrics_payload['sampler/reset_distribution/motions/top10_mass']:.6f} "
             f"single_anchor_motions={single_anchor_motion_count}/{motion_total}",
             flush=True,
@@ -1805,7 +1909,10 @@ class TrainRunner:
         for entry in top_motion_entries:
             print(
                 f"  {entry['full_motion_name']} "
-                f"p={float(entry['probability']):.6f} anchors={int(entry['anchor_count'])}",
+                f"motion_p={float(entry['probability']):.6f} "
+                f"active_anchors={int(entry['active_anchor_count'])}/{int(entry['anchor_count'])} "
+                f"max_anchor=A{int(entry['max_anchor_index'])}@{float(entry['max_anchor_time']):.3f}s "
+                f"max_anchor_p={float(entry['max_anchor_probability']):.6f}",
                 flush=True,
             )
         print("  top reset anchors:", flush=True)
@@ -1817,7 +1924,10 @@ class TrainRunner:
         for entry in top_anchor_entries:
             print(
                 f"  {entry['full_motion_name']} A{int(entry['anchor_index'])} "
-                f"t={float(entry['anchor_time']):.3f}s p={float(entry['probability']):.6f}",
+                f"t={float(entry['anchor_time']):.3f}s "
+                f"anchor_p={float(entry['probability']):.6f} "
+                f"motion_p={float(entry['motion_probability']):.6f} "
+                f"anchor_share={float(entry['anchor_share']) * 100.0:.1f}%",
                 flush=True,
             )
         if latest_heatmap_path := artifacts.get("latest_heatmap_png"):
@@ -1854,6 +1964,8 @@ class TrainRunner:
 
     def rollout(self, obs):
         recovery_metric_samples: list[dict[str, float]] = []
+        relative_anchor_pos_samples: list[torch.Tensor] = []
+        location_tracking_available = True
         for _ in range(self.steps):
             self.global_step += 1
             actor_obs = get_actor_observation(obs, self.actor_type)
@@ -1868,6 +1980,16 @@ class TrainRunner:
                 action_dim=self.cfg.action_space,
                 observation_window_lengths=self.observation_window_lengths,
             )
+            if location_tracking_available:
+                relative_anchor_pos = self._extract_relative_anchor_pos_sample(
+                    next_obs.get("privilege"),
+                    action_dim=self.cfg.action_space,
+                )
+                if relative_anchor_pos is None:
+                    location_tracking_available = False
+                    relative_anchor_pos_samples.clear()
+                else:
+                    relative_anchor_pos_samples.append(relative_anchor_pos)
             reward = task_reward
 
             self.tracker.add_values("episode_return", reward)
@@ -1900,6 +2022,10 @@ class TrainRunner:
         recovery_metrics_payload = self._build_recovery_metrics_payload(recovery_metric_samples)
         if recovery_metrics_payload:
             self._log_metrics(recovery_metrics_payload)
+        if location_tracking_available:
+            location_tracking_payload = self._build_location_tracking_metrics(relative_anchor_pos_samples)
+            if location_tracking_payload:
+                self._log_metrics(location_tracking_payload)
 
         actor_obs = get_actor_observation(obs, self.actor_type)
         critic_obs = self._get_critic_observation(obs)
@@ -1931,7 +2057,7 @@ class TrainRunner:
         self.tracker.reset("value_clip_fraction")
 
         for _ in range(5):
-            batch_iter = self.rollout_buffer.sample_batchs(self.batch_keys, 6000 * 10)
+            batch_iter = self.rollout_buffer.sample_batchs(self.batch_keys, 4096 * 10)
 
             for batch in batch_iter:
                 policy_obs_batch = get_policy_batch(batch, self.actor_type, self.device)
@@ -2099,6 +2225,7 @@ class TrainRunner:
             "resume_trainer_state_restored": self.resume_trainer_state_restored,
             "segment_source": self.segment_source,
             "sampling_strategy": self.sampling_strategy,
+            "disable_quality_gate": self.config.disable_quality_gate,
             "observation_window_lengths": self.observation_window_lengths,
             "num_updates": self.config.num_updates,
             "start_update_count": self.start_update_count,

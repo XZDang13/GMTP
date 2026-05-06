@@ -4,6 +4,27 @@ import sys
 import types
 from dataclasses import dataclass, field, is_dataclass
 
+REF2ACT_ROBUST_REWARD_TERM_IDS = (
+    "multi_scale_anchor_position_reward",
+    "multi_scale_anchor_quaternion_reward",
+    "multi_scale_key_position_reward",
+    "multi_scale_key_quaternion_reward",
+    "multi_scale_key_linear_velocity_reward",
+    "multi_scale_key_angular_velocity_reward",
+    "multi_scale_anchor_linear_velocity_reward",
+    "multi_scale_anchor_angular_velocity_reward",
+    "multi_scale_end_effector_position_reward",
+    "multi_scale_end_effector_quaternion_reward",
+    "self_collision_penalty",
+    "action_rate_penalty",
+    "joint_limit_penalty",
+    "joint_acc_penalty",
+    "joint_torque_penalty",
+    "com_position_reward",
+    "com_velocity_reward",
+    "com_support_reward",
+)
+
 
 def _configclass(cls=None, **kwargs):
     def wrap(c):
@@ -61,6 +82,7 @@ def _install_env_cfg_stubs(monkeypatch):
         soft_threshold: float = 1.0
         recovery_enter_threshold: float = 1.8
         hard_tracking_threshold: float | None = 4.0
+        record_soft_violations: bool = False
 
     @dataclass
     class RobustTrackingCfg:
@@ -78,13 +100,9 @@ def _install_env_cfg_stubs(monkeypatch):
     @dataclass(frozen=True)
     class RewardSpec:
         terms: tuple[RewardTermCfg, ...] = field(
-            default_factory=lambda: (
-                RewardTermCfg(id="multi_scale_tracking", type="multi_scale_tracking", weight=1.0),
-                RewardTermCfg(
-                    id="tracking_recovery_penalty",
-                    type="tracking_recovery_penalty",
-                    weight=-0.25,
-                ),
+            default_factory=lambda: tuple(
+                RewardTermCfg(id=term_id, type=term_id, weight=1.0)
+                for term_id in REF2ACT_ROBUST_REWARD_TERM_IDS
             )
         )
 
@@ -139,8 +157,8 @@ def _install_env_cfg_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.observation_history", observation_mod)
 
 
-def _reward_term_weight(env_cfg, term_id: str) -> float:
-    return next(term.weight for term in env_cfg.rewards.terms if term.id == term_id)
+def _reward_term_ids(env_cfg) -> tuple[str, ...]:
+    return tuple(term.id for term in env_cfg.rewards.terms)
 
 
 def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
@@ -157,27 +175,39 @@ def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
         assert training_cfg.sampling_strategy == env_cfg.SamplingStrategy.FailureWeighted
         assert training_cfg.segment_source == env_cfg.SegmentSource.Anchor
         assert training_cfg.init_failure_bins is True
-        assert training_cfg.failure_decay == 0.999
-        assert training_cfg.failure_weight_uniform_mix == 0.05
-        assert training_cfg.failure_weight_max_uniform_ratio == 8.0
+        assert training_cfg.failure_decay == 0.99
+        assert training_cfg.failure_weight_uniform_mix == 0.35
+        assert training_cfg.failure_weight_max_uniform_ratio == 10.0
         assert training_cfg.failure_weight_exploration_bonus == 0.10
-        assert training_cfg.failure_temperature == 0.75
-        assert training_cfg.scene.num_envs == 8192
+        assert training_cfg.failure_temperature == 1.5
+        assert training_cfg.scene.num_envs == env_cfg.TRAINING_NUM_ENVS
         assert eval_cfg.scene.num_envs == 4096
         assert training_cfg.recovery.enabled is False
         assert eval_cfg.recovery.enabled is False
         assert training_cfg.robust_tracking.enabled is True
         assert eval_cfg.robust_tracking.enabled is True
-        assert training_cfg.robust_tracking.quality_gate.enabled is False
-        assert eval_cfg.robust_tracking.quality_gate.enabled is False
-        assert training_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 4.0
-        assert eval_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 4.0
+        assert training_cfg.robust_tracking.quality_gate.enabled is True
+        assert eval_cfg.robust_tracking.quality_gate.enabled is True
+        assert training_cfg.robust_tracking.quality_gate.soft_threshold == env_cfg.TRACKING_QUALITY_SOFT_THRESHOLD
+        assert eval_cfg.robust_tracking.quality_gate.soft_threshold == env_cfg.TRACKING_QUALITY_SOFT_THRESHOLD
+        assert training_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 1.8
+        assert eval_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 1.8
+        assert training_cfg.robust_tracking.quality_gate.record_soft_violations is True
+        assert eval_cfg.robust_tracking.quality_gate.record_soft_violations is True
+        disabled_robust_tracking = env_cfg.set_robust_tracking_quality_gate_enabled(
+            training_cfg.robust_tracking,
+            False,
+        )
+        assert disabled_robust_tracking.quality_gate.enabled is False
+        assert disabled_robust_tracking.enabled is True
+        assert training_cfg.robust_tracking.quality_gate.enabled is True
         assert training_cfg.robust_tracking.fall_recovery.enabled is False
         assert eval_cfg.robust_tracking.fall_recovery.enabled is False
         assert training_cfg.robust_tracking.fall_guard.enabled is False
         assert eval_cfg.robust_tracking.fall_guard.enabled is False
-        assert _reward_term_weight(training_cfg, "tracking_recovery_penalty") == -2.0
-        assert _reward_term_weight(eval_cfg, "tracking_recovery_penalty") == -2.0
+        assert _reward_term_ids(training_cfg) == REF2ACT_ROBUST_REWARD_TERM_IDS
+        assert _reward_term_ids(eval_cfg) == REF2ACT_ROBUST_REWARD_TERM_IDS
+        assert "tracking_recovery_penalty" not in _reward_term_ids(training_cfg)
     finally:
         sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
         sys.modules.pop("gmtp.integrations.ref2act", None)

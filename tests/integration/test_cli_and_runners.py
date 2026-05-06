@@ -164,6 +164,31 @@ class _RecoveryExtrasTrainEnv(_DummyTrainEnv):
         return obs, reward, terminate, timeout, {}
 
 
+class _LocationMetricTrainEnv(_DummyTrainEnv):
+    def _relative_anchor_pos(self) -> torch.Tensor:
+        values = torch.zeros(self.batch_size, 3, dtype=torch.float32)
+        if self.step_count == 1:
+            values[:2] = torch.tensor([[3.0, 4.0, 12.0], [0.0, 0.0, 2.0]], dtype=torch.float32)
+        elif self.step_count == 2:
+            values[:2] = torch.tensor([[1.0, 2.0, 2.0], [0.0, 0.0, 0.0]], dtype=torch.float32)
+        return values
+
+    def _build_privilege_obs(self) -> torch.Tensor:
+        privilege = torch.zeros(self.batch_size, 10, dtype=torch.float32)
+        privilege[:, 7:10] = self._relative_anchor_pos()
+        return privilege
+
+    def reset(self):
+        obs, info = super().reset()
+        obs["privilege"] = self._build_privilege_obs()
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminate, timeout, info = super().step(action)
+        obs["privilege"] = self._build_privilege_obs()
+        return obs, reward, terminate, timeout, info
+
+
 def _window_length(window_lengths, prefix: str, default: int) -> int:
     if not window_lengths:
         return default
@@ -174,6 +199,7 @@ def _fake_train_module(env_cls=_DummyTrainEnv):
     def make_training_env(
         window_lengths=None,
         motion_files=None,
+        disable_quality_gate=False,
     ):
         cfg = types.SimpleNamespace(
             scene=types.SimpleNamespace(num_envs=2),
@@ -186,6 +212,7 @@ def _fake_train_module(env_cls=_DummyTrainEnv):
             segment_source="Anchor",
             sampling_strategy="FailureWeighted",
             failure_temperature=1.0,
+            disable_quality_gate=bool(disable_quality_gate),
         )
         return (
             env_cls(
@@ -367,6 +394,7 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.actor_fusion_type == "film"
     assert args.disable_amp is False
     assert args.disable_wandb is False
+    assert args.disable_quality_gate is False
     assert args.motion_mae_encoder_checkpoint is None
     assert args.motion_files is None
     assert args.resume_checkpoint_path is None
@@ -378,6 +406,9 @@ def test_cli_parser_builds_train_and_eval_commands():
 
     args = parser.parse_args(["train", "--disable-amp"])
     assert args.disable_amp is True
+
+    args = parser.parse_args(["train", "--disable-quality-gate"])
+    assert args.disable_quality_gate is True
 
     args = parser.parse_args(["train", "--anchor-log-interval", "25", "--anchor-heatmap-bins", "64"])
     assert args.anchor_log_interval == 25
@@ -511,6 +542,17 @@ def test_train_runner_passes_motion_file_override_to_training_env(monkeypatch):
     runner.env.close()
 
 
+def test_train_runner_passes_disable_quality_gate_to_training_env(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+
+    runner = TrainRunner(RunConfig(use_wandb=False, disable_quality_gate=True))
+
+    assert runner.cfg.disable_quality_gate is True
+    config_payload = json.loads(runner.run_paths.config_path.read_text(encoding="utf-8"))
+    assert config_payload["config"]["disable_quality_gate"] is True
+    runner.env.close()
+
+
 def test_train_runner_constructs_film_res_actor(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
     runner = TrainRunner(
@@ -622,6 +664,40 @@ def test_train_runner_skips_recovery_metric_log_when_unavailable(monkeypatch):
     runner.rollout(runner.initial_obs)
 
     assert logged_payloads == []
+    runner.env.close()
+
+
+def test_train_runner_logs_rollout_location_tracking_metrics(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module(_LocationMetricTrainEnv))
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=2,
+            num_updates=1,
+        )
+    )
+    logged_payloads = []
+    runner._log_metrics = lambda payload: logged_payloads.append(dict(payload))
+
+    runner.rollout(runner.initial_obs)
+
+    relative_anchor_pos = torch.tensor(
+        [[3.0, 4.0, 12.0], [0.0, 0.0, 2.0], [1.0, 2.0, 2.0], [0.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    location_error = torch.linalg.vector_norm(relative_anchor_pos, dim=-1)
+    xy_error = torch.linalg.vector_norm(relative_anchor_pos[:, :2], dim=-1)
+    z_error = torch.abs(relative_anchor_pos[:, 2])
+    assert len(logged_payloads) == 1
+    assert logged_payloads[0] == pytest.approx(
+        {
+            "tracking/location_error_m": float(location_error.mean().item()),
+            "tracking/location_error_xy_m": float(xy_error.mean().item()),
+            "tracking/location_error_z_m": float(z_error.mean().item()),
+            "tracking/location_error_p95_m": float(torch.quantile(location_error, 0.95).item()),
+            "tracking/location_error_max_m": float(location_error.max().item()),
+        }
+    )
     runner.env.close()
 
 
@@ -796,10 +872,11 @@ def test_train_runner_logs_anchor_probability_summary_and_heatmap_every_configur
     output = capsys.readouterr().out
 
     assert "sampler snapshot after update 100" in output
-    assert "max_p=1.000000" in output
+    assert "max_anchor_p=1.000000" in output
+    assert "max_motion_p=1.000000" in output
     assert "reset anchors:" in output
     assert "reset motions:" in output
-    assert "jump_anchor A0 t=0.000s p=1.000000" in output
+    assert "jump_anchor A0 t=0.000s anchor_p=1.000000 motion_p=1.000000 anchor_share=100.0%" in output
     assert any(
         "sampler/reset_distribution/anchors/jump_anchor/A000" not in payload
         and payload.get("sampler/reset_distribution/anchors/max_probability") == 1.0

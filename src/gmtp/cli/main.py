@@ -83,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--output-root", default="runs")
     train_parser.add_argument("--run-name", default=None)
     train_parser.add_argument("--disable-wandb", action="store_true")
+    train_parser.add_argument(
+        "--disable-quality-gate",
+        action="store_true",
+        help="Disable the Ref2Act terminal tracking quality gate during training.",
+    )
     train_parser.add_argument("--anchor-log-interval", type=int, default=100)
     train_parser.add_argument("--anchor-heatmap-bins", type=int, default=128)
     _add_disable_amp_argument(train_parser)
@@ -193,6 +198,7 @@ def _run_train(args) -> int:
                 motion_files=args.motion_files,
                 resume_checkpoint_path=args.resume_checkpoint_path,
                 use_amp=not args.disable_amp,
+                disable_quality_gate=args.disable_quality_gate,
                 rollout_steps=args.rollout_steps,
                 num_updates=args.num_updates,
                 checkpoint_interval=args.checkpoint_interval,
