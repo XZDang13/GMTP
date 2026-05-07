@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -108,9 +109,54 @@ def load_actor_from_checkpoint(
         motion_mae_encoder_checkpoint=motion_mae_encoder_checkpoint,
         device=device,
     ).to(device)
-    actor.load_state_dict(checkpoint.model["actor"])
+    load_actor_checkpoint_state(actor, checkpoint.model["actor"])
     actor.eval()
     return actor, actor_type, actor_kwargs
+
+
+def load_actor_checkpoint_state(
+    actor: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> Any:
+    remapped_state_dict = _remap_legacy_actor_encoder_keys(state_dict)
+    incompatible = actor.load_state_dict(remapped_state_dict, strict=False)
+    allowed_missing_prefixes = (
+        "motion_encoder.window_encoder.pooling.",
+        "motion_encoder.window_encoder.output_proj.",
+    )
+    allowed_unexpected_prefixes = (
+        "motion_encoder.window_encoder.latent_pool.",
+        "motion_encoder.window_encoder.output_proj.0.",
+        "motion_encoder.window_encoder.output_proj.1.",
+    )
+    disallowed_missing = [
+        key for key in incompatible.missing_keys if not key.startswith(allowed_missing_prefixes)
+    ]
+    disallowed_unexpected = [
+        key for key in incompatible.unexpected_keys if not key.startswith(allowed_unexpected_prefixes)
+    ]
+    if disallowed_missing or disallowed_unexpected:
+        actor.load_state_dict(remapped_state_dict)
+    return incompatible
+
+
+def _remap_legacy_actor_encoder_keys(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    remapped: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for prefix in ("robot_encoder.window_encoder.", "motion_encoder.window_encoder."):
+            if not key.startswith(prefix):
+                continue
+            suffix = key[len(prefix) :]
+            if suffix.startswith("attention_pool."):
+                new_key = f"{prefix}pooling.{suffix.removeprefix('attention_pool.')}"
+            elif suffix == "position_embedding" or suffix.startswith(("input_proj.", "transformer.")):
+                new_key = f"{prefix}_encoder.{suffix}"
+            break
+        remapped[new_key] = value
+    return remapped
 
 
 def resolve_checkpoint_stem(path: str | Path) -> str:

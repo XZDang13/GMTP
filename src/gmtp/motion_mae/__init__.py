@@ -30,7 +30,7 @@ from .features import (
 )
 from .losses import compute_motion_mae_losses
 from .model import ReferenceMotionMAE
-from .policy import FrozenMotionMAEEncoder, build_frozen_motion_mae_encoder, export_motion_mae_latents
+from .policy import FrozenMotionMAEEncoder, build_frozen_motion_mae_encoder
 from .schema import CanonicalMotionSequence, FeatureSliceSpec, MotionFeatureSchema, MotionSegment
 
 __all__ = [
@@ -62,7 +62,6 @@ __all__ = [
     "build_motion_mae_encoder_checkpoint",
     "build_valid_window_centers",
     "compute_motion_mae_losses",
-    "export_motion_mae_latents",
     "load_motion_mae_checkpoint",
     "load_motion_mae_encoder_checkpoint",
     "load_motion_mae_pretrain_config",

@@ -23,11 +23,11 @@ def test_reference_motion_mae_shapes_and_deterministic_encode():
 
     assert outputs["prediction"].shape == (2, 3, 9)
     assert outputs["encoded_visible"].shape == (2, 4, 16)
-    assert outputs["latent"].shape == (2, 5)
-    torch.testing.assert_close(encoded, outputs["latent"])
+    assert "latent" not in outputs
+    torch.testing.assert_close(encoded, outputs["encoded_visible"])
 
 
-def test_reference_motion_mae_latent_uses_last_encoded_token():
+def test_reference_motion_mae_has_no_pooling_or_latent_modules():
     model = ReferenceMotionMAE(
         input_dim=4,
         target_dim=4,
@@ -40,22 +40,17 @@ def test_reference_motion_mae_latent_uses_last_encoded_token():
         nhead=2,
         dim_feedforward=8,
     )
-    model.latent_norm = torch.nn.Identity()
-    model.latent_proj = torch.nn.Identity()
-    encoded_visible = torch.tensor(
-        [
-            [
-                [1.0, 2.0, 3.0, 4.0],
-                [10.0, 20.0, 30.0, 40.0],
-                [100.0, 200.0, 300.0, 400.0],
-            ]
-        ]
+
+    state_keys = tuple(model.state_dict())
+
+    assert not hasattr(model, "latent_pool")
+    assert not hasattr(model, "latent_norm")
+    assert not hasattr(model, "latent_proj")
+    assert not hasattr(model, "decoder_condition_proj")
+    assert not any(
+        key.startswith(("latent_pool.", "latent_norm.", "latent_proj.", "decoder_condition_proj."))
+        for key in state_keys
     )
-
-    latent = model._pool_latent(encoded_visible)
-
-    torch.testing.assert_close(latent, encoded_visible[:, -1])
-    assert not torch.allclose(latent, encoded_visible.mean(dim=1))
 
 
 def test_compute_motion_mae_losses_uses_structured_slices():
@@ -83,7 +78,7 @@ def test_compute_motion_mae_losses_uses_structured_slices():
     assert torch.isclose(losses["loss"], torch.tensor(3.0))
 
 
-def test_reference_motion_mae_reconstruction_trains_latent_head():
+def test_reference_motion_mae_reconstruction_trains_token_encoder_and_decoder():
     model = ReferenceMotionMAE(
         input_dim=7,
         target_dim=9,
@@ -102,6 +97,7 @@ def test_reference_motion_mae_reconstruction_trains_latent_head():
     loss = outputs["prediction"].square().mean()
     loss.backward()
 
-    assert model.latent_norm.weight.grad is not None
-    assert model.latent_proj.weight.grad is not None
-    assert model.decoder_condition_proj.weight.grad is not None
+    assert model.input_proj.weight.grad is not None
+    assert model.encoder.layers[0].self_attn.in_proj_weight.grad is not None
+    assert model.decoder.layers[0].self_attn.in_proj_weight.grad is not None
+    assert model.output_proj.weight.grad is not None

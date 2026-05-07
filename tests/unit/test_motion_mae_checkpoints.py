@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import numpy as np
+import pytest
 import torch
 
 from gmtp.motion_mae import (
@@ -14,7 +14,6 @@ from gmtp.motion_mae import (
     build_frozen_motion_mae_encoder,
     build_motion_mae_checkpoint,
     build_motion_mae_encoder_checkpoint,
-    export_motion_mae_latents,
     load_motion_mae_checkpoint,
     load_motion_mae_encoder_checkpoint,
     save_motion_mae_checkpoint,
@@ -131,10 +130,12 @@ def test_motion_mae_checkpoint_roundtrip(tmp_path):
     path = save_motion_mae_checkpoint(checkpoint, tmp_path / "motion_mae.pth")
     loaded = load_motion_mae_checkpoint(path)
 
-    assert loaded.meta["latent_dim"] == 6
+    assert loaded.meta["token_dim"] == 16
+    assert "pooling_type" not in loaded.meta["model_kwargs"]
     assert loaded.training["epoch"] == 2
     assert loaded.schema.d_ref == 13
     assert "model" in loaded.model
+    assert not any(key.startswith("latent_pool.") for key in loaded.model["model"])
 
 
 def test_motion_mae_encoder_loader_and_frozen_wrapper(tmp_path):
@@ -144,9 +145,37 @@ def test_motion_mae_encoder_loader_and_frozen_wrapper(tmp_path):
     frozen_encoder = build_frozen_motion_mae_encoder(path, device="cpu")
     reference = torch.randn(2, 4, 13)
 
-    assert loaded.meta["latent_dim"] == 6
-    assert frozen_encoder(reference).shape == (2, 6)
+    assert loaded.meta["token_dim"] == 16
+    assert "pooling_type" not in loaded.meta["model_kwargs"]
+    assert not any(key.startswith("latent_pool.") for key in loaded.model["encoder_state"])
+    assert frozen_encoder(reference).shape == (2, 4, 16)
+    assert frozen_encoder.token_dim == 16
     assert all(not parameter.requires_grad for parameter in frozen_encoder.parameters())
+
+
+def test_motion_mae_encoder_loader_ignores_stale_attention_pool_weights(tmp_path):
+    path = _write_motion_mae_encoder_checkpoint(tmp_path)
+    payload = torch.load(path, map_location="cpu")
+    payload["model"]["encoder_state"]["latent_pool.query"] = torch.randn(1, 1, 16)
+    legacy_path = tmp_path / "legacy_motion_mae_encoder.pth"
+    torch.save(payload, legacy_path)
+
+    frozen_encoder = build_frozen_motion_mae_encoder(legacy_path, device="cpu")
+
+    assert frozen_encoder(torch.randn(2, 4, 13)).shape == (2, 4, 16)
+
+
+def test_motion_mae_encoder_loader_rejects_missing_token_encoder_weights(tmp_path):
+    path = _write_motion_mae_encoder_checkpoint(tmp_path)
+    payload = torch.load(path, map_location="cpu")
+    payload["model"]["encoder_state"].pop("input_proj.weight")
+    legacy_path = tmp_path / "missing_token_encoder_motion_mae_encoder.pth"
+    torch.save(payload, legacy_path)
+
+    with pytest.raises(ValueError, match="token-encoder weights"):
+        build_frozen_motion_mae_encoder(legacy_path, device="cpu")
+
+
 def test_resolve_motion_mae_checkpoint_path_prefers_override(tmp_path):
     checkpoint_path = _write_motion_mae_encoder_checkpoint(tmp_path)
     checkpoint = CheckpointV2(
@@ -159,31 +188,3 @@ def test_resolve_motion_mae_checkpoint_path_prefers_override(tmp_path):
     resolved = resolve_motion_mae_checkpoint_path(checkpoint, override=checkpoint_path)
 
     assert resolved == checkpoint_path.resolve()
-
-
-def test_export_motion_mae_latents_is_deterministic(tmp_path):
-    checkpoint_path = _write_motion_mae_encoder_checkpoint(tmp_path)
-    frozen_encoder = build_frozen_motion_mae_encoder(checkpoint_path, device="cpu")
-    dataset = [
-        {
-            "reference": torch.zeros(4, 13),
-            "target": torch.zeros(2, 13),
-            "motion_name": "sample",
-            "motion_file": "sample.npz",
-            "center_t": 3,
-        },
-        {
-            "reference": torch.ones(4, 13),
-            "target": torch.ones(2, 13),
-            "motion_name": "sample",
-            "motion_file": "sample.npz",
-            "center_t": 4,
-        },
-    ]
-
-    payload_a = export_motion_mae_latents(dataset, frozen_encoder, batch_size=2)
-    payload_b = export_motion_mae_latents(dataset, frozen_encoder, batch_size=2)
-
-    assert payload_a["latents"].shape == (2, 6)
-    np.testing.assert_allclose(payload_a["latents"], payload_b["latents"])
-    assert payload_a["center_t"].tolist() == [3, 4]

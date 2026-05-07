@@ -21,7 +21,7 @@ def _add_motion_window_length_argument(parser: argparse.ArgumentParser, *, defau
 def _add_robot_encoder_type_argument(parser: argparse.ArgumentParser, *, default) -> None:
     parser.add_argument(
         "--robot-encoder-type",
-        choices=("cnn", "transformer"),
+        choices=("transformer",),
         default=default,
         help="Windowed robot-history encoder. robot-window-length=1 always uses the flat MLP path.",
     )
@@ -102,17 +102,6 @@ def build_parser() -> argparse.ArgumentParser:
     motion_mae_parser.add_argument("--output-root", default=None)
     motion_mae_parser.add_argument("--run-name", default=None)
     motion_mae_parser.add_argument("--device", default=None)
-
-    motion_mae_latents_parser = pretrain_subparsers.add_parser(
-        "motion-mae-latents",
-        help="Export deterministic Motion MAE latents for configured legal windows.",
-    )
-    motion_mae_latents_parser.add_argument("--checkpoint", required=True)
-    motion_mae_latents_parser.add_argument("--config", required=True)
-    motion_mae_latents_parser.add_argument("--motion-files", nargs="+", default=None)
-    motion_mae_latents_parser.add_argument("--output-root", default=None)
-    motion_mae_latents_parser.add_argument("--run-name", default=None)
-    motion_mae_latents_parser.add_argument("--device", default=None)
 
     motion_mae_visualize_parser = pretrain_subparsers.add_parser(
         "motion-mae-visualize",
@@ -289,22 +278,6 @@ def _run_pretrain_motion_mae(args) -> int:
     return 0
 
 
-def _run_pretrain_motion_mae_latents(args) -> int:
-    from gmtp.motion_mae import apply_motion_mae_cli_overrides, load_motion_mae_pretrain_config
-    from gmtp.runtime.motion_mae_export import MotionMAELatentExportRunner
-
-    config = load_motion_mae_pretrain_config(args.config)
-    config = apply_motion_mae_cli_overrides(
-        config,
-        motion_files=args.motion_files,
-        output_root=args.output_root,
-        run_name=args.run_name,
-        device=args.device,
-    )
-    MotionMAELatentExportRunner(checkpoint_path=args.checkpoint, config=config).export()
-    return 0
-
-
 def _run_pretrain_motion_mae_visualize(args) -> int:
     from gmtp.runtime.motion_mae_visualize import MotionMAEVisualizerRunner
 
@@ -334,8 +307,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run_train(args)
     if args.command == "pretrain" and args.pretrain_target == "motion-mae":
         return _run_pretrain_motion_mae(args)
-    if args.command == "pretrain" and args.pretrain_target == "motion-mae-latents":
-        return _run_pretrain_motion_mae_latents(args)
     if args.command == "pretrain" and args.pretrain_target == "motion-mae-visualize":
         return _run_pretrain_motion_mae_visualize(args)
     if args.command == "eval" and args.eval_target == "isaac":

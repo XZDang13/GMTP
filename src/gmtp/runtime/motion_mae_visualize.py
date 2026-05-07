@@ -184,6 +184,17 @@ def build_motion_mae_model_from_checkpoint(
         ) from exc
 
     model_kwargs = dict(checkpoint.meta["model_kwargs"])
+    legacy_latent_keys = (
+        "latent_pool.",
+        "latent_norm.",
+        "latent_proj.",
+        "decoder_condition_proj.",
+    )
+    if any(key.startswith(legacy_latent_keys) for key in checkpoint.model["model"]):
+        raise ValueError(
+            "Motion MAE checkpoint uses the removed pooled-latent architecture. "
+            "Retrain or regenerate the full Motion MAE checkpoint with token-decoder MAE."
+        )
     model = ReferenceMotionMAE(**model_kwargs).to(device)
     model.load_state_dict(checkpoint.model["model"])
     model.eval()

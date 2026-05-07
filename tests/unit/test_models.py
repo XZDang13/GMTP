@@ -13,8 +13,19 @@ from gmtp.models import (
 from gmtp.models.actor import ACTOR_HIDDEN_DIM
 from gmtp.models.critic import CRITIC_GROUP_HIDDEN_DIM, CRITIC_HIDDEN_DIM, build_critic_privilege_layout
 from gmtp.models.film import FiLMResStack
-from gmtp.models.motion_encoder import MOTION_ENCODER_OUTPUT_DIM, build_motion_window_layout
-from gmtp.models.robot_encoder import ROBOT_ENCODER_HIDDEN_DIM, ROBOT_ENCODER_OUTPUT_DIM, build_robot_window_layout
+from gmtp.models.motion_encoder import (
+    MOTION_ENCODER_HIDDEN_DIM,
+    MOTION_ENCODER_OUTPUT_DIM,
+    MotionWindowEncoder,
+    MotionEncoderType,
+    build_motion_window_layout,
+)
+from gmtp.models.robot_encoder import (
+    ROBOT_ENCODER_HIDDEN_DIM,
+    ROBOT_ENCODER_OUTPUT_DIM,
+    RobotWindowEncoder,
+    build_robot_window_layout,
+)
 from gmtp.motion_mae import (
     FeatureSliceSpec,
     MotionFeatureSchema,
@@ -26,6 +37,7 @@ from gmtp.motion_mae import (
     build_motion_mae_encoder_checkpoint,
     save_motion_mae_encoder_checkpoint,
 )
+from gmtp.models.pooling import LearnedQueryAttentionPool
 from gmtp.runtime.checkpoints import CheckpointV2, build_training_checkpoint
 from gmtp.runtime.policy import (
     load_actor_from_checkpoint,
@@ -173,6 +185,16 @@ def _write_motion_mae_encoder_checkpoint(
     return str(save_motion_mae_encoder_checkpoint(checkpoint, tmp_path / "motion_mae_encoder.pth"))
 
 
+class _RecordingPool(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tokens: torch.Tensor | None = None
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        self.tokens = tokens.detach().clone()
+        return torch.zeros(tokens.shape[0], tokens.shape[-1], dtype=tokens.dtype, device=tokens.device)
+
+
 def test_film_res_actor_forward_returns_step():
     motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=3)
     actor = FiLMResActor(
@@ -226,7 +248,7 @@ def test_build_actor_constructs_film_res_with_requested_depth():
         actor_kwargs={
             "num_blocks": 4,
             "robot_window_length": 4,
-            "robot_encoder_type": "cnn",
+            "robot_encoder_type": "transformer",
             "motion_window_length": 4,
             "motion_encoder_type": "transformer",
             "actor_fusion_type": "concat_mlp",
@@ -240,7 +262,7 @@ def test_build_actor_constructs_film_res_with_requested_depth():
     assert get_actor_kwargs(actor, "film_res") == {
         "num_blocks": 4,
         "robot_window_length": 4,
-        "robot_encoder_type": "cnn",
+        "robot_encoder_type": "transformer",
         "motion_window_length": 4,
         "motion_encoder_type": "transformer",
         "actor_fusion_type": "concat_mlp",
@@ -325,27 +347,17 @@ def test_film_res_actor_reshapes_windowed_robot_obs_from_ref2act_layout():
     )
 
 
-def test_film_res_actor_windowed_robot_encoder_supports_cnn_mode():
+def test_film_res_actor_windowed_robot_encoder_rejects_cnn_mode():
     motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, robot_window_length=4)
-    actor = FiLMResActor(
-        robot_obs_dim=robot_obs_dim,
-        motion_obs_dim=motion_obs_dim,
-        action_dim=2,
-        robot_window_length=4,
-        robot_encoder_type="cnn",
-    )
 
-    conv_layers = [module for module in actor.robot_encoder.window_encoder.temporal_conv if isinstance(module, nn.Conv1d)]
-
-    assert len(conv_layers) == 2
-    assert conv_layers[0].in_channels == actor.robot_step_dim
-    assert conv_layers[0].out_channels == ROBOT_ENCODER_HIDDEN_DIM
-    assert conv_layers[1].in_channels == ROBOT_ENCODER_HIDDEN_DIM
-    assert conv_layers[1].out_channels == ROBOT_ENCODER_HIDDEN_DIM
-    assert actor.robot_encoder.robot_encoder_type == "cnn"
-    assert actor.robot_encoder.window_encoder.output_proj.out_features == ROBOT_ENCODER_OUTPUT_DIM
-    assert not hasattr(actor.robot_encoder.window_encoder, "transformer")
-    assert actor.robot_obs_normlizer.mean.shape == (4, 12)
+    with pytest.raises(ValueError, match="transformer"):
+        FiLMResActor(
+            robot_obs_dim=robot_obs_dim,
+            motion_obs_dim=motion_obs_dim,
+            action_dim=2,
+            robot_window_length=4,
+            robot_encoder_type="cnn",
+        )
 
 
 def test_film_res_actor_windowed_robot_encoder_supports_transformer_mode():
@@ -359,8 +371,9 @@ def test_film_res_actor_windowed_robot_encoder_supports_transformer_mode():
     )
 
     assert actor.robot_encoder.robot_encoder_type == "transformer"
-    assert isinstance(actor.robot_encoder.window_encoder.transformer, nn.TransformerEncoder)
-    assert isinstance(actor.robot_encoder.window_encoder.input_proj, nn.Linear)
+    assert isinstance(actor.robot_encoder.window_encoder.encoder.transformer, nn.TransformerEncoder)
+    assert isinstance(actor.robot_encoder.window_encoder.encoder.input_proj, nn.Linear)
+    assert isinstance(actor.robot_encoder.window_encoder.pooling, LearnedQueryAttentionPool)
     assert actor.robot_encoder.window_encoder.output_proj.out_features == ROBOT_ENCODER_OUTPUT_DIM
     assert not hasattr(actor.robot_encoder.window_encoder, "temporal_conv")
 
@@ -376,10 +389,40 @@ def test_film_res_actor_windowed_motion_encoder_supports_transformer_mode():
     )
 
     assert actor.motion_encoder.motion_encoder_type == "transformer"
-    assert isinstance(actor.motion_encoder.window_encoder.transformer, nn.TransformerEncoder)
-    assert isinstance(actor.motion_encoder.window_encoder.input_proj, nn.Linear)
+    assert isinstance(actor.motion_encoder.window_encoder.encoder.transformer, nn.TransformerEncoder)
+    assert isinstance(actor.motion_encoder.window_encoder.encoder.input_proj, nn.Linear)
+    assert isinstance(actor.motion_encoder.window_encoder.pooling, LearnedQueryAttentionPool)
     assert actor.motion_encoder.window_encoder.output_proj.out_features == MOTION_ENCODER_OUTPUT_DIM
     assert actor.motion_obs_normlizer.mean.shape == (4, actor.motion_step_dim)
+
+
+def test_robot_window_encoder_pools_all_time_tokens():
+    encoder = RobotWindowEncoder(robot_step_dim=5, robot_window_length=4)
+    pool = _RecordingPool()
+    encoder.pooling = pool
+
+    output = encoder(torch.randn(2, 4, 5))
+
+    assert output.shape == (2, ROBOT_ENCODER_OUTPUT_DIM)
+    assert pool.tokens is not None
+    assert pool.tokens.shape == (2, 4, ROBOT_ENCODER_HIDDEN_DIM)
+
+
+def test_motion_transformer_window_encoder_pools_all_time_tokens():
+    encoder = MotionWindowEncoder(
+        motion_step_dim=5,
+        motion_window_length=4,
+        motion_encoder_type=MotionEncoderType.TRANSFORMER,
+        device="cpu",
+    )
+    pool = _RecordingPool()
+    encoder.pooling = pool
+
+    output = encoder(torch.randn(2, 4, 5))
+
+    assert output.shape == (2, MOTION_ENCODER_OUTPUT_DIM)
+    assert pool.tokens is not None
+    assert pool.tokens.shape == (2, 4, MOTION_ENCODER_HIDDEN_DIM)
 
 
 def test_film_res_actor_single_frame_motion_forces_mlp_mode():
@@ -395,28 +438,6 @@ def test_film_res_actor_single_frame_motion_forces_mlp_mode():
     assert actor.motion_encoder.motion_encoder_type == "mlp"
     assert actor.motion_encoder.single_frame_encoder[-1].linear.out_features == MOTION_ENCODER_OUTPUT_DIM
     assert actor.motion_obs_normlizer.mean.shape == (motion_obs_dim,)
-
-
-def test_film_res_actor_forward_supports_windowed_robot_obs_with_cnn_encoder():
-    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, robot_window_length=4)
-    actor = FiLMResActor(
-        robot_obs_dim=robot_obs_dim,
-        motion_obs_dim=motion_obs_dim,
-        action_dim=2,
-        num_blocks=3,
-        robot_window_length=4,
-        robot_encoder_type="cnn",
-    )
-
-    step = actor(
-        {
-            "robot_obs": torch.randn(3, 4, 12),
-            "motion_obs": torch.randn(3, motion_obs_dim),
-        }
-    )
-
-    assert step.action.shape == (3, 2)
-    assert step.log_prob.shape == (3,)
 
 
 def test_film_res_actor_forward_supports_windowed_robot_obs_with_transformer_encoder():
@@ -486,7 +507,12 @@ def test_film_res_actor_forward_supports_windowed_motion_obs_with_mae_encoder(tm
     assert step.action.shape == (3, 2)
     assert step.log_prob.shape == (3,)
     assert actor.motion_encoder.motion_encoder_type == "mae"
-    assert not any("frozen_encoder" in key for key in actor.state_dict())
+    assert not any("motion_encoder.window_encoder._encoder" in key for key in actor.state_dict())
+    assert isinstance(actor.motion_encoder.window_encoder.pooling, LearnedQueryAttentionPool)
+    assert any("motion_encoder.window_encoder.pooling." in key for key in actor.state_dict())
+    assert all(
+        not parameter.requires_grad for parameter in actor.motion_encoder.window_encoder.encoder.parameters()
+    )
 
 
 def test_motion_mae_encoder_rejects_mismatched_past_frames(tmp_path):
@@ -619,6 +645,19 @@ def test_critic_privilege_layout_uses_ref2act_term_order_and_contiguous_slices()
     assert layout.group("robot").obs_dim == 15
 
 
+def test_critic_privilege_layout_includes_key_body_geometry_dims():
+    layout = build_critic_privilege_layout(2, key_body_count=4)
+
+    assert layout.obs_dim == 67
+    assert layout.group("target").obs_dim == 7
+    assert layout.group("geometry").obs_dim == 45
+    assert layout.group("robot").obs_dim == 15
+
+    terms_by_id = {term.term_id: term for term in layout.terms}
+    assert terms_by_id["relative_key_pos"].flat_dim == 12
+    assert terms_by_id["relative_key_tangent_and_normal"].flat_dim == 24
+
+
 def test_structured_critic_encodes_privilege_groups_before_fusion():
     layout = build_critic_privilege_layout(2)
     critic = Critic(obs_dim=layout.obs_dim, action_dim=2)
@@ -637,6 +676,39 @@ def test_structured_critic_encodes_privilege_groups_before_fusion():
     assert critic.fusion_encoder[0].linear.out_features == CRITIC_HIDDEN_DIM
     assert critic.head.critic_layer.in_features == CRITIC_HIDDEN_DIM
     assert step.value.shape == (4,)
+
+
+def test_structured_critic_accepts_group_mapping_and_single_observation():
+    layout = build_critic_privilege_layout(2, key_body_count=4)
+    critic = Critic(obs_dim=layout.obs_dim, action_dim=2, key_body_count=4)
+    flat_obs = torch.randn(4, layout.obs_dim)
+    structured_obs = critic.split_observation(flat_obs)
+
+    batch_step = critic(structured_obs, update_normlizer=True)
+    single_step = critic({name: value[0] for name, value in structured_obs.items()})
+
+    assert critic.observation_storage_specs() == {
+        "critic_target_observations": (7,),
+        "critic_geometry_observations": (45,),
+        "critic_robot_observations": (15,),
+    }
+    assert batch_step.value.shape == (4,)
+    assert single_step.value.numel() == 1
+    torch.testing.assert_close(critic.flatten_observation(structured_obs), flat_obs)
+
+
+def test_structured_critic_rejects_missing_or_missized_group_observations():
+    layout = build_critic_privilege_layout(2, key_body_count=4)
+    critic = Critic(obs_dim=layout.obs_dim, action_dim=2, key_body_count=4)
+    structured_obs = critic.split_observation(torch.randn(4, layout.obs_dim))
+
+    with pytest.raises(KeyError, match="robot"):
+        critic({name: value for name, value in structured_obs.items() if name != "robot"})
+
+    bad_geometry_obs = dict(structured_obs)
+    bad_geometry_obs["geometry"] = bad_geometry_obs["geometry"][..., :-1]
+    with pytest.raises(ValueError, match="geometry"):
+        critic(bad_geometry_obs)
 
 
 def test_film_res_stack_accumulates_residuals_layer_by_layer():
@@ -860,6 +932,50 @@ def test_load_actor_from_checkpoint_restores_film_res_weights():
     )
 
 
+def test_load_actor_from_checkpoint_accepts_missing_policy_mae_pooling(tmp_path):
+    checkpoint_path = _write_motion_mae_encoder_checkpoint(tmp_path, action_dim=2, past_frames=4)
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, motion_window_length=4)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        num_blocks=2,
+        motion_window_length=4,
+        motion_encoder_type="mae",
+        motion_mae_encoder_checkpoint=checkpoint_path,
+    )
+    legacy_actor_state = {
+        key: value
+        for key, value in actor.state_dict().items()
+        if not key.startswith("motion_encoder.window_encoder.pooling.")
+    }
+    checkpoint = CheckpointV2(
+        meta={
+            "actor_type": "film_res",
+            "actor_kwargs": {
+                "num_blocks": 2,
+                "robot_window_length": 1,
+                "motion_window_length": 4,
+                "motion_encoder_type": "mae",
+            },
+        },
+        model={"actor": legacy_actor_state, "critic": Critic(obs_dim=3).state_dict()},
+        env={},
+        artifacts={"motion_mae_encoder_checkpoint": checkpoint_path},
+    )
+
+    loaded_actor, _, _ = load_actor_from_checkpoint(
+        checkpoint,
+        obs_dims={"robot": robot_obs_dim, "motion": motion_obs_dim, "policy": motion_obs_dim + robot_obs_dim},
+        action_dim=2,
+        device=torch.device("cpu"),
+        motion_mae_encoder_checkpoint=checkpoint_path,
+    )
+
+    assert isinstance(loaded_actor.motion_encoder.window_encoder.pooling, LearnedQueryAttentionPool)
+    assert any("motion_encoder.window_encoder.pooling." in key for key in loaded_actor.state_dict())
+
+
 def test_checkpoint_spec_rejects_legacy_film_attn_res_actor_type():
     motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=3)
     actor = FiLMResActor(robot_obs_dim=robot_obs_dim, motion_obs_dim=motion_obs_dim, action_dim=3, num_blocks=2)
@@ -875,6 +991,30 @@ def test_checkpoint_spec_rejects_legacy_film_attn_res_actor_type():
     )
 
     with pytest.raises(ValueError, match="film_res"):
+        resolve_checkpoint_actor_spec(checkpoint)
+
+
+def test_checkpoint_spec_rejects_removed_robot_cnn_encoder_type():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=3, robot_window_length=4)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=3,
+        num_blocks=2,
+        robot_window_length=4,
+        robot_encoder_type="transformer",
+    )
+    checkpoint = CheckpointV2(
+        meta={
+            "actor_type": "film_res",
+            "actor_kwargs": {"num_blocks": 2, "robot_window_length": 4, "robot_encoder_type": "cnn"},
+        },
+        model={"actor": actor.state_dict(), "critic": Critic(obs_dim=3).state_dict()},
+        env={},
+        artifacts={},
+    )
+
+    with pytest.raises(ValueError, match="robot encoder type 'cnn'"):
         resolve_checkpoint_actor_spec(checkpoint)
 
 

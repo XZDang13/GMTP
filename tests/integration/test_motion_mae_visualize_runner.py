@@ -20,9 +20,12 @@ from gmtp.motion_mae import (
 from gmtp.runtime.config import MotionMAEVisualizationConfig
 from gmtp.runtime.motion_mae_visualize import MotionMAEVisualizerRunner
 
+TEST_MOTION_FILE = "env/assests/85_09_stageii.npz"
+TEST_MOTION_NAME = "85_09_stageii"
+
 
 def _load_motion_names() -> tuple[tuple[str, ...], tuple[str, ...]]:
-    with np.load("env/assests/115_02_stageii.npz", allow_pickle=True) as payload:
+    with np.load(TEST_MOTION_FILE, allow_pickle=True) as payload:
         joint_names = tuple(str(item) for item in payload["joint_names"].tolist())
         body_names = tuple(str(item) for item in payload["body_names"].tolist())
     return joint_names, body_names
@@ -71,7 +74,7 @@ def _schema() -> MotionFeatureSchema:
 def _pretrain_config() -> MotionMAEPretrainConfig:
     return MotionMAEPretrainConfig(
         data=MotionMAEDataConfig(
-            motion_files=("env/assests/115_02_stageii.npz",),
+            motion_files=(TEST_MOTION_FILE,),
             past_frames=4,
             future_frames=2,
             split_mode="by_window",
@@ -190,7 +193,7 @@ def test_motion_mae_visualizer_runner_writes_summary_npz_and_video(tmp_path, mon
     assert video_path.stat().st_size > 0
     assert summary["media_type"] == "video"
     assert summary["split"] == "val"
-    assert summary["motion_name"] == "115_02_stageii"
+    assert summary["motion_name"] == TEST_MOTION_NAME
     assert "gravity_mae" in summary["metrics"]
     assert "joint_pos_mae" in summary["metrics"]
     assert "root_mae" in summary["metrics"]
@@ -198,7 +201,10 @@ def test_motion_mae_visualizer_runner_writes_summary_npz_and_video(tmp_path, mon
     assert summary["pred_view_uses_ground_truth_root_orientation"] is True
     assert summary["pred_view_uses_ground_truth_root_velocity"] is True
     assert summary["target_joint_alignment_verified"] is True
-    assert summary["render_comparison_mode"] == "ground_truth_root_position_and_orientation_plus_predicted_joint_trajectory"
+    assert (
+        summary["render_comparison_mode"]
+        == "ground_truth_root_position_and_orientation_plus_predicted_joint_trajectory"
+    )
     assert summary["future_step_ahead"] == [1, 2]
 
     payload = np.load(comparison_path)
@@ -263,7 +269,7 @@ def test_motion_mae_visualizer_runner_can_render_whole_motion(tmp_path, monkeypa
             checkpoint_path=str(checkpoint_path),
             config_path=str(config_path),
             split="val",
-            motion_name="115_02_stageii",
+            motion_name=TEST_MOTION_NAME,
             whole_motion=True,
             output_root=str(tmp_path / "runs-whole-motion"),
             device="cpu",

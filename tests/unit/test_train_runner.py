@@ -42,6 +42,14 @@ def test_extract_relative_anchor_pos_sample_skips_unavailable_or_nonfinite_privi
     assert TrainRunner._extract_relative_anchor_pos_sample(nonfinite_privilege, action_dim=2) is None
 
 
+def test_infer_critic_key_body_count_from_privilege_observation_dim():
+    assert TrainRunner._infer_critic_key_body_count(
+        critic_obs_dim=67,
+        action_dim=2,
+        observation_window_lengths={},
+    ) == 4
+
+
 def test_build_location_tracking_metrics_reports_full_xy_z_p95_and_max_errors():
     relative_anchor_pos_samples = [
         torch.tensor([[3.0, 4.0, 12.0], [0.0, 0.0, 2.0]], dtype=torch.float32),

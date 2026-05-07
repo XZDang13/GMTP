@@ -26,8 +26,12 @@ from gmtp.models import (
     ActorType,
     Critic,
     build_actor,
+    build_critic_privilege_layout,
     get_actor_kwargs,
     get_actor_observation,
+    get_critic_batch,
+    get_critic_observation,
+    get_critic_records,
     get_policy_batch,
     get_policy_records,
     get_policy_storage_specs,
@@ -37,7 +41,11 @@ from gmtp.runtime.amp import AMP_DTYPE_NAME, autocast_context, build_grad_scaler
 from gmtp.runtime.config import RunConfig
 from gmtp.runtime.io import build_run_paths, write_json
 from gmtp.runtime.observations import infer_env_observation_dims, structure_env_observation
-from gmtp.runtime.policy import resolve_checkpoint_actor_spec, resolve_motion_mae_checkpoint_path
+from gmtp.runtime.policy import (
+    load_actor_checkpoint_state,
+    resolve_checkpoint_actor_spec,
+    resolve_motion_mae_checkpoint_path,
+)
 
 RECOVERY_METRIC_LOG_NAMES = {
     "fall_recovery/active_rate": "recovery/active_rate",
@@ -227,8 +235,19 @@ class TrainRunner:
             observation_window_lengths=self.observation_window_lengths,
         )
         startup_timer.log("building policy and value models")
+        startup_timer.log("inferring observation dimensions")
         self.raw_obs_dims = infer_env_observation_dims(self.initial_obs)
         self.obs_dims = self.raw_obs_dims
+        startup_timer.log(
+            "building actor model: "
+            f"type={self.actor_type.value} "
+            f"robot_encoder={self.actor_config_kwargs['robot_encoder_type']} "
+            f"robot_window={self.actor_config_kwargs['robot_window_length']} "
+            f"motion_encoder={self.actor_config_kwargs['motion_encoder_type']} "
+            f"motion_window={self.actor_config_kwargs['motion_window_length']}"
+        )
+        if self.motion_mae_encoder_checkpoint is not None:
+            startup_timer.log(f"loading Motion MAE encoder checkpoint {self.motion_mae_encoder_checkpoint}")
         self.actor = build_actor(
             self.obs_dims,
             self.actor_type,
@@ -238,7 +257,22 @@ class TrainRunner:
             device=self.device,
         ).to(self.device)
         self.actor_kwargs = get_actor_kwargs(self.actor, self.actor_type)
-        self.critic = Critic(self.obs_dims["critic"], action_dim=self.cfg.action_space).to(self.device)
+        startup_timer.log("actor model ready")
+        startup_timer.log("resolving critic observation layout")
+        self.critic_key_body_count = self._resolve_critic_key_body_count(
+            self.cfg,
+            self.env,
+            critic_obs_dim=self.obs_dims["critic"],
+            action_dim=self.cfg.action_space,
+            observation_window_lengths=self.observation_window_lengths,
+        )
+        startup_timer.log(
+            "building critic model: "
+            f"obs_dim={self.obs_dims['critic']} "
+            f"key_body_count={self.critic_key_body_count}"
+        )
+        self.critic = self._build_critic_model().to(self.device)
+        startup_timer.log(f"critic model ready: type={self.critic.critic_type}")
         startup_timer.log("creating optimizers and rollout storage")
 
         self.actor_optimizer, actor_optimizer_stats = self._build_optimizer_collection(
@@ -262,9 +296,11 @@ class TrainRunner:
             actor_kwargs=self.actor_kwargs,
         )
         self.policy_batch_keys = list(self.policy_storage_specs)
+        self.critic_storage_specs = self.critic.observation_storage_specs()
+        self.critic_batch_keys = list(self.critic_storage_specs)
         self.batch_keys = [
             *self.policy_batch_keys,
-            "critic_observations",
+            *self.critic_batch_keys,
             "actions",
             "log_probs",
             "rewards",
@@ -274,7 +310,8 @@ class TrainRunner:
         ]
         for key, shape in self.policy_storage_specs.items():
             self.rollout_buffer.create_storage_space(key, shape, torch.float32)
-        self.rollout_buffer.create_storage_space("critic_observations", (self.obs_dims["critic"],), torch.float32)
+        for key, shape in self.critic_storage_specs.items():
+            self.rollout_buffer.create_storage_space(key, shape, torch.float32)
         self.rollout_buffer.create_storage_space("actions", (self.cfg.action_space,), torch.float32)
         self.rollout_buffer.create_storage_space("log_probs", (), torch.float32)
         self.rollout_buffer.create_storage_space("rewards", (), torch.float32)
@@ -311,6 +348,87 @@ class TrainRunner:
             "critic optimizer split:",
             f"Muon={critic_optimizer_stats['muon_tensors']} tensors / {critic_optimizer_stats['muon_numel']} params,",
             f"AdamW={critic_optimizer_stats['adamw_tensors']} tensors / {critic_optimizer_stats['adamw_numel']} params",
+        )
+
+    @staticmethod
+    def _sized_optional_sequence_length(value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return 1
+        try:
+            return len(tuple(value))
+        except TypeError:
+            return None
+
+    @staticmethod
+    def _infer_critic_key_body_count(
+        *,
+        critic_obs_dim: int,
+        action_dim: int,
+        observation_window_lengths: Mapping[str, int],
+        max_key_body_count: int = 128,
+    ) -> int | None:
+        for key_body_count in range(max_key_body_count + 1):
+            layout = build_critic_privilege_layout(
+                action_dim,
+                key_body_count=key_body_count,
+                observation_window_lengths=observation_window_lengths,
+            )
+            if layout.obs_dim == int(critic_obs_dim):
+                return key_body_count
+        return None
+
+    @classmethod
+    def _resolve_critic_key_body_count(
+        cls,
+        cfg: Any,
+        env: Any,
+        *,
+        critic_obs_dim: int,
+        action_dim: int,
+        observation_window_lengths: Mapping[str, int],
+    ) -> int:
+        cfg_count = cls._sized_optional_sequence_length(getattr(cfg, "key_body_names", None))
+        if cfg_count is not None:
+            return cfg_count
+
+        env_unwrapped = getattr(env, "unwrapped", env)
+        env_count = cls._sized_optional_sequence_length(getattr(env_unwrapped, "key_body_indices", None))
+        if env_count is not None:
+            return env_count
+
+        inferred_count = cls._infer_critic_key_body_count(
+            critic_obs_dim=critic_obs_dim,
+            action_dim=action_dim,
+            observation_window_lengths=observation_window_lengths,
+        )
+        return 0 if inferred_count is None else inferred_count
+
+    @staticmethod
+    def _checkpoint_critic_meta(checkpoint: CheckpointV2) -> Mapping[str, Any] | None:
+        critic_meta = checkpoint.meta.get("critic")
+        return critic_meta if isinstance(critic_meta, Mapping) else None
+
+    def _build_critic_model(self) -> Critic:
+        action_dim: int | None = self.cfg.action_space
+        key_body_count = self.critic_key_body_count
+
+        if self.resume_checkpoint is not None and self.resume_checkpoint.training:
+            critic_meta = self._checkpoint_critic_meta(self.resume_checkpoint)
+            critic_type = "flat" if critic_meta is None else str(critic_meta.get("critic_type", "flat"))
+            if critic_type == "flat":
+                action_dim = None
+                key_body_count = int(critic_meta.get("key_body_count", 0)) if critic_meta is not None else 0
+            else:
+                key_body_count = int(critic_meta.get("key_body_count", key_body_count))
+
+        self.critic_key_body_count = key_body_count
+        return Critic(
+            self.obs_dims["critic"],
+            action_dim=action_dim,
+            key_body_count=key_body_count,
+            observation_window_lengths=self.observation_window_lengths,
         )
 
     @staticmethod
@@ -543,17 +661,42 @@ class TrainRunner:
 
         checkpoint = self.resume_checkpoint
         startup_timer.log("restoring actor and critic weights from resume checkpoint")
-        self.actor.load_state_dict(checkpoint.model["actor"])
-        self.critic.load_state_dict(checkpoint.model["critic"])
-
-        training_state = dict(checkpoint.training)
-        if not training_state:
-            self.resume_mode = "warm_start"
+        actor_incompatible_keys = load_actor_checkpoint_state(self.actor, checkpoint.model["actor"])
+        if actor_incompatible_keys.missing_keys or actor_incompatible_keys.unexpected_keys:
             print(
-                "resume checkpoint does not contain trainer state; warm-starting actor/critic with fresh "
-                "optimizers, scheduler, scaler, and counters.",
+                "resume checkpoint actor was loaded across the encoder redesign; "
+                "compatible legacy encoder keys were remapped and new policy-owned pooling/projection "
+                "weights were initialized where no compatible checkpoint weights existed.",
                 flush=True,
             )
+        training_state = dict(checkpoint.training)
+
+        critic_weights_restored = True
+        try:
+            self.critic.load_state_dict(checkpoint.model["critic"])
+        except RuntimeError as exc:
+            if training_state:
+                raise
+            critic_weights_restored = False
+            print(
+                "resume checkpoint critic weights are incompatible with the current critic architecture; "
+                "warm-starting actor only and keeping a freshly initialized critic. "
+                f"Reason: {self._format_failure_reason(exc)}",
+                flush=True,
+            )
+
+        if not training_state:
+            self.resume_mode = "warm_start"
+            warm_start_message = (
+                "resume checkpoint does not contain trainer state; warm-starting actor/critic with fresh "
+                "optimizers, scheduler, scaler, and counters."
+            )
+            if not critic_weights_restored:
+                warm_start_message = (
+                    "resume checkpoint does not contain trainer state; warm-starting actor with a fresh critic, "
+                    "optimizers, scheduler, scaler, and counters."
+                )
+            print(warm_start_message, flush=True)
             return
 
         missing_keys = self._training_state_missing_keys(training_state)
@@ -1933,10 +2076,6 @@ class TrainRunner:
         if latest_heatmap_path := artifacts.get("latest_heatmap_png"):
             print(f"  latest heatmap: {latest_heatmap_path}", flush=True)
 
-    @staticmethod
-    def _get_critic_observation(obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        return obs["privilege"]
-
     @torch.no_grad()
     def _update_actor_statistics(
         self,
@@ -1945,7 +2084,11 @@ class TrainRunner:
         self.actor(actor_obs_batch, update_normlizer=True)
 
     @torch.no_grad()
-    def get_value(self, critic_obs_batch: torch.Tensor, update_normlizer: bool = True) -> torch.Tensor:
+    def get_value(
+        self,
+        critic_obs_batch: torch.Tensor | Mapping[str, torch.Tensor],
+        update_normlizer: bool = True,
+    ) -> torch.Tensor:
         critic_step: ValueStep = self.critic(critic_obs_batch, update_normlizer=update_normlizer)
         return critic_step.value
 
@@ -1953,7 +2096,7 @@ class TrainRunner:
     def get_action(
         self,
         actor_obs_batch: dict[str, torch.Tensor],
-        critic_obs_batch: torch.Tensor,
+        critic_obs_batch: torch.Tensor | Mapping[str, torch.Tensor],
         determine: bool = False,
     ):
         actor_step = self.actor(actor_obs_batch, update_normlizer=True)
@@ -1969,7 +2112,7 @@ class TrainRunner:
         for _ in range(self.steps):
             self.global_step += 1
             actor_obs = get_actor_observation(obs, self.actor_type)
-            critic_obs = self._get_critic_observation(obs)
+            critic_obs = get_critic_observation(self.critic, obs)
             action, log_prob, value = self.get_action(actor_obs, critic_obs)
             next_obs, task_reward, terminate, timeout, info = self.env.step(action)
             recovery_metric_sample = self._extract_recovery_metric_sample(info)
@@ -2007,7 +2150,6 @@ class TrainRunner:
                 self.tracker.reset("episode_length", done)
 
             records = {
-                "critic_observations": critic_obs,
                 "actions": action,
                 "log_probs": log_prob,
                 "rewards": reward,
@@ -2015,6 +2157,7 @@ class TrainRunner:
                 "terminate": terminate,
             }
             records.update(get_policy_records(actor_obs, self.actor_type))
+            records.update(get_critic_records(critic_obs))
 
             self.rollout_buffer.add_records(records)
             obs = next_obs
@@ -2028,7 +2171,7 @@ class TrainRunner:
                 self._log_metrics(location_tracking_payload)
 
         actor_obs = get_actor_observation(obs, self.actor_type)
-        critic_obs = self._get_critic_observation(obs)
+        critic_obs = get_critic_observation(self.critic, obs)
         self._update_actor_statistics(actor_obs)
         last_value = self.get_value(critic_obs, update_normlizer=True)
         returns, advantages = compute_gae(
@@ -2061,7 +2204,7 @@ class TrainRunner:
 
             for batch in batch_iter:
                 policy_obs_batch = get_policy_batch(batch, self.actor_type, self.device)
-                critic_obs_batch = batch["critic_observations"].to(self.device)
+                critic_obs_batch = get_critic_batch(batch, self.critic, self.device)
                 action_batch = batch["actions"].to(self.device)
                 log_prob_batch = batch["log_probs"].to(self.device)
                 value_batch = batch["values"].to(self.device)

@@ -74,6 +74,12 @@ def test_checkpoint_v2_roundtrip(tmp_path):
         "motion_encoder_type": "mlp",
         "actor_fusion_type": "film",
     }
+    assert loaded.meta["critic"] == {
+        "critic_type": "flat",
+        "obs_dim": 5,
+        "key_body_count": 0,
+        "group_dims": {},
+    }
     assert loaded.env["action_mode"] == "offset"
     assert loaded.env["root_name"] == "torso_link"
     assert loaded.env["anchor_body_name"] == "torso_link"

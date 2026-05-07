@@ -111,8 +111,6 @@ def _extract_encoder_state_dict(model: ReferenceMotionMAE) -> dict[str, torch.Te
         "input_proj.",
         "encoder_position_embedding",
         "encoder.",
-        "latent_norm.",
-        "latent_proj.",
     )
     filtered: dict[str, torch.Tensor] = {}
     for key, value in model.state_dict().items():
@@ -134,7 +132,7 @@ def build_motion_mae_checkpoint(
     return MotionMAECheckpointV1(
         meta={
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "latent_dim": int(model.latent_dim),
+            "token_dim": int(model.d_model),
             "model_kwargs": _model_kwargs_from_model(model),
         },
         model={"model": model.state_dict()},
@@ -157,7 +155,7 @@ def build_motion_mae_encoder_checkpoint(
     return MotionMAEEncoderCheckpointV1(
         meta={
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "latent_dim": int(model.latent_dim),
+            "token_dim": int(model.d_model),
             "model_kwargs": _model_kwargs_from_model(model),
             "frozen": True,
         },

@@ -14,7 +14,9 @@ from gmtp.motion_mae import (
     MotionFeatureSequence,
     ReferenceMotionMAE,
     ReferenceMotionMAEDataset,
+    build_motion_mae_checkpoint,
     build_motion_mae_encoder_checkpoint,
+    save_motion_mae_checkpoint,
     save_motion_mae_encoder_checkpoint,
 )
 from gmtp.motion_mae.schema import MotionSegment
@@ -452,6 +454,46 @@ def test_build_motion_mae_model_from_checkpoint_rejects_encoder_checkpoint(tmp_p
 
     with pytest.raises(ValueError, match="full Motion MAE checkpoint"):
         build_motion_mae_model_from_checkpoint(checkpoint_path, device=torch.device("cpu"))
+
+
+def test_build_motion_mae_model_from_checkpoint_rejects_legacy_pooled_latent_checkpoint(tmp_path):
+    schema = _schema(joint_count=2)
+    model = ReferenceMotionMAE(
+        input_dim=schema.d_ref,
+        target_dim=schema.d_target,
+        past_frames=4,
+        future_frames=2,
+        latent_dim=6,
+        d_model=16,
+        encoder_layers=2,
+        decoder_layers=1,
+        nhead=4,
+        dim_feedforward=32,
+    )
+    checkpoint = build_motion_mae_checkpoint(
+        model=model,
+        optimizer=None,
+        schema=schema,
+        config=MotionMAEPretrainConfig(
+            data=MotionMAEDataConfig(
+                motion_files=("env/assests/115_02_stageii.npz",),
+                past_frames=4,
+                future_frames=2,
+                split_mode="by_window",
+                val_ratio=0.5,
+            ),
+            model=MotionMAEModelConfig(d_model=16, latent_dim=6, encoder_layers=2, decoder_layers=1, nhead=4),
+        ),
+        epoch=1,
+        best_metric=0.5,
+    )
+    path = save_motion_mae_checkpoint(checkpoint, tmp_path / "legacy_motion_mae.pth")
+    payload = torch.load(path, map_location="cpu")
+    payload["model"]["model"]["latent_pool.query"] = torch.randn(1, 1, 16)
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match="pooled-latent architecture"):
+        build_motion_mae_model_from_checkpoint(path, device=torch.device("cpu"))
 
 
 def test_resolve_renderer_size_returns_requested_size_when_within_framebuffer():

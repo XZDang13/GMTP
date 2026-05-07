@@ -14,6 +14,7 @@ from gmtp.integrations.ref2act.observation_history import (
     build_motion_policy_window_lengths,
 )
 from gmtp.models.layers import MLPLayer, NormPosition
+from gmtp.models.pooling import LearnedQueryAttentionPool
 from gmtp.motion_mae import build_frozen_motion_mae_encoder
 
 _OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")
@@ -25,7 +26,6 @@ MOTION_ENCODER_OUTPUT_DIM = 512
 MOTION_ENCODER_TRANSFORMER_HEADS = 4
 MOTION_ENCODER_TRANSFORMER_LAYERS = 1
 MOTION_ENCODER_FEEDFORWARD_DIM = 256
-MOTION_MAE_ADAPTER_HIDDEN_DIM = 128
 
 
 class MotionEncoderType(StrEnum):
@@ -166,7 +166,7 @@ def normalize_motion_encoder_type(motion_encoder_type: str | MotionEncoderType |
         ) from exc
 
 
-class MotionTransformerWindowEncoder(nn.Module):
+class MotionTransformerTokenEncoder(nn.Module):
     def __init__(self, *, motion_step_dim: int, motion_window_length: int) -> None:
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(
@@ -186,69 +186,87 @@ class MotionTransformerWindowEncoder(nn.Module):
             norm=nn.LayerNorm(MOTION_ENCODER_HIDDEN_DIM),
             enable_nested_tensor=False,
         )
-        self.output_proj = nn.Linear(MOTION_ENCODER_HIDDEN_DIM, MOTION_ENCODER_OUTPUT_DIM)
         nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
 
     def forward(self, motion_obs: torch.Tensor) -> torch.Tensor:
         x = self.input_proj(motion_obs)
         x = x + self.position_embedding
-        x = self.transformer(x)
-        return self.output_proj(x[:, -1])
+        return self.transformer(x)
 
 
-class MotionMaeWindowEncoder(nn.Module):
+class MotionWindowEncoder(nn.Module):
     def __init__(
         self,
         *,
-        checkpoint_path: str | Path,
         motion_step_dim: int,
         motion_window_length: int,
+        motion_encoder_type: MotionEncoderType,
+        checkpoint_path: str | Path | None = None,
         device: torch.device | str,
     ) -> None:
         super().__init__()
-        frozen_encoder = build_frozen_motion_mae_encoder(checkpoint_path, device=device)
-        schema = frozen_encoder.schema
-        if int(frozen_encoder.encoder.past_frames) != int(motion_window_length):
-            raise ValueError(
-                "Motion MAE encoder checkpoint is incompatible with motion_window_length: "
-                f"checkpoint past_frames={frozen_encoder.encoder.past_frames}, "
-                f"requested motion_window_length={motion_window_length}."
-            )
-        if int(schema.d_ref) != int(motion_step_dim):
-            raise ValueError(
-                "Motion MAE encoder checkpoint is incompatible with policy motion dim: "
-                f"checkpoint d_ref={schema.d_ref}, policy motion step dim={motion_step_dim}."
-            )
-        if tuple(schema.reference_feature_names) != tuple(schema.policy_feature_names):
-            raise ValueError(
-                "Motion MAE encoder checkpoint is incompatible with actor-integrated MAE mode: "
-                "reference_feature_names must match policy_feature_names."
-            )
+        self.motion_encoder_type = motion_encoder_type
+        self._encoder_is_registered = motion_encoder_type != MotionEncoderType.MAE
 
-        object.__setattr__(self, "_frozen_encoder", frozen_encoder)
-        self.output_proj = nn.Sequential(
-            MLPLayer(
-                frozen_encoder.latent_dim,
-                MOTION_MAE_ADAPTER_HIDDEN_DIM,
-                nn.SiLU(),
-                NormPosition.POST,
-            ),
-            MLPLayer(MOTION_MAE_ADAPTER_HIDDEN_DIM, MOTION_ENCODER_OUTPUT_DIM, nn.Identity()),
+        if motion_encoder_type == MotionEncoderType.MAE:
+            if checkpoint_path is None:
+                raise ValueError(
+                    "motion_mae_encoder_checkpoint is required when motion_encoder_type='mae'."
+                )
+            frozen_encoder = build_frozen_motion_mae_encoder(checkpoint_path, device=device)
+            schema = frozen_encoder.schema
+            if int(frozen_encoder.encoder.past_frames) != int(motion_window_length):
+                raise ValueError(
+                    "Motion MAE encoder checkpoint is incompatible with motion_window_length: "
+                    f"checkpoint past_frames={frozen_encoder.encoder.past_frames}, "
+                    f"requested motion_window_length={motion_window_length}."
+                )
+            if int(schema.d_ref) != int(motion_step_dim):
+                raise ValueError(
+                    "Motion MAE encoder checkpoint is incompatible with policy motion dim: "
+                    f"checkpoint d_ref={schema.d_ref}, policy motion step dim={motion_step_dim}."
+                )
+            if tuple(schema.reference_feature_names) != tuple(schema.policy_feature_names):
+                raise ValueError(
+                    "Motion MAE encoder checkpoint is incompatible with actor-integrated MAE mode: "
+                    "reference_feature_names must match policy_feature_names."
+                )
+
+            object.__setattr__(self, "_encoder", frozen_encoder)
+            token_dim = frozen_encoder.token_dim
+            num_heads = frozen_encoder.num_heads
+        else:
+            self._encoder = MotionTransformerTokenEncoder(
+                motion_step_dim=motion_step_dim,
+                motion_window_length=motion_window_length,
+            )
+            token_dim = MOTION_ENCODER_HIDDEN_DIM
+            num_heads = MOTION_ENCODER_TRANSFORMER_HEADS
+
+        self.pooling = LearnedQueryAttentionPool(
+            token_dim,
+            num_heads,
         )
+        self.output_proj = nn.Linear(token_dim, MOTION_ENCODER_OUTPUT_DIM)
 
     @property
-    def frozen_encoder(self):
-        return self._frozen_encoder
+    def encoder(self) -> nn.Module:
+        return self._encoder
 
     def _apply(self, fn):
         super()._apply(fn)
-        object.__setattr__(self, "_frozen_encoder", self._frozen_encoder._apply(fn))
+        if not self._encoder_is_registered:
+            object.__setattr__(self, "_encoder", self._encoder._apply(fn))
         return self
 
     def forward(self, motion_obs: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            latent = self._frozen_encoder(motion_obs)
-        return self.output_proj(latent.detach())
+        if self.motion_encoder_type == MotionEncoderType.MAE:
+            with torch.no_grad():
+                tokens = self.encoder(motion_obs)
+            tokens = tokens.detach()
+        else:
+            tokens = self.encoder(motion_obs)
+        return self.output_proj(self.pooling(tokens))
 
 
 class MotionHistoryEncoder(nn.Module):
@@ -290,22 +308,13 @@ class MotionHistoryEncoder(nn.Module):
             raise ValueError("Windowed motion observations require motion_encoder_type to be 'transformer' or 'mae'.")
 
         self.motion_encoder_type = requested_encoder_type
-        if self.motion_encoder_type == MotionEncoderType.MAE:
-            if motion_mae_encoder_checkpoint is None:
-                raise ValueError(
-                    "motion_mae_encoder_checkpoint is required when motion_encoder_type='mae'."
-                )
-            self.window_encoder = MotionMaeWindowEncoder(
-                checkpoint_path=motion_mae_encoder_checkpoint,
-                motion_step_dim=self.motion_step_dim,
-                motion_window_length=self.motion_window_length,
-                device=device,
-            )
-        else:
-            self.window_encoder = MotionTransformerWindowEncoder(
-                motion_step_dim=self.motion_step_dim,
-                motion_window_length=self.motion_window_length,
-            )
+        self.window_encoder = MotionWindowEncoder(
+            motion_step_dim=self.motion_step_dim,
+            motion_window_length=self.motion_window_length,
+            motion_encoder_type=self.motion_encoder_type,
+            checkpoint_path=motion_mae_encoder_checkpoint,
+            device=device,
+        )
 
     def forward(self, motion_obs: torch.Tensor) -> torch.Tensor:
         if not self.is_windowed:

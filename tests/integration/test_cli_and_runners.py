@@ -189,6 +189,29 @@ class _LocationMetricTrainEnv(_DummyTrainEnv):
         return obs, reward, terminate, timeout, info
 
 
+class _StructuredCriticTrainEnv(_DummyTrainEnv):
+    def __init__(self, batch_size: int, *, robot_window_length: int = 4, motion_window_length: int = 1):
+        super().__init__(
+            batch_size,
+            robot_window_length=robot_window_length,
+            motion_window_length=motion_window_length,
+        )
+        self.key_body_indices = [0, 1, 2, 3]
+
+    def _build_privilege_obs(self) -> torch.Tensor:
+        return torch.arange(67, dtype=torch.float32).reshape(1, 67).repeat(self.batch_size, 1)
+
+    def reset(self):
+        obs, info = super().reset()
+        obs["privilege"] = self._build_privilege_obs()
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminate, timeout, info = super().step(action)
+        obs["privilege"] = self._build_privilege_obs() + float(self.step_count)
+        return obs, reward, terminate, timeout, info
+
+
 def _window_length(window_lengths, prefix: str, default: int) -> int:
     if not window_lengths:
         return default
@@ -226,6 +249,17 @@ def _fake_train_module(env_cls=_DummyTrainEnv):
     return types.SimpleNamespace(
         make_training_env=make_training_env,
     )
+
+
+def _fake_structured_critic_train_module():
+    base_module = _fake_train_module(_StructuredCriticTrainEnv)
+
+    def make_training_env(*args, **kwargs):
+        env, cfg = base_module.make_training_env(*args, **kwargs)
+        cfg.key_body_names = ["pelvis", "left_hand", "right_hand", "head"]
+        return env, cfg
+
+    return types.SimpleNamespace(make_training_env=make_training_env)
 
 
 def _fake_eval_module():
@@ -404,6 +438,9 @@ def test_cli_parser_builds_train_and_eval_commands():
     with pytest.raises(SystemExit):
         parser.parse_args(["train", "--attn-block-size", "5"])
 
+    with pytest.raises(SystemExit):
+        parser.parse_args(["train", "--robot-encoder-type", "cnn"])
+
     args = parser.parse_args(["train", "--disable-amp"])
     assert args.disable_amp is True
 
@@ -470,10 +507,8 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.pretrain_target == "motion-mae"
     assert args.config == "foo.json"
 
-    args = parser.parse_args(["pretrain", "motion-mae-latents", "--checkpoint", "encoder.pth", "--config", "foo.json"])
-    assert args.command == "pretrain"
-    assert args.pretrain_target == "motion-mae-latents"
-    assert args.checkpoint == "encoder.pth"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["pretrain", "motion-mae-latents", "--checkpoint", "encoder.pth", "--config", "foo.json"])
 
     args = parser.parse_args(
         [
@@ -558,7 +593,7 @@ def test_train_runner_constructs_film_res_actor(monkeypatch):
     runner = TrainRunner(
         RunConfig(
             num_blocks=4,
-            robot_encoder_type="cnn",
+            robot_encoder_type="transformer",
             actor_fusion_type="motion_residual",
             use_wandb=False,
         )
@@ -567,7 +602,7 @@ def test_train_runner_constructs_film_res_actor(monkeypatch):
     assert runner.actor_kwargs == {
         "num_blocks": 4,
         "robot_window_length": 4,
-        "robot_encoder_type": "cnn",
+        "robot_encoder_type": "transformer",
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
         "actor_fusion_type": "motion_residual",
@@ -745,6 +780,34 @@ def test_train_runner_update_smoke_uses_cpu_fallback(monkeypatch):
     runner.env.close()
 
 
+def test_train_runner_update_uses_structured_critic_observation_storage(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_structured_critic_train_module())
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=1,
+            num_updates=1,
+        )
+    )
+
+    assert runner.critic.critic_type == "structured"
+    assert runner.critic_key_body_count == 4
+    assert runner.critic_storage_specs == {
+        "critic_target_observations": (7,),
+        "critic_geometry_observations": (45,),
+        "critic_robot_observations": (15,),
+    }
+    assert "critic_observations" not in runner.rollout_buffer.data
+
+    runner.rollout(runner.initial_obs)
+    runner.update()
+
+    assert runner.rollout_buffer.data["critic_target_observations"].shape[-1] == 7
+    assert runner.rollout_buffer.data["critic_geometry_observations"].shape[-1] == 45
+    assert runner.rollout_buffer.data["critic_robot_observations"].shape[-1] == 15
+    runner.env.close()
+
+
 def test_train_runner_warm_starts_from_checkpoint_without_trainer_state(tmp_path, monkeypatch, capsys):
     checkpoint_path = _write_checkpoint(tmp_path, robot_window_length=1)
     checkpoint = load_checkpoint_v2(checkpoint_path)
@@ -770,6 +833,36 @@ def test_train_runner_warm_starts_from_checkpoint_without_trainer_state(tmp_path
         assert torch.equal(runner.actor.state_dict()[key].detach().cpu(), value)
     for key, value in checkpoint.model["critic"].items():
         assert torch.equal(runner.critic.state_dict()[key].detach().cpu(), value)
+    runner.env.close()
+
+
+def test_train_runner_warm_start_keeps_new_structured_critic_when_legacy_flat_critic_is_incompatible(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    checkpoint_path = _write_checkpoint(tmp_path, robot_window_length=4)
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_structured_critic_train_module())
+
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            resume_checkpoint_path=str(checkpoint_path),
+            output_root=str(tmp_path / "runs"),
+        )
+    )
+    output = capsys.readouterr().out
+
+    assert "critic weights are incompatible" in output
+    assert "warm-starting actor only" in output
+    assert runner.resume_mode == "warm_start"
+    assert runner.critic.critic_type == "structured"
+    assert runner.critic_key_body_count == 4
+    assert runner.critic_storage_specs == {
+        "critic_target_observations": (7,),
+        "critic_geometry_observations": (45,),
+        "critic_robot_observations": (15,),
+    }
     runner.env.close()
 
 

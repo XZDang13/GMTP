@@ -13,16 +13,30 @@ from .actor import (
     normalize_actor_fusion_type,
     normalize_actor_type,
 )
-from .critic import Critic
+from .critic import (
+    Critic,
+    build_critic_privilege_layout,
+    get_critic_batch,
+    get_critic_metadata,
+    get_critic_observation,
+    get_critic_records,
+)
+from .pooling import LearnedQueryAttentionPool
 
 __all__ = [
     "ActorType",
     "ActorFusionType",
     "Critic",
     "FiLMResActor",
+    "LearnedQueryAttentionPool",
+    "build_critic_privilege_layout",
     "build_actor",
     "get_actor_kwargs",
     "get_actor_observation",
+    "get_critic_batch",
+    "get_critic_metadata",
+    "get_critic_observation",
+    "get_critic_records",
     "get_policy_batch",
     "get_policy_records",
     "get_policy_storage_specs",

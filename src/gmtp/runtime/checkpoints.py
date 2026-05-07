@@ -9,7 +9,7 @@ import torch
 
 from gmtp.integrations.ref2act.motion import motion_label, motion_names, resolve_motion_files
 from gmtp.integrations.ref2act.observation_history import normalize_observation_window_lengths
-from gmtp.models import ActorType, get_actor_kwargs
+from gmtp.models import ActorType, get_actor_kwargs, get_critic_metadata
 
 CHECKPOINT_VERSION = 2
 
@@ -142,6 +142,7 @@ def build_training_checkpoint(
             "created_at": created_at or datetime.now().isoformat(timespec="seconds"),
             "actor_type": ActorType.FILM_RES.value,
             "actor_kwargs": get_actor_kwargs(actor, ActorType.FILM_RES),
+            "critic": get_critic_metadata(critic),
             "motion_label": motion_label(resolved_motion_files),
         },
         model={

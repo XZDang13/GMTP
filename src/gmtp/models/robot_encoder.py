@@ -13,6 +13,7 @@ from gmtp.integrations.ref2act.observation_history import (
     build_robot_policy_window_lengths,
 )
 from gmtp.models.layers import MLPLayer, NormPosition
+from gmtp.models.pooling import LearnedQueryAttentionPool
 
 _OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")
 DEFAULT_OBSERVATION_TERM_REGISTRY = _OBSERVATION_SPEC.DEFAULT_OBSERVATION_TERM_REGISTRY
@@ -20,14 +21,13 @@ ObservationLayout = _OBSERVATION_SPEC.ObservationLayout
 
 ROBOT_ENCODER_HIDDEN_DIM = 128
 ROBOT_ENCODER_OUTPUT_DIM = 512
-ROBOT_ENCODER_TRANSFORMER_HEADS = 4
-ROBOT_ENCODER_TRANSFORMER_LAYERS = 1
+ROBOT_ENCODER_TRANSFORMER_HEADS = 8
+ROBOT_ENCODER_TRANSFORMER_LAYERS = 2
 ROBOT_ENCODER_FEEDFORWARD_DIM = 256
 
 
 class RobotEncoderType(StrEnum):
     MLP = "mlp"
-    CNN = "cnn"
     TRANSFORMER = "transformer"
 
 
@@ -149,9 +149,6 @@ def normalize_robot_encoder_type(robot_encoder_type: str | RobotEncoderType | No
     normalized = str(robot_encoder_type).lower().replace("-", "_")
     alias_map = {
         "mlp": RobotEncoderType.MLP,
-        "cnn": RobotEncoderType.CNN,
-        "conv1d": RobotEncoderType.CNN,
-        "conv": RobotEncoderType.CNN,
         "transformer": RobotEncoderType.TRANSFORMER,
     }
     try:
@@ -159,27 +156,11 @@ def normalize_robot_encoder_type(robot_encoder_type: str | RobotEncoderType | No
     except KeyError as exc:
         raise ValueError(
             f"Unsupported robot encoder type '{robot_encoder_type}'. "
-            "Expected one of: 'mlp', 'cnn', 'transformer'."
+            "Windowed robot observations support only 'transformer'."
         ) from exc
 
 
-class RobotCnnWindowEncoder(nn.Module):
-    def __init__(self, robot_step_dim: int) -> None:
-        super().__init__()
-        self.temporal_conv = nn.Sequential(
-            nn.Conv1d(robot_step_dim, ROBOT_ENCODER_HIDDEN_DIM, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv1d(ROBOT_ENCODER_HIDDEN_DIM, ROBOT_ENCODER_HIDDEN_DIM, kernel_size=3, padding=1),
-            nn.SiLU(),
-        )
-        self.output_proj = nn.Linear(ROBOT_ENCODER_HIDDEN_DIM, ROBOT_ENCODER_OUTPUT_DIM)
-
-    def forward(self, robot_obs: torch.Tensor) -> torch.Tensor:
-        x = self.temporal_conv(robot_obs.transpose(1, 2)).transpose(1, 2)
-        return self.output_proj(x[:, -1])
-
-
-class RobotTransformerWindowEncoder(nn.Module):
+class RobotTransformerTokenEncoder(nn.Module):
     def __init__(self, *, robot_step_dim: int, robot_window_length: int) -> None:
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(
@@ -199,14 +180,34 @@ class RobotTransformerWindowEncoder(nn.Module):
             norm=nn.LayerNorm(ROBOT_ENCODER_HIDDEN_DIM),
             enable_nested_tensor=False,
         )
-        self.output_proj = nn.Linear(ROBOT_ENCODER_HIDDEN_DIM, ROBOT_ENCODER_OUTPUT_DIM)
         nn.init.normal_(self.position_embedding, mean=0.0, std=0.02)
 
     def forward(self, robot_obs: torch.Tensor) -> torch.Tensor:
         x = self.input_proj(robot_obs)
         x = x + self.position_embedding
-        x = self.transformer(x)
-        return self.output_proj(x[:, -1])
+        return self.transformer(x)
+
+
+class RobotWindowEncoder(nn.Module):
+    def __init__(self, *, robot_step_dim: int, robot_window_length: int) -> None:
+        super().__init__()
+        self._encoder = RobotTransformerTokenEncoder(
+            robot_step_dim=robot_step_dim,
+            robot_window_length=robot_window_length,
+        )
+        self.pooling = LearnedQueryAttentionPool(
+            ROBOT_ENCODER_HIDDEN_DIM,
+            ROBOT_ENCODER_TRANSFORMER_HEADS,
+        )
+        self.output_proj = nn.Linear(ROBOT_ENCODER_HIDDEN_DIM, ROBOT_ENCODER_OUTPUT_DIM)
+
+    @property
+    def encoder(self) -> nn.Module:
+        return self._encoder
+
+    def forward(self, robot_obs: torch.Tensor) -> torch.Tensor:
+        tokens = self.encoder(robot_obs)
+        return self.output_proj(self.pooling(tokens))
 
 
 class RobotHistoryEncoder(nn.Module):
@@ -241,17 +242,14 @@ class RobotHistoryEncoder(nn.Module):
             )
             return
 
-        if requested_encoder_type == RobotEncoderType.MLP:
-            raise ValueError("Windowed robot observations require robot_encoder_type to be 'cnn' or 'transformer'.")
+        if requested_encoder_type != RobotEncoderType.TRANSFORMER:
+            raise ValueError("Windowed robot observations require robot_encoder_type='transformer'.")
 
         self.robot_encoder_type = requested_encoder_type
-        if self.robot_encoder_type == RobotEncoderType.CNN:
-            self.window_encoder = RobotCnnWindowEncoder(self.robot_step_dim)
-        else:
-            self.window_encoder = RobotTransformerWindowEncoder(
-                robot_step_dim=self.robot_step_dim,
-                robot_window_length=self.robot_window_length,
-            )
+        self.window_encoder = RobotWindowEncoder(
+            robot_step_dim=self.robot_step_dim,
+            robot_window_length=self.robot_window_length,
+        )
 
     def forward(self, robot_obs: torch.Tensor) -> torch.Tensor:
         if not self.is_windowed:
