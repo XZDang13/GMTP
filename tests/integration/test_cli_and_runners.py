@@ -108,60 +108,16 @@ class _DummyTrainEnv:
         return None
 
 
-def _recovery_metrics_for_step(step_count: int) -> dict[str, float]:
-    if step_count == 1:
-        return {
-            "active_rate": 0.2,
-            "entry_rate": 0.1,
-            "exit_rate": 0.05,
-            "timeout_rate": 0.0,
-            "reference_time_scale_mean": 0.9,
-            "score_mean": 1.5,
-        }
-    return {
-        "active_rate": 0.4,
-        "entry_rate": 0.3,
-        "exit_rate": 0.15,
-        "timeout_rate": 0.05,
-        "reference_time_scale_mean": 0.8,
-        "score_mean": 1.0,
-    }
-
-
-class _RecoveryInfoTrainEnv(_DummyTrainEnv):
+class _CurriculumExtrasTrainEnv(_DummyTrainEnv):
     def step(self, action):
-        obs, reward, terminate, timeout, _ = super().step(action)
-        metrics = _recovery_metrics_for_step(self.step_count)
-        info = {
-            "env": {
-                "fall_recovery": {
-                    "active_rate": torch.tensor([metrics["active_rate"]], dtype=torch.float32),
-                    "entry_rate": torch.tensor(metrics["entry_rate"], dtype=torch.float32),
-                    "exit_rate": torch.tensor(metrics["exit_rate"], dtype=torch.float32),
-                    "timeout_rate": torch.tensor(metrics["timeout_rate"], dtype=torch.float32),
-                    "reference_time_scale_mean": torch.tensor(metrics["reference_time_scale_mean"], dtype=torch.float32),
-                },
-                "tracking_quality": {
-                    "score_mean": torch.tensor(metrics["score_mean"], dtype=torch.float32),
-                },
-            }
+        obs, reward, terminate, timeout, info = super().step(action)
+        self.extras = {
+            "curriculum/end_effector_position_failure": torch.tensor(
+                0.25 - 0.01 * self.step_count,
+                dtype=torch.float32,
+            )
         }
         return obs, reward, terminate, timeout, info
-
-
-class _RecoveryExtrasTrainEnv(_DummyTrainEnv):
-    def step(self, action):
-        obs, reward, terminate, timeout, _ = super().step(action)
-        metrics = _recovery_metrics_for_step(self.step_count)
-        self.extras = {
-            "fall_recovery/active_rate": torch.tensor(metrics["active_rate"], dtype=torch.float32),
-            "fall_recovery/entry_rate": torch.tensor(metrics["entry_rate"], dtype=torch.float32),
-            "fall_recovery/exit_rate": torch.tensor(metrics["exit_rate"], dtype=torch.float32),
-            "fall_recovery/timeout_rate": torch.tensor(metrics["timeout_rate"], dtype=torch.float32),
-            "fall_recovery/reference_time_scale_mean": torch.tensor(metrics["reference_time_scale_mean"], dtype=torch.float32),
-            "tracking_quality/score_mean": torch.tensor(metrics["score_mean"], dtype=torch.float32),
-        }
-        return obs, reward, terminate, timeout, {}
 
 
 class _LocationMetricTrainEnv(_DummyTrainEnv):
@@ -222,7 +178,9 @@ def _fake_train_module(env_cls=_DummyTrainEnv):
     def make_training_env(
         window_lengths=None,
         motion_files=None,
-        disable_quality_gate=False,
+        end_effector_termination_curriculum_enabled=False,
+        end_effector_termination_initial_threshold=0.25,
+        end_effector_termination_end_threshold=0.10,
     ):
         cfg = types.SimpleNamespace(
             scene=types.SimpleNamespace(num_envs=2),
@@ -234,8 +192,25 @@ def _fake_train_module(env_cls=_DummyTrainEnv):
             anchor_body_name="torso_link",
             segment_source="Anchor",
             sampling_strategy="FailureWeighted",
-            failure_temperature=1.0,
-            disable_quality_gate=bool(disable_quality_gate),
+            weight_fail=0.55,
+            weight_novel=0.25,
+            cap_beta=2.0,
+            adaptive_uniform_ratio=0.05,
+            adaptive_alpha=0.005,
+            adaptive_kernel_size=1,
+            adaptive_lambda=0.8,
+            motion_sampling_warmup_s=0.0,
+            motion_sampling_ramp_s=10.0,
+            motion_sampling_schedule="cosine",
+            end_effector_termination_curriculum_enabled=bool(
+                end_effector_termination_curriculum_enabled
+            ),
+            end_effector_termination_initial_threshold=float(
+                end_effector_termination_initial_threshold
+            ),
+            end_effector_termination_end_threshold=float(
+                end_effector_termination_end_threshold
+            ),
         )
         return (
             env_cls(
@@ -428,7 +403,17 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.actor_fusion_type == "film"
     assert args.disable_amp is False
     assert args.disable_wandb is False
-    assert args.disable_quality_gate is False
+    assert args.disable_end_effector_termination_curriculum is False
+    assert args.end_effector_termination_start_threshold == pytest.approx(0.25)
+    assert args.end_effector_termination_end_threshold == pytest.approx(0.10)
+    assert args.end_effector_termination_tighten_step == pytest.approx(0.03)
+    assert args.end_effector_termination_warmup_fraction == pytest.approx(0.20)
+    assert args.end_effector_termination_deadline_fraction == pytest.approx(0.80)
+    assert args.end_effector_termination_ema_updates == 20
+    assert args.end_effector_termination_min_ema_samples == 10
+    assert args.end_effector_termination_hold_updates == 20
+    assert args.end_effector_termination_max_terminate_rate == pytest.approx(0.03)
+    assert args.end_effector_termination_error_margin == pytest.approx(0.75)
     assert args.motion_mae_encoder_checkpoint is None
     assert args.motion_files is None
     assert args.resume_checkpoint_path is None
@@ -444,8 +429,43 @@ def test_cli_parser_builds_train_and_eval_commands():
     args = parser.parse_args(["train", "--disable-amp"])
     assert args.disable_amp is True
 
-    args = parser.parse_args(["train", "--disable-quality-gate"])
-    assert args.disable_quality_gate is True
+    args = parser.parse_args(
+        [
+            "train",
+            "--disable-end-effector-termination-curriculum",
+            "--end-effector-termination-start-threshold",
+            "0.3",
+            "--end-effector-termination-end-threshold",
+            "0.12",
+            "--end-effector-termination-start-fraction",
+            "0.1",
+            "--end-effector-termination-end-fraction",
+            "0.7",
+            "--end-effector-termination-tighten-step",
+            "0.02",
+            "--end-effector-termination-ema-updates",
+            "30",
+            "--end-effector-termination-min-ema-samples",
+            "12",
+            "--end-effector-termination-hold-updates",
+            "7",
+            "--end-effector-termination-max-terminate-rate",
+            "0.04",
+            "--end-effector-termination-error-margin",
+            "0.8",
+        ]
+    )
+    assert args.disable_end_effector_termination_curriculum is True
+    assert args.end_effector_termination_start_threshold == pytest.approx(0.3)
+    assert args.end_effector_termination_end_threshold == pytest.approx(0.12)
+    assert args.end_effector_termination_warmup_fraction == pytest.approx(0.1)
+    assert args.end_effector_termination_deadline_fraction == pytest.approx(0.7)
+    assert args.end_effector_termination_tighten_step == pytest.approx(0.02)
+    assert args.end_effector_termination_ema_updates == 30
+    assert args.end_effector_termination_min_ema_samples == 12
+    assert args.end_effector_termination_hold_updates == 7
+    assert args.end_effector_termination_max_terminate_rate == pytest.approx(0.04)
+    assert args.end_effector_termination_error_margin == pytest.approx(0.8)
 
     args = parser.parse_args(["train", "--anchor-log-interval", "25", "--anchor-heatmap-bins", "64"])
     assert args.anchor_log_interval == 25
@@ -577,14 +597,46 @@ def test_train_runner_passes_motion_file_override_to_training_env(monkeypatch):
     runner.env.close()
 
 
-def test_train_runner_passes_disable_quality_gate_to_training_env(monkeypatch):
+def test_train_runner_passes_end_effector_termination_curriculum_to_training_env(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
 
-    runner = TrainRunner(RunConfig(use_wandb=False, disable_quality_gate=True))
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=2,
+            num_updates=10,
+        )
+    )
 
-    assert runner.cfg.disable_quality_gate is True
+    assert runner.cfg.end_effector_termination_curriculum_enabled is True
+    assert runner.cfg.end_effector_termination_initial_threshold == pytest.approx(0.25)
+    assert runner.cfg.end_effector_termination_end_threshold == pytest.approx(0.10)
+    assert runner.end_effector_termination_curriculum.thresholds == pytest.approx(
+        (0.25, 0.22, 0.19, 0.16, 0.13, 0.10)
+    )
     config_payload = json.loads(runner.run_paths.config_path.read_text(encoding="utf-8"))
-    assert config_payload["config"]["disable_quality_gate"] is True
+    assert config_payload["config"]["end_effector_termination_curriculum_enabled"] is True
+    assert config_payload["config"]["end_effector_termination_start_threshold"] == pytest.approx(0.25)
+    assert config_payload["config"]["end_effector_termination_end_threshold"] == pytest.approx(0.10)
+    assert config_payload["config"]["end_effector_termination_tighten_step"] == pytest.approx(0.03)
+    assert config_payload["config"]["end_effector_termination_warmup_fraction"] == pytest.approx(0.20)
+    assert config_payload["config"]["end_effector_termination_deadline_fraction"] == pytest.approx(0.80)
+    runner.env.close()
+
+
+def test_train_runner_can_disable_end_effector_termination_curriculum(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            end_effector_termination_curriculum_enabled=False,
+        )
+    )
+
+    assert runner.cfg.end_effector_termination_curriculum_enabled is False
+    assert runner.cfg.end_effector_termination_initial_threshold == pytest.approx(0.10)
+    assert runner.cfg.end_effector_termination_end_threshold == pytest.approx(0.10)
     runner.env.close()
 
 
@@ -634,8 +686,12 @@ def test_train_runner_rollout_updates_actor_statistics(monkeypatch):
     runner.env.close()
 
 
-def test_train_runner_logs_rollout_recovery_metrics_from_info(monkeypatch):
-    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module(_RecoveryInfoTrainEnv))
+def test_train_runner_logs_latest_curriculum_metric_from_extras(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "gmtp.integrations.ref2act.isaac_env",
+        _fake_train_module(_CurriculumExtrasTrainEnv),
+    )
     runner = TrainRunner(
         RunConfig(
             use_wandb=False,
@@ -648,43 +704,14 @@ def test_train_runner_logs_rollout_recovery_metrics_from_info(monkeypatch):
 
     runner.rollout(runner.initial_obs)
 
-    assert len(logged_payloads) == 1
-    assert logged_payloads[0] == pytest.approx(
-        {
-            "recovery/active_rate": 0.3,
-            "recovery/entry_rate": 0.2,
-            "recovery/exit_rate": 0.1,
-            "recovery/timeout_rate": 0.025,
-            "recovery/reference_time_scale_mean": 0.85,
-            "recovery/tracking_score_mean": 1.25,
-            "recovery/exit_to_entry_ratio": 0.5,
-            "recovery/timeout_to_entry_ratio": 0.125,
-        }
+    assert any(
+        payload.get("curriculum/end_effector_position_failure") == pytest.approx(0.23)
+        for payload in logged_payloads
     )
     runner.env.close()
 
 
-def test_train_runner_logs_rollout_recovery_metrics_from_extras_fallback(monkeypatch):
-    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module(_RecoveryExtrasTrainEnv))
-    runner = TrainRunner(
-        RunConfig(
-            use_wandb=False,
-            rollout_steps=2,
-            num_updates=1,
-        )
-    )
-    logged_payloads = []
-    runner._log_metrics = lambda payload: logged_payloads.append(dict(payload))
-
-    runner.rollout(runner.initial_obs)
-
-    assert len(logged_payloads) == 1
-    assert logged_payloads[0]["recovery/active_rate"] == pytest.approx(0.3)
-    assert logged_payloads[0]["recovery/exit_to_entry_ratio"] == pytest.approx(0.5)
-    runner.env.close()
-
-
-def test_train_runner_skips_recovery_metric_log_when_unavailable(monkeypatch):
+def test_train_runner_skips_auxiliary_metric_log_when_unavailable(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
     runner = TrainRunner(
         RunConfig(

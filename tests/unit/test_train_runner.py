@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 import torch
 
+from gmtp.runtime.checkpoints import CheckpointV2
+from gmtp.runtime.config import RunConfig
 from gmtp.runtime.train_runner import ANCHOR_CONSOLE_TOP_K, ANCHOR_DASHBOARD_MAX_RANK_BANDS, TrainRunner
 
 
@@ -15,6 +17,231 @@ def test_build_episode_metrics_payload_separates_return_and_length_namespaces():
         "episode/returns": 12.5,
         "episode/lengths": 48.0,
     }
+
+
+def test_build_end_effector_termination_curriculum_state_uses_performance_gate_defaults():
+    config = RunConfig(
+        use_wandb=False,
+        rollout_steps=2,
+        num_updates=100,
+    )
+
+    state = TrainRunner._build_end_effector_termination_curriculum_state(config)
+
+    assert state.enabled is True
+    assert state.thresholds == pytest.approx((0.25, 0.22, 0.19, 0.16, 0.13, 0.10))
+    assert state.stage_index == 0
+    assert state.current_threshold == pytest.approx(0.25)
+    assert state.warmup_fraction == pytest.approx(0.20)
+    assert state.deadline_fraction == pytest.approx(0.80)
+    assert state.ema_alpha == pytest.approx(2.0 / 21.0)
+    assert state.last_tighten_update == 0
+
+
+def test_build_end_effector_termination_curriculum_state_disabled_uses_final_threshold():
+    config = RunConfig(
+        use_wandb=False,
+        end_effector_termination_curriculum_enabled=False,
+    )
+
+    state = TrainRunner._build_end_effector_termination_curriculum_state(config)
+
+    assert state.enabled is False
+    assert state.thresholds == pytest.approx((0.10,))
+    assert state.current_threshold == pytest.approx(0.10)
+    assert state.gate_reason == "disabled"
+
+
+def test_build_end_effector_termination_curriculum_state_restores_checkpoint_gate_state():
+    checkpoint = CheckpointV2(
+        meta={},
+        model={},
+        env={},
+        training={
+            "actor_optimizer": {},
+            "critic_optimizer": {},
+            "lr_scheduler": {},
+            "grad_scaler": {},
+            "update_count": 42,
+            "global_step": 840,
+            "end_effector_termination_curriculum": {
+                "stage_index": 3,
+                "ema_terminate_rate": 0.02,
+                "ema_error_mean": 0.08,
+                "ema_sample_count": 17,
+                "ema_error_sample_count": 15,
+                "last_tighten_update": 39,
+            },
+        },
+    )
+
+    state = TrainRunner._build_end_effector_termination_curriculum_state(
+        RunConfig(use_wandb=False),
+        checkpoint=checkpoint,
+    )
+
+    assert state.stage_index == 3
+    assert state.current_threshold == pytest.approx(0.16)
+    assert state.ema_terminate_rate == pytest.approx(0.02)
+    assert state.ema_error_mean == pytest.approx(0.08)
+    assert state.ema_sample_count == 17
+    assert state.ema_error_sample_count == 15
+    assert state.last_tighten_update == 39
+    assert state.gate_reason == "restored"
+
+
+def test_end_effector_curriculum_deadline_stage_index_ratchets_to_final_stage():
+    config = RunConfig(use_wandb=False, num_updates=100)
+    state = TrainRunner._build_end_effector_termination_curriculum_state(config)
+
+    assert TrainRunner._deadline_stage_index(state, update_count=79, num_updates=100) == 0
+    assert TrainRunner._deadline_stage_index(state, update_count=80, num_updates=100) == 0
+    assert TrainRunner._deadline_stage_index(state, update_count=84, num_updates=100) == 1
+    assert TrainRunner._deadline_stage_index(state, update_count=100, num_updates=100) == 5
+
+
+def test_set_runtime_end_effector_termination_threshold_updates_model_and_curriculum():
+    rule = types.SimpleNamespace(id="end_effector_position_failure", threshold=0.25)
+    termination_model = types.SimpleNamespace(failure_rules=[rule])
+    termination_curriculum = types.SimpleNamespace(
+        _base_values={"end_effector_position_failure": 0.25},
+        _current_values={"end_effector_position_failure": 0.25},
+        _rules={"end_effector_position_failure": rule},
+    )
+    env = types.SimpleNamespace(
+        unwrapped=types.SimpleNamespace(
+            termination_model=termination_model,
+            termination_curriculum=termination_curriculum,
+        )
+    )
+
+    updated = TrainRunner._set_runtime_end_effector_termination_threshold(env, 0.19)
+
+    assert updated is True
+    assert rule.threshold == pytest.approx(0.19)
+    assert termination_curriculum._base_values["end_effector_position_failure"] == pytest.approx(0.19)
+    assert termination_curriculum._current_values["end_effector_position_failure"] == pytest.approx(0.19)
+
+
+def test_end_effector_curriculum_gate_decisions_use_warmup_stability_and_error_margin():
+    runner = TrainRunner.__new__(TrainRunner)
+    runner.config = RunConfig(
+        use_wandb=False,
+        num_updates=100,
+        end_effector_termination_hold_updates=20,
+        end_effector_termination_min_ema_samples=10,
+    )
+    runner.end_effector_termination_curriculum = (
+        TrainRunner._build_end_effector_termination_curriculum_state(runner.config)
+    )
+    state = runner.end_effector_termination_curriculum
+
+    runner.update_count = 19
+    state.last_tighten_update = 0
+    state.ema_sample_count = 10
+    state.ema_error_sample_count = 10
+    state.ema_terminate_rate = 0.01
+    state.ema_error_mean = 0.01
+    assert runner._normal_end_effector_gate_passes(0.22) == (False, "warmup")
+
+    runner.update_count = 20
+    state.ema_sample_count = 9
+    assert runner._normal_end_effector_gate_passes(0.22) == (False, "insufficient_samples")
+
+    state.ema_sample_count = 10
+    state.ema_error_sample_count = 9
+    assert runner._normal_end_effector_gate_passes(0.22) == (False, "insufficient_error_samples")
+
+    state.ema_error_sample_count = 10
+    state.ema_terminate_rate = 0.04
+    assert runner._normal_end_effector_gate_passes(0.22) == (False, "terminate_rate")
+
+    state.ema_terminate_rate = 0.03
+    state.ema_error_mean = None
+    state.ema_error_sample_count = 0
+    assert runner._normal_end_effector_gate_passes(0.22) == (True, "passed_terminate_only")
+
+    state.ema_error_sample_count = 10
+    state.ema_error_mean = 0.22 * 0.75 + 0.001
+    assert runner._normal_end_effector_gate_passes(0.22) == (False, "error_mean")
+
+    state.ema_error_mean = 0.22 * 0.75
+    assert runner._normal_end_effector_gate_passes(0.22) == (True, "passed")
+
+    state.last_tighten_update = 5
+    runner.update_count = 24
+    assert runner._normal_end_effector_gate_passes(0.22) == (False, "min_hold")
+
+
+def test_advance_end_effector_curriculum_uses_deadline_catchup_to_final_threshold():
+    runner = TrainRunner.__new__(TrainRunner)
+    runner.config = RunConfig(use_wandb=False, num_updates=100)
+    runner.end_effector_termination_curriculum = (
+        TrainRunner._build_end_effector_termination_curriculum_state(runner.config)
+    )
+    runner.update_count = 100
+    rule = types.SimpleNamespace(id="end_effector_position_failure", threshold=0.25)
+    runner.env = types.SimpleNamespace(
+        unwrapped=types.SimpleNamespace(
+            termination_model=types.SimpleNamespace(failure_rules=[rule]),
+        )
+    )
+    runner._last_end_effector_curriculum_rollout_metrics = {
+        "terminate_rate": 1.0,
+        "error_mean": 1.0,
+    }
+    logged_payloads = []
+    runner._log_metrics = lambda payload: logged_payloads.append(dict(payload))
+
+    runner._advance_end_effector_termination_curriculum()
+
+    state = runner.end_effector_termination_curriculum
+    assert state.stage_index == len(state.thresholds) - 1
+    assert state.current_threshold == pytest.approx(0.10)
+    assert state.deadline_forced is True
+    assert state.gate_reason == "deadline"
+    assert rule.threshold == pytest.approx(0.10)
+    assert logged_payloads[-1]["curriculum/end_effector/current_threshold"] == pytest.approx(0.10)
+
+
+def test_advance_end_effector_curriculum_advances_on_stable_rollout_metrics():
+    runner = TrainRunner.__new__(TrainRunner)
+    runner.config = RunConfig(
+        use_wandb=False,
+        num_updates=100,
+        end_effector_termination_min_ema_samples=1,
+        end_effector_termination_hold_updates=0,
+    )
+    runner.end_effector_termination_curriculum = (
+        TrainRunner._build_end_effector_termination_curriculum_state(runner.config)
+    )
+    runner.update_count = 20
+    rule = types.SimpleNamespace(id="end_effector_position_failure", threshold=0.25)
+    runner.env = types.SimpleNamespace(
+        unwrapped=types.SimpleNamespace(
+            termination_model=types.SimpleNamespace(failure_rules=[rule]),
+        )
+    )
+    runner._last_end_effector_curriculum_rollout_metrics = {
+        "terminate_rate": 0.0,
+        "error_mean": 0.10,
+    }
+    logged_payloads = []
+    runner._log_metrics = lambda payload: logged_payloads.append(dict(payload))
+
+    runner._advance_end_effector_termination_curriculum()
+
+    state = runner.end_effector_termination_curriculum
+    assert state.stage_index == 1
+    assert state.current_threshold == pytest.approx(0.22)
+    assert state.gate_pass is True
+    assert state.gate_reason == "passed"
+    assert state.last_tighten_update == 20
+    assert state.ema_terminate_rate == pytest.approx(0.0)
+    assert state.ema_error_mean == pytest.approx(0.10)
+    assert rule.threshold == pytest.approx(0.22)
+    assert logged_payloads[-1]["curriculum/end_effector/terminate_rate"] == pytest.approx(0.0)
+    assert logged_payloads[-1]["curriculum/end_effector/error_mean"] == pytest.approx(0.10)
 
 
 def test_extract_relative_anchor_pos_sample_uses_gmtp_privilege_term_order():

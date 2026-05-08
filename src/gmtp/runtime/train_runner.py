@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import shutil
@@ -47,21 +48,12 @@ from gmtp.runtime.policy import (
     resolve_motion_mae_checkpoint_path,
 )
 
-RECOVERY_METRIC_LOG_NAMES = {
-    "fall_recovery/active_rate": "recovery/active_rate",
-    "fall_recovery/entry_rate": "recovery/entry_rate",
-    "fall_recovery/exit_rate": "recovery/exit_rate",
-    "fall_recovery/timeout_rate": "recovery/timeout_rate",
-    "fall_recovery/reference_time_scale_mean": "recovery/reference_time_scale_mean",
-    "tracking_quality/score_mean": "recovery/tracking_score_mean",
-}
-RECOVERY_ENTRY_RATE_KEY = "fall_recovery/entry_rate"
-RECOVERY_EXIT_RATE_KEY = "fall_recovery/exit_rate"
-RECOVERY_TIMEOUT_RATE_KEY = "fall_recovery/timeout_rate"
-RECOVERY_RATIO_EPS = 1.0e-8
 RELATIVE_ANCHOR_POS_DIM = 3
 PPO_CLIP_RATIO = 0.2
 ENTROPY_COEF = 0.01
+CURRICULUM_METRIC_PREFIX = "curriculum/"
+END_EFFECTOR_TERMINATION_RULE_ID = "end_effector_position_failure"
+END_EFFECTOR_TERMINATION_STATE_KEY = "end_effector_termination_curriculum"
 ANCHOR_CONSOLE_TOP_K = 20
 ANCHOR_DASHBOARD_MAX_RANK_BANDS = 80
 ANCHOR_DASHBOARD_TOP_K = 20
@@ -91,6 +83,27 @@ class AnchorRankBandGrid:
     num_bins: int
     num_motions: int
     num_rank_bands: int
+
+
+@dataclass
+class EndEffectorTerminationCurriculumState:
+    enabled: bool
+    thresholds: tuple[float, ...]
+    stage_index: int
+    current_threshold: float
+    warmup_fraction: float
+    deadline_fraction: float
+    ema_alpha: float
+    end_threshold: float
+    tighten_step: float
+    ema_terminate_rate: float | None = None
+    ema_error_mean: float | None = None
+    ema_sample_count: int = 0
+    ema_error_sample_count: int = 0
+    last_tighten_update: int = 0
+    gate_pass: bool = False
+    deadline_forced: bool = False
+    gate_reason: str = "initial"
 
 
 class StartupTimer:
@@ -178,17 +191,25 @@ class TrainRunner:
             robot_window_length=int(self.actor_config_kwargs["robot_window_length"]),
             motion_window_length=int(self.actor_config_kwargs["motion_window_length"]),
         )
+        self.end_effector_termination_curriculum = self._build_end_effector_termination_curriculum_state(
+            config,
+            checkpoint=self.resume_checkpoint,
+        )
         make_training_kwargs = self._build_make_training_env_kwargs(
             make_training_env,
             window_lengths=self.observation_window_lengths,
             motion_files=self.motion_file_inputs,
-            disable_quality_gate=config.disable_quality_gate,
+            end_effector_termination_curriculum=self.end_effector_termination_curriculum,
         )
         if self.motion_file_inputs is None:
             startup_timer.log("creating training environment with default motion set")
         else:
             startup_timer.log(f"creating training environment with {len(self.motion_file_inputs)} motion input(s)")
         self.env, self.cfg = make_training_env(**make_training_kwargs)
+        self._set_runtime_end_effector_termination_threshold(
+            self.env,
+            self.end_effector_termination_curriculum.current_threshold,
+        )
         startup_timer.log(f"training environment ready with {len(self.cfg.expert_motion_file)} resolved motion clip(s)")
         self.device = normalize_device(self.env.unwrapped.device)
         self.requested_amp = bool(config.use_amp)
@@ -479,11 +500,11 @@ class TrainRunner:
             f"source={self.segment_source} "
             f"motions={len(self.motion_files)} "
             f"anchors={num_anchors_text} "
-            f"temperature={float(getattr(self.cfg, 'failure_temperature', 1.0)):.3g} "
-            f"uniform_mix={float(getattr(self.cfg, 'failure_weight_uniform_mix', 0.0)):.3g} "
-            f"max_uniform_ratio={getattr(self.cfg, 'failure_weight_max_uniform_ratio', None)} "
-            f"exploration_bonus={float(getattr(self.cfg, 'failure_weight_exploration_bonus', 0.0)):.3g} "
-            f"decay={float(getattr(self.cfg, 'failure_decay', 1.0)):.5g}"
+            f"weight_fail={float(getattr(self.cfg, 'weight_fail', 0.0)):.3g} "
+            f"weight_novel={float(getattr(self.cfg, 'weight_novel', 0.0)):.3g} "
+            f"adaptive_alpha={float(getattr(self.cfg, 'adaptive_alpha', 0.0)):.3g} "
+            f"adaptive_uniform={float(getattr(self.cfg, 'adaptive_uniform_ratio', 0.0)):.3g} "
+            f"ramp_s={float(getattr(self.cfg, 'motion_sampling_ramp_s', 0.0)):.3g}"
         )
 
     @staticmethod
@@ -500,20 +521,438 @@ class TrainRunner:
         return "".join(normalized)
 
     @staticmethod
+    def _validate_end_effector_termination_curriculum_config(config: RunConfig) -> None:
+        if config.rollout_steps < 1:
+            raise ValueError("rollout_steps must be positive.")
+        if config.num_updates < 1:
+            raise ValueError("num_updates must be positive.")
+
+        warmup_fraction = float(config.end_effector_termination_warmup_fraction)
+        deadline_fraction = float(config.end_effector_termination_deadline_fraction)
+        if not 0.0 <= warmup_fraction <= deadline_fraction <= 1.0:
+            raise ValueError(
+                "end-effector termination curriculum fractions must satisfy "
+                "0 <= warmup_fraction <= deadline_fraction <= 1."
+            )
+
+        start_threshold = float(config.end_effector_termination_start_threshold)
+        end_threshold = float(config.end_effector_termination_end_threshold)
+        if start_threshold <= 0.0 or end_threshold <= 0.0:
+            raise ValueError("end-effector termination thresholds must be positive.")
+        if start_threshold < end_threshold:
+            raise ValueError("end-effector termination start threshold must be >= end threshold.")
+        if float(config.end_effector_termination_tighten_step) <= 0.0:
+            raise ValueError("end-effector termination tighten step must be positive.")
+        if int(config.end_effector_termination_ema_updates) < 1:
+            raise ValueError("end-effector termination EMA update window must be positive.")
+        if int(config.end_effector_termination_min_ema_samples) < 1:
+            raise ValueError("end-effector termination min EMA samples must be positive.")
+        if int(config.end_effector_termination_hold_updates) < 0:
+            raise ValueError("end-effector termination hold updates must be non-negative.")
+        if float(config.end_effector_termination_max_terminate_rate) < 0.0:
+            raise ValueError("end-effector termination max terminate rate must be non-negative.")
+        if float(config.end_effector_termination_error_margin) < 0.0:
+            raise ValueError("end-effector termination error margin must be non-negative.")
+
+    @staticmethod
+    def _build_end_effector_threshold_stages(
+        *,
+        start_threshold: float,
+        end_threshold: float,
+        tighten_step: float,
+    ) -> tuple[float, ...]:
+        start_threshold = float(start_threshold)
+        end_threshold = float(end_threshold)
+        tighten_step = float(tighten_step)
+        if start_threshold <= end_threshold:
+            return (end_threshold,)
+
+        thresholds = [start_threshold]
+        current = start_threshold
+        while current - tighten_step > end_threshold:
+            current = round(current - tighten_step, 10)
+            thresholds.append(current)
+        if thresholds[-1] != end_threshold:
+            thresholds.append(end_threshold)
+        return tuple(thresholds)
+
+    @staticmethod
+    def _ema_alpha(window_updates: int) -> float:
+        return 2.0 / float(max(1, int(window_updates)) + 1)
+
+    @staticmethod
+    def _update_ema(previous: float | None, value: float, alpha: float) -> float:
+        if previous is None:
+            return float(value)
+        return float(previous) + float(alpha) * (float(value) - float(previous))
+
+    @staticmethod
+    def _coerce_optional_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(scalar):
+            return None
+        return scalar
+
+    @staticmethod
+    def _restore_curriculum_state_payload(checkpoint: CheckpointV2 | None) -> Mapping[str, Any] | None:
+        if checkpoint is None or not checkpoint.training:
+            return None
+        training_state = dict(checkpoint.training)
+        if TrainRunner._training_state_missing_keys(training_state):
+            return None
+        payload = training_state.get(END_EFFECTOR_TERMINATION_STATE_KEY)
+        return payload if isinstance(payload, Mapping) else None
+
+    @classmethod
+    def _build_end_effector_termination_curriculum_state(
+        cls,
+        config: RunConfig,
+        *,
+        checkpoint: CheckpointV2 | None = None,
+    ) -> EndEffectorTerminationCurriculumState:
+        cls._validate_end_effector_termination_curriculum_config(config)
+
+        start_threshold = float(config.end_effector_termination_start_threshold)
+        end_threshold = float(config.end_effector_termination_end_threshold)
+        thresholds = cls._build_end_effector_threshold_stages(
+            start_threshold=start_threshold,
+            end_threshold=end_threshold,
+            tighten_step=float(config.end_effector_termination_tighten_step),
+        )
+        ema_alpha = cls._ema_alpha(int(config.end_effector_termination_ema_updates))
+
+        if not config.end_effector_termination_curriculum_enabled:
+            return EndEffectorTerminationCurriculumState(
+                enabled=False,
+                thresholds=(end_threshold,),
+                stage_index=0,
+                current_threshold=end_threshold,
+                warmup_fraction=float(config.end_effector_termination_warmup_fraction),
+                deadline_fraction=float(config.end_effector_termination_deadline_fraction),
+                ema_alpha=ema_alpha,
+                end_threshold=end_threshold,
+                tighten_step=float(config.end_effector_termination_tighten_step),
+                gate_reason="disabled",
+            )
+
+        restored = cls._restore_curriculum_state_payload(checkpoint)
+        stage_index = 0
+        ema_terminate_rate = None
+        ema_error_mean = None
+        ema_sample_count = 0
+        ema_error_sample_count = 0
+        last_tighten_update = 0
+        gate_reason = "initial"
+        if restored is not None:
+            stage_index = min(max(0, int(restored.get("stage_index", 0))), len(thresholds) - 1)
+            ema_terminate_rate = cls._coerce_optional_float(restored.get("ema_terminate_rate"))
+            ema_error_mean = cls._coerce_optional_float(restored.get("ema_error_mean"))
+            ema_sample_count = max(0, int(restored.get("ema_sample_count", 0)))
+            ema_error_sample_count = max(0, int(restored.get("ema_error_sample_count", 0)))
+            last_tighten_update = max(0, int(restored.get("last_tighten_update", 0)))
+            gate_reason = "restored"
+
+        return EndEffectorTerminationCurriculumState(
+            enabled=True,
+            thresholds=thresholds,
+            stage_index=stage_index,
+            current_threshold=float(thresholds[stage_index]),
+            warmup_fraction=float(config.end_effector_termination_warmup_fraction),
+            deadline_fraction=float(config.end_effector_termination_deadline_fraction),
+            ema_alpha=ema_alpha,
+            end_threshold=end_threshold,
+            tighten_step=float(config.end_effector_termination_tighten_step),
+            ema_terminate_rate=ema_terminate_rate,
+            ema_error_mean=ema_error_mean,
+            ema_sample_count=ema_sample_count,
+            ema_error_sample_count=ema_error_sample_count,
+            last_tighten_update=last_tighten_update,
+            gate_reason=gate_reason,
+        )
+
+    @staticmethod
     def _build_make_training_env_kwargs(
         make_training_env,
         *,
         window_lengths: Mapping[str, int],
         motion_files: list[str] | None,
-        disable_quality_gate: bool = False,
+        end_effector_termination_curriculum: EndEffectorTerminationCurriculumState | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"window_lengths": window_lengths}
-        if disable_quality_gate:
-            kwargs["disable_quality_gate"] = True
+        if end_effector_termination_curriculum is not None:
+            kwargs.update(
+                {
+                    "end_effector_termination_curriculum_enabled": (
+                        end_effector_termination_curriculum.enabled
+                    ),
+                    "end_effector_termination_initial_threshold": (
+                        end_effector_termination_curriculum.current_threshold
+                    ),
+                    "end_effector_termination_end_threshold": (
+                        end_effector_termination_curriculum.end_threshold
+                    ),
+                }
+            )
 
         if motion_files is not None:
             kwargs["motion_files"] = motion_files
         return kwargs
+
+    @staticmethod
+    def _find_end_effector_failure_rule(termination_model: Any) -> Any | None:
+        getter = getattr(termination_model, "get_failure_rule", None)
+        if callable(getter):
+            try:
+                return getter(END_EFFECTOR_TERMINATION_RULE_ID)
+            except (KeyError, ValueError, AttributeError):
+                pass
+
+        for rule in getattr(termination_model, "failure_rules", ()) or ():
+            if str(getattr(rule, "id", "")) == END_EFFECTOR_TERMINATION_RULE_ID:
+                return rule
+        return None
+
+    @classmethod
+    def _set_runtime_end_effector_termination_threshold(cls, env: Any, threshold: float) -> bool:
+        env_unwrapped = getattr(env, "unwrapped", env)
+        threshold_value = float(threshold)
+        updated = False
+
+        termination_model = getattr(env_unwrapped, "termination_model", None)
+        if termination_model is not None:
+            rule = cls._find_end_effector_failure_rule(termination_model)
+            if rule is not None and hasattr(rule, "threshold"):
+                rule.threshold = threshold_value
+                updated = True
+
+        curriculum = getattr(env_unwrapped, "termination_curriculum", None)
+        if curriculum is not None:
+            for attr_name in ("_base_values", "_current_values"):
+                values = getattr(curriculum, attr_name, None)
+                if isinstance(values, dict) and END_EFFECTOR_TERMINATION_RULE_ID in values:
+                    values[END_EFFECTOR_TERMINATION_RULE_ID] = threshold_value
+                    updated = True
+            rules = getattr(curriculum, "_rules", None)
+            if isinstance(rules, dict):
+                rule = rules.get(END_EFFECTOR_TERMINATION_RULE_ID)
+                if rule is not None and hasattr(rule, "threshold"):
+                    rule.threshold = threshold_value
+                    updated = True
+
+        return updated
+
+    def _extract_end_effector_termination_error_mean(self) -> float | None:
+        env_unwrapped = getattr(self.env, "unwrapped", self.env)
+        extras = getattr(env_unwrapped, "extras", None)
+        if isinstance(extras, Mapping):
+            scalar = self._coerce_metric_scalar(extras.get("curriculum/end_effector/error_mean"))
+            if scalar is not None:
+                return scalar
+
+        termination_model = getattr(env_unwrapped, "termination_model", None)
+        if termination_model is None:
+            return None
+        rule = self._find_end_effector_failure_rule(termination_model)
+        if rule is None or not callable(getattr(rule, "error", None)):
+            return None
+        context_builder = getattr(termination_model, "build_context", None)
+        if not callable(context_builder):
+            return None
+
+        try:
+            context = context_builder(
+                getattr(env_unwrapped, "episode_length_buf"),
+                getattr(env_unwrapped, "max_episode_length"),
+                getattr(env_unwrapped, "robot"),
+                getattr(env_unwrapped, "reference_motion"),
+                getattr(env_unwrapped, "sampler"),
+            )
+            error = rule.error(context)
+        except (AttributeError, TypeError, RuntimeError, ValueError):
+            return None
+        return self._coerce_metric_scalar(error)
+
+    @staticmethod
+    def _deadline_stage_index(
+        state: EndEffectorTerminationCurriculumState,
+        *,
+        update_count: int,
+        num_updates: int,
+    ) -> int:
+        final_stage = len(state.thresholds) - 1
+        if final_stage <= 0:
+            return 0
+        deadline_update = int(math.ceil(float(num_updates) * state.deadline_fraction))
+        if update_count < deadline_update:
+            return 0
+        remaining_updates = max(1, int(num_updates) - deadline_update)
+        progress = min(1.0, max(0.0, (int(update_count) - deadline_update) / remaining_updates))
+        return min(final_stage, int(math.ceil(progress * final_stage)))
+
+    def _update_end_effector_curriculum_ema(
+        self,
+        *,
+        terminate_rate: float,
+        error_mean: float | None,
+    ) -> None:
+        state = self.end_effector_termination_curriculum
+        state.ema_terminate_rate = self._update_ema(
+            state.ema_terminate_rate,
+            terminate_rate,
+            state.ema_alpha,
+        )
+        state.ema_sample_count += 1
+        if error_mean is not None:
+            state.ema_error_mean = self._update_ema(
+                state.ema_error_mean,
+                error_mean,
+                state.ema_alpha,
+            )
+            state.ema_error_sample_count += 1
+
+    def _normal_end_effector_gate_passes(self, next_threshold: float) -> tuple[bool, str]:
+        state = self.end_effector_termination_curriculum
+        config = self.config
+        warmup_update = int(math.ceil(int(config.num_updates) * state.warmup_fraction))
+        if self.update_count < warmup_update:
+            return False, "warmup"
+
+        updates_since_tighten = self.update_count - int(state.last_tighten_update)
+        if updates_since_tighten < int(config.end_effector_termination_hold_updates):
+            return False, "min_hold"
+        if state.ema_sample_count < int(config.end_effector_termination_min_ema_samples):
+            return False, "insufficient_samples"
+
+        terminate_ema = state.ema_terminate_rate
+        if terminate_ema is None or terminate_ema > float(config.end_effector_termination_max_terminate_rate):
+            return False, "terminate_rate"
+
+        if state.ema_error_mean is None:
+            if bool(config.end_effector_termination_allow_error_fallback):
+                return True, "passed_terminate_only"
+            return False, "missing_error"
+        if state.ema_error_sample_count < int(config.end_effector_termination_min_ema_samples):
+            return False, "insufficient_error_samples"
+
+        error_limit = float(next_threshold) * float(config.end_effector_termination_error_margin)
+        if state.ema_error_mean > error_limit:
+            return False, "error_mean"
+        return True, "passed"
+
+    def _end_effector_curriculum_metrics_payload(
+        self,
+        *,
+        rollout_terminate_rate: float | None = None,
+        rollout_error_mean: float | None = None,
+    ) -> dict[str, float]:
+        state = self.end_effector_termination_curriculum
+        next_stage = min(state.stage_index + 1, len(state.thresholds) - 1)
+        payload = {
+            "curriculum/end_effector_position_failure": float(state.current_threshold),
+            "curriculum/end_effector/current_threshold": float(state.current_threshold),
+            "curriculum/end_effector/stage_index": float(state.stage_index),
+            "curriculum/end_effector/stage_count": float(len(state.thresholds)),
+            "curriculum/end_effector/next_threshold": float(state.thresholds[next_stage]),
+            "curriculum/end_effector/gate_pass": float(state.gate_pass),
+            "curriculum/end_effector/deadline_forced": float(state.deadline_forced),
+            "curriculum/end_effector/ema_sample_count": float(state.ema_sample_count),
+            "curriculum/end_effector/ema_error_sample_count": float(state.ema_error_sample_count),
+            "curriculum/end_effector/updates_since_tighten": float(
+                self.update_count - int(state.last_tighten_update)
+            ),
+        }
+        if state.ema_terminate_rate is not None:
+            payload["curriculum/end_effector/ema_terminate_rate"] = float(state.ema_terminate_rate)
+        if state.ema_error_mean is not None:
+            payload["curriculum/end_effector/ema_error_mean"] = float(state.ema_error_mean)
+        if rollout_terminate_rate is not None:
+            payload["curriculum/end_effector/terminate_rate"] = float(rollout_terminate_rate)
+        if rollout_error_mean is not None:
+            payload["curriculum/end_effector/error_mean"] = float(rollout_error_mean)
+        return payload
+
+    def _advance_end_effector_termination_curriculum(self) -> None:
+        state = self.end_effector_termination_curriculum
+        if not state.enabled:
+            return
+
+        rollout_metrics = getattr(self, "_last_end_effector_curriculum_rollout_metrics", {})
+        terminate_rate = self._coerce_optional_float(rollout_metrics.get("terminate_rate"))
+        if terminate_rate is None:
+            return
+        error_mean = self._coerce_optional_float(rollout_metrics.get("error_mean"))
+        self._update_end_effector_curriculum_ema(
+            terminate_rate=terminate_rate,
+            error_mean=error_mean,
+        )
+
+        state.gate_pass = False
+        state.deadline_forced = False
+        final_stage = len(state.thresholds) - 1
+        if state.stage_index >= final_stage:
+            state.gate_reason = "final"
+            self._log_metrics(
+                self._end_effector_curriculum_metrics_payload(
+                    rollout_terminate_rate=terminate_rate,
+                    rollout_error_mean=error_mean,
+                )
+            )
+            return
+
+        deadline_stage = self._deadline_stage_index(
+            state,
+            update_count=self.update_count,
+            num_updates=int(self.config.num_updates),
+        )
+        target_stage = state.stage_index
+        if deadline_stage > state.stage_index:
+            target_stage = deadline_stage
+            state.deadline_forced = True
+            state.gate_reason = "deadline"
+        else:
+            next_threshold = state.thresholds[state.stage_index + 1]
+            gate_pass, reason = self._normal_end_effector_gate_passes(next_threshold)
+            state.gate_pass = gate_pass
+            state.gate_reason = reason
+            if gate_pass:
+                target_stage = state.stage_index + 1
+
+        if target_stage > state.stage_index:
+            state.stage_index = min(target_stage, final_stage)
+            state.current_threshold = float(state.thresholds[state.stage_index])
+            state.last_tighten_update = int(self.update_count)
+            self._set_runtime_end_effector_termination_threshold(self.env, state.current_threshold)
+
+        self._log_metrics(
+            self._end_effector_curriculum_metrics_payload(
+                rollout_terminate_rate=terminate_rate,
+                rollout_error_mean=error_mean,
+            )
+        )
+
+    def _end_effector_curriculum_state_dict(self) -> dict[str, Any]:
+        state = self.end_effector_termination_curriculum
+        return {
+            "enabled": bool(state.enabled),
+            "thresholds": list(state.thresholds),
+            "stage_index": int(state.stage_index),
+            "current_threshold": float(state.current_threshold),
+            "warmup_fraction": float(state.warmup_fraction),
+            "deadline_fraction": float(state.deadline_fraction),
+            "end_threshold": float(state.end_threshold),
+            "tighten_step": float(state.tighten_step),
+            "ema_terminate_rate": state.ema_terminate_rate,
+            "ema_error_mean": state.ema_error_mean,
+            "ema_sample_count": int(state.ema_sample_count),
+            "ema_error_sample_count": int(state.ema_error_sample_count),
+            "last_tighten_update": int(state.last_tighten_update),
+            "gate_reason": str(state.gate_reason),
+        }
 
     @staticmethod
     def _split_optimizer_param_groups(
@@ -652,6 +1091,7 @@ class TrainRunner:
                 "enabled": bool(self.use_amp),
                 "dtype": self.amp_dtype,
             },
+            END_EFFECTOR_TERMINATION_STATE_KEY: self._end_effector_curriculum_state_dict(),
             "rng_state": self._capture_rng_state(),
         }
 
@@ -748,59 +1188,27 @@ class TrainRunner:
         return float(tensor.mean().item())
 
     @classmethod
-    def _extract_recovery_metric_sample_from_mapping(cls, payload: Mapping[str, Any] | None) -> dict[str, float]:
+    def _extract_curriculum_metric_sample_from_mapping(cls, payload: Mapping[str, Any] | None) -> dict[str, float]:
         if not isinstance(payload, Mapping):
             return {}
 
         sample: dict[str, float] = {}
         for metric_name, value in cls._iter_metric_items(payload):
             normalized_name = metric_name.strip("/")
-            for source_name in RECOVERY_METRIC_LOG_NAMES:
-                if normalized_name != source_name and not normalized_name.endswith(f"/{source_name}"):
-                    continue
-                scalar = cls._coerce_metric_scalar(value)
-                if scalar is not None:
-                    sample[source_name] = scalar
-                break
+            prefix_index = normalized_name.find(CURRICULUM_METRIC_PREFIX)
+            if prefix_index < 0:
+                continue
+            scalar = cls._coerce_metric_scalar(value)
+            if scalar is None:
+                continue
+            sample[normalized_name[prefix_index:]] = scalar
         return sample
 
-    def _extract_recovery_metric_sample(self, info: Mapping[str, Any] | None) -> dict[str, float]:
-        sample = self._extract_recovery_metric_sample_from_mapping(info)
-        missing_source_names = set(RECOVERY_METRIC_LOG_NAMES) - set(sample)
-        if not missing_source_names:
-            return sample
-
+    def _extract_curriculum_metric_sample(self, info: Mapping[str, Any] | None) -> dict[str, float]:
+        sample = self._extract_curriculum_metric_sample_from_mapping(info)
         extras = getattr(self.env.unwrapped, "extras", None)
-        extras_sample = self._extract_recovery_metric_sample_from_mapping(extras)
-        for source_name in missing_source_names:
-            if source_name in extras_sample:
-                sample[source_name] = extras_sample[source_name]
+        sample.update(self._extract_curriculum_metric_sample_from_mapping(extras))
         return sample
-
-    @staticmethod
-    def _build_recovery_metrics_payload(metric_samples: list[dict[str, float]]) -> dict[str, float]:
-        if not metric_samples:
-            return {}
-
-        payload: dict[str, float] = {}
-        for source_name, log_name in RECOVERY_METRIC_LOG_NAMES.items():
-            values = [sample[source_name] for sample in metric_samples if source_name in sample]
-            if values:
-                payload[log_name] = float(sum(values) / len(values))
-
-        entry_sum = sum(sample.get(RECOVERY_ENTRY_RATE_KEY, 0.0) for sample in metric_samples)
-        exit_sum = sum(sample.get(RECOVERY_EXIT_RATE_KEY, 0.0) for sample in metric_samples)
-        timeout_sum = sum(sample.get(RECOVERY_TIMEOUT_RATE_KEY, 0.0) for sample in metric_samples)
-        if any(
-            key in sample
-            for sample in metric_samples
-            for key in (RECOVERY_ENTRY_RATE_KEY, RECOVERY_EXIT_RATE_KEY, RECOVERY_TIMEOUT_RATE_KEY)
-        ):
-            denominator = max(entry_sum, RECOVERY_RATIO_EPS)
-            payload["recovery/exit_to_entry_ratio"] = float(exit_sum / denominator)
-            payload["recovery/timeout_to_entry_ratio"] = float(timeout_sum / denominator)
-
-        return payload
 
     @staticmethod
     def _build_episode_metrics_payload(mean_return: float, mean_length: float) -> dict[str, float]:
@@ -1043,6 +1451,15 @@ class TrainRunner:
             )
             return cls._as_cpu_tensor(probabilities, dtype=torch.float32).reshape(-1)
 
+        bin_builder = getattr(sampler, "_build_bin_sampling_probabilities", None)
+        if callable(bin_builder):
+            probabilities = bin_builder(
+                fail_counts,
+                sample_counts,
+                eligible_mask=eligible_mask,
+            )
+            return cls._as_cpu_tensor(probabilities, dtype=torch.float32).reshape(-1)
+
         return cls._build_guarded_sampling_probabilities(
             fail_counts,
             sample_counts,
@@ -1090,12 +1507,20 @@ class TrainRunner:
             [cls._as_cpu_tensor(sample_counts, dtype=torch.float32).sum() for sample_counts in bin_sample_counts],
             dim=0,
         )
-        motion_probs = cls._build_sampler_sampling_probabilities(
-            sampler,
-            motion_fail_counts,
-            motion_sample_counts,
-            temperature=temperature,
-        )
+        motion_builder = getattr(sampler, "_build_motion_sampling_probabilities", None)
+        if callable(motion_builder):
+            motion_eligible_mask = getattr(sampler, "motion_reset_eligible", None)
+            motion_probs = cls._as_cpu_tensor(
+                motion_builder(eligible_mask=motion_eligible_mask),
+                dtype=torch.float32,
+            ).reshape(-1)
+        else:
+            motion_probs = cls._build_sampler_sampling_probabilities(
+                sampler,
+                motion_fail_counts,
+                motion_sample_counts,
+                temperature=temperature,
+            )
 
         results: list[dict[str, float | int | str]] = []
         for motion_index, clip in enumerate(clips):
@@ -1145,7 +1570,7 @@ class TrainRunner:
             return []
         return self._compute_anchor_reset_probabilities(
             sampler,
-            temperature=float(getattr(self.cfg, "failure_temperature", 1.0)),
+            temperature=1.0,
         )
 
     @classmethod
@@ -1226,7 +1651,8 @@ class TrainRunner:
         env_unwrapped = getattr(getattr(self, "env", None), "unwrapped", None)
         sampler = getattr(env_unwrapped, "sampler", None)
         cfg = getattr(self, "cfg", None)
-        max_uniform_ratio = getattr(cfg, "failure_weight_max_uniform_ratio", None)
+        weight_fail = float(getattr(cfg, "weight_fail", getattr(sampler, "weight_fail", 0.0)))
+        weight_novel = float(getattr(cfg, "weight_novel", getattr(sampler, "weight_novel", 0.0)))
         metrics = {
             "sampler/config/uses_failure_weighted": float(
                 getattr(self, "sampling_strategy", None) == "failure_weighted"
@@ -1234,13 +1660,29 @@ class TrainRunner:
             "sampler/config/uses_anchor_source": float(getattr(self, "segment_source", None) == "anchor"),
             "sampler/config/motion_count": float(len(getattr(self, "motion_files", []))),
             "sampler/config/anchor_bin_count": float(getattr(sampler, "num_bins", 0) or 0),
-            "sampler/config/failure_temperature": float(getattr(cfg, "failure_temperature", 1.0)),
-            "sampler/config/uniform_mix": float(getattr(cfg, "failure_weight_uniform_mix", 0.0)),
-            "sampler/config/exploration_bonus": float(getattr(cfg, "failure_weight_exploration_bonus", 0.0)),
-            "sampler/config/failure_decay": float(getattr(cfg, "failure_decay", 1.0)),
+            "sampler/config/weight_fail": weight_fail,
+            "sampler/config/weight_novel": weight_novel,
+            "sampler/config/weight_uniform": max(0.0, 1.0 - weight_fail - weight_novel),
+            "sampler/config/cap_beta": float(getattr(cfg, "cap_beta", getattr(sampler, "cap_beta", 0.0))),
+            "sampler/config/adaptive_uniform_ratio": float(
+                getattr(cfg, "adaptive_uniform_ratio", getattr(sampler, "adaptive_uniform_ratio", 0.0))
+            ),
+            "sampler/config/adaptive_alpha": float(
+                getattr(cfg, "adaptive_alpha", getattr(sampler, "adaptive_alpha", 0.0))
+            ),
+            "sampler/config/adaptive_kernel_size": float(
+                getattr(cfg, "adaptive_kernel_size", getattr(sampler, "adaptive_kernel_size", 1))
+            ),
+            "sampler/config/adaptive_lambda": float(
+                getattr(cfg, "adaptive_lambda", getattr(sampler, "adaptive_lambda", 0.0))
+            ),
+            "sampler/config/motion_sampling_warmup_s": float(
+                getattr(cfg, "motion_sampling_warmup_s", getattr(sampler, "motion_sampling_warmup_s", 0.0))
+            ),
+            "sampler/config/motion_sampling_ramp_s": float(
+                getattr(cfg, "motion_sampling_ramp_s", getattr(sampler, "motion_sampling_ramp_s", 0.0))
+            ),
         }
-        if max_uniform_ratio is not None:
-            metrics["sampler/config/max_uniform_ratio"] = float(max_uniform_ratio)
         return metrics
 
     @classmethod
@@ -2006,8 +2448,10 @@ class TrainRunner:
         print(
             f"sampler snapshot after update {self.update_count} step={self.global_step}: "
             f"strategy={self.sampling_strategy} source={self.segment_source} "
-            f"temperature={metrics_payload['sampler/config/failure_temperature']:.3g} "
-            f"uniform_mix={metrics_payload['sampler/config/uniform_mix']:.3g}",
+            f"weight_fail={metrics_payload['sampler/config/weight_fail']:.3g} "
+            f"weight_novel={metrics_payload['sampler/config/weight_novel']:.3g} "
+            f"weight_uniform={metrics_payload['sampler/config/weight_uniform']:.3g} "
+            f"adaptive_alpha={metrics_payload['sampler/config/adaptive_alpha']:.3g}",
             flush=True,
         )
         print(
@@ -2106,7 +2550,9 @@ class TrainRunner:
         return action, log_prob, value
 
     def rollout(self, obs):
-        recovery_metric_samples: list[dict[str, float]] = []
+        latest_curriculum_metrics: dict[str, float] = {}
+        terminate_rate_samples: list[float] = []
+        end_effector_error_samples: list[float] = []
         relative_anchor_pos_samples: list[torch.Tensor] = []
         location_tracking_available = True
         for _ in range(self.steps):
@@ -2115,9 +2561,15 @@ class TrainRunner:
             critic_obs = get_critic_observation(self.critic, obs)
             action, log_prob, value = self.get_action(actor_obs, critic_obs)
             next_obs, task_reward, terminate, timeout, info = self.env.step(action)
-            recovery_metric_sample = self._extract_recovery_metric_sample(info)
-            if recovery_metric_sample:
-                recovery_metric_samples.append(recovery_metric_sample)
+            terminate_rate = self._coerce_metric_scalar(terminate.to(dtype=torch.float32))
+            if terminate_rate is not None:
+                terminate_rate_samples.append(terminate_rate)
+            end_effector_error_mean = self._extract_end_effector_termination_error_mean()
+            if end_effector_error_mean is not None:
+                end_effector_error_samples.append(end_effector_error_mean)
+            curriculum_metric_sample = self._extract_curriculum_metric_sample(info)
+            if curriculum_metric_sample:
+                latest_curriculum_metrics.update(curriculum_metric_sample)
             next_obs = structure_env_observation(
                 next_obs,
                 action_dim=self.cfg.action_space,
@@ -2162,13 +2614,25 @@ class TrainRunner:
             self.rollout_buffer.add_records(records)
             obs = next_obs
 
-        recovery_metrics_payload = self._build_recovery_metrics_payload(recovery_metric_samples)
-        if recovery_metrics_payload:
-            self._log_metrics(recovery_metrics_payload)
+        if latest_curriculum_metrics:
+            self._log_metrics(latest_curriculum_metrics)
         if location_tracking_available:
             location_tracking_payload = self._build_location_tracking_metrics(relative_anchor_pos_samples)
             if location_tracking_payload:
                 self._log_metrics(location_tracking_payload)
+
+        terminate_rate = (
+            float(sum(terminate_rate_samples) / len(terminate_rate_samples)) if terminate_rate_samples else None
+        )
+        error_mean = (
+            float(sum(end_effector_error_samples) / len(end_effector_error_samples))
+            if end_effector_error_samples
+            else None
+        )
+        self._last_end_effector_curriculum_rollout_metrics = {
+            "terminate_rate": terminate_rate,
+            "error_mean": error_mean,
+        }
 
         actor_obs = get_actor_observation(obs, self.actor_type)
         critic_obs = get_critic_observation(self.critic, obs)
@@ -2287,6 +2751,7 @@ class TrainRunner:
             }
         )
         self.update_count += 1
+        self._advance_end_effector_termination_curriculum()
         if self.update_count % self.anchor_log_interval == 0:
             self._log_anchor_reset_probabilities()
 
@@ -2368,7 +2833,7 @@ class TrainRunner:
             "resume_trainer_state_restored": self.resume_trainer_state_restored,
             "segment_source": self.segment_source,
             "sampling_strategy": self.sampling_strategy,
-            "disable_quality_gate": self.config.disable_quality_gate,
+            "end_effector_termination_curriculum": self._end_effector_curriculum_state_dict(),
             "observation_window_lengths": self.observation_window_lengths,
             "num_updates": self.config.num_updates,
             "start_update_count": self.start_update_count,

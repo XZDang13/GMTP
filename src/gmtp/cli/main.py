@@ -84,10 +84,32 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--run-name", default=None)
     train_parser.add_argument("--disable-wandb", action="store_true")
     train_parser.add_argument(
-        "--disable-quality-gate",
+        "--disable-end-effector-termination-curriculum",
         action="store_true",
-        help="Disable the Ref2Act terminal tracking quality gate during training.",
+        help="Disable the performance-gated end-effector termination curriculum and train with the final threshold.",
     )
+    train_parser.add_argument("--end-effector-termination-start-threshold", type=float, default=0.25)
+    train_parser.add_argument("--end-effector-termination-end-threshold", type=float, default=0.10)
+    train_parser.add_argument("--end-effector-termination-tighten-step", type=float, default=0.03)
+    train_parser.add_argument(
+        "--end-effector-termination-warmup-fraction",
+        "--end-effector-termination-start-fraction",
+        dest="end_effector_termination_warmup_fraction",
+        type=float,
+        default=0.20,
+    )
+    train_parser.add_argument(
+        "--end-effector-termination-deadline-fraction",
+        "--end-effector-termination-end-fraction",
+        dest="end_effector_termination_deadline_fraction",
+        type=float,
+        default=0.80,
+    )
+    train_parser.add_argument("--end-effector-termination-ema-updates", type=int, default=20)
+    train_parser.add_argument("--end-effector-termination-min-ema-samples", type=int, default=10)
+    train_parser.add_argument("--end-effector-termination-hold-updates", type=int, default=20)
+    train_parser.add_argument("--end-effector-termination-max-terminate-rate", type=float, default=0.03)
+    train_parser.add_argument("--end-effector-termination-error-margin", type=float, default=0.75)
     train_parser.add_argument("--anchor-log-interval", type=int, default=100)
     train_parser.add_argument("--anchor-heatmap-bins", type=int, default=128)
     _add_disable_amp_argument(train_parser)
@@ -187,7 +209,19 @@ def _run_train(args) -> int:
                 motion_files=args.motion_files,
                 resume_checkpoint_path=args.resume_checkpoint_path,
                 use_amp=not args.disable_amp,
-                disable_quality_gate=args.disable_quality_gate,
+                end_effector_termination_curriculum_enabled=(
+                    not args.disable_end_effector_termination_curriculum
+                ),
+                end_effector_termination_start_threshold=args.end_effector_termination_start_threshold,
+                end_effector_termination_end_threshold=args.end_effector_termination_end_threshold,
+                end_effector_termination_tighten_step=args.end_effector_termination_tighten_step,
+                end_effector_termination_warmup_fraction=args.end_effector_termination_warmup_fraction,
+                end_effector_termination_deadline_fraction=args.end_effector_termination_deadline_fraction,
+                end_effector_termination_ema_updates=args.end_effector_termination_ema_updates,
+                end_effector_termination_min_ema_samples=args.end_effector_termination_min_ema_samples,
+                end_effector_termination_hold_updates=args.end_effector_termination_hold_updates,
+                end_effector_termination_max_terminate_rate=args.end_effector_termination_max_terminate_rate,
+                end_effector_termination_error_margin=args.end_effector_termination_error_margin,
                 rollout_steps=args.rollout_steps,
                 num_updates=args.num_updates,
                 checkpoint_interval=args.checkpoint_interval,

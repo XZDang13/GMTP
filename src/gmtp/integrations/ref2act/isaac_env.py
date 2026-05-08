@@ -5,7 +5,13 @@ from dataclasses import replace
 
 import gymnasium
 
-from .env_cfg import G1MultiMotionEnv, G1MultiMotionTrainingEnv, set_robust_tracking_quality_gate_enabled
+from .env_cfg import (
+    END_EFFECTOR_TERMINATE_END_THRESHOLD,
+    END_EFFECTOR_TERMINATE_START_THRESHOLD,
+    G1MultiMotionEnv,
+    G1MultiMotionTrainingEnv,
+    set_end_effector_termination_threshold,
+)
 from .motion import resolve_motion_files
 from .observation_history import build_gmtp_observation_spec
 
@@ -18,11 +24,22 @@ def make_training_env(
     *,
     window_lengths: Mapping[str, int] | None = None,
     motion_files: list[str] | None = None,
-    disable_quality_gate: bool = False,
+    end_effector_termination_curriculum_enabled: bool = False,
+    end_effector_termination_initial_threshold: float = END_EFFECTOR_TERMINATE_START_THRESHOLD,
+    end_effector_termination_end_threshold: float = END_EFFECTOR_TERMINATE_END_THRESHOLD,
 ):
     cfg = G1MultiMotionTrainingEnv()
-    if disable_quality_gate and hasattr(cfg, "robust_tracking"):
-        cfg.robust_tracking = set_robust_tracking_quality_gate_enabled(cfg.robust_tracking, False)
+    if end_effector_termination_curriculum_enabled and not hasattr(cfg, "termination"):
+        raise ValueError("Ref2Act environment config does not expose termination.")
+    if hasattr(cfg, "termination"):
+        cfg.termination = set_end_effector_termination_threshold(
+            cfg.termination,
+            (
+                end_effector_termination_initial_threshold
+                if end_effector_termination_curriculum_enabled
+                else end_effector_termination_end_threshold
+            ),
+        )
     motion_file_inputs = motion_files if motion_files is not None else cfg.expert_motion_file
     cfg.expert_motion_file = resolve_motion_files(motion_file_inputs)
     cfg.observation = build_gmtp_observation_spec(add_noise=True, window_lengths=window_lengths)
@@ -44,6 +61,11 @@ def make_eval_env(
     cfg.add_reset_noise = False
     cfg.random_start = False
     cfg.events = None
+    if hasattr(cfg, "termination"):
+        cfg.termination = set_end_effector_termination_threshold(
+            cfg.termination,
+            END_EFFECTOR_TERMINATE_END_THRESHOLD,
+        )
     cfg.observation = build_gmtp_observation_spec(add_noise=False, window_lengths=window_lengths)
     cfg.action = replace(cfg.action, buffer_length=1, latency_range=None, noise_scale=0.0)
     cfg.reference_motion_viewer_enabled = show_reference_motion

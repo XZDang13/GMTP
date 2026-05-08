@@ -4,7 +4,9 @@ import sys
 import types
 from dataclasses import dataclass, field, is_dataclass
 
-REF2ACT_ROBUST_REWARD_TERM_IDS = (
+import pytest
+
+REF2ACT_REWARD_TERM_IDS = (
     "multi_scale_anchor_position_reward",
     "multi_scale_anchor_quaternion_reward",
     "multi_scale_key_position_reward",
@@ -60,36 +62,23 @@ def _install_env_cfg_stubs(monkeypatch):
         mode: str = "default"
 
     @dataclass
-    class RecoveryCfg:
-        enabled: bool = False
-
-    @dataclass
     class SceneCfg:
         num_envs: int = 4096
 
-    @dataclass
-    class FallRecoveryCfg:
-        enabled: bool = False
-        reference_time_scale: float = 0.25
+    @dataclass(frozen=True)
+    class TerminationRuleCfg:
+        id: str
+        type: str
+        threshold: float
 
-    @dataclass
-    class FallGuardCfg:
-        enabled: bool = True
-
-    @dataclass
-    class QualityGateCfg:
-        enabled: bool = True
-        soft_threshold: float = 1.0
-        recovery_enter_threshold: float = 1.8
-        hard_tracking_threshold: float | None = 4.0
-        record_soft_violations: bool = False
-
-    @dataclass
-    class RobustTrackingCfg:
-        enabled: bool = False
-        quality_gate: QualityGateCfg = field(default_factory=QualityGateCfg)
-        fall_recovery: FallRecoveryCfg = field(default_factory=FallRecoveryCfg)
-        fall_guard: FallGuardCfg = field(default_factory=FallGuardCfg)
+    @dataclass(frozen=True)
+    class TerminationSpec:
+        failure_rules: tuple[TerminationRuleCfg, ...] = field(
+            default_factory=lambda: (
+                TerminationRuleCfg("anchor_position_failure", "anchor_position_failure", 0.25),
+                TerminationRuleCfg("end_effector_position_failure", "end_effector_position_failure", 0.15),
+            )
+        )
 
     @dataclass(frozen=True)
     class RewardTermCfg:
@@ -102,7 +91,7 @@ def _install_env_cfg_stubs(monkeypatch):
         terms: tuple[RewardTermCfg, ...] = field(
             default_factory=lambda: tuple(
                 RewardTermCfg(id=term_id, type=term_id, weight=1.0)
-                for term_id in REF2ACT_ROBUST_REWARD_TERM_IDS
+                for term_id in REF2ACT_REWARD_TERM_IDS
             )
         )
 
@@ -110,8 +99,8 @@ def _install_env_cfg_stubs(monkeypatch):
     class FakeG1MotionTrackingEnvCfg:
         action = ActionCfg()
         scene = SceneCfg()
-        recovery = RecoveryCfg()
-        robust_tracking = RobustTrackingCfg()
+        termination = TerminationSpec()
+        termination_curriculum = None
         rewards = RewardSpec()
 
     @_configclass
@@ -161,6 +150,13 @@ def _reward_term_ids(env_cfg) -> tuple[str, ...]:
     return tuple(term.id for term in env_cfg.rewards.terms)
 
 
+def _termination_threshold(env_cfg, rule_id: str) -> float:
+    for rule in env_cfg.termination.failure_rules:
+        if rule.id == rule_id:
+            return float(rule.threshold)
+    raise AssertionError(f"Missing termination rule: {rule_id}")
+
+
 def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
     _install_env_cfg_stubs(monkeypatch)
     sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
@@ -175,39 +171,32 @@ def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
         assert training_cfg.sampling_strategy == env_cfg.SamplingStrategy.FailureWeighted
         assert training_cfg.segment_source == env_cfg.SegmentSource.Anchor
         assert training_cfg.init_failure_bins is True
-        assert training_cfg.failure_decay == 0.99
-        assert training_cfg.failure_weight_uniform_mix == 0.35
-        assert training_cfg.failure_weight_max_uniform_ratio == 10.0
-        assert training_cfg.failure_weight_exploration_bonus == 0.10
-        assert training_cfg.failure_temperature == 1.5
+        assert training_cfg.weight_fail == 0.55
+        assert training_cfg.weight_novel == 0.25
+        assert training_cfg.cap_beta == 2.0
+        assert training_cfg.adaptive_uniform_ratio == 0.05
+        assert training_cfg.adaptive_alpha == 0.005
+        assert training_cfg.adaptive_kernel_size == 1
+        assert training_cfg.adaptive_lambda == 0.8
+        assert training_cfg.motion_sampling_warmup_s == 0.0
+        assert training_cfg.motion_sampling_ramp_s == 10.0
+        assert training_cfg.motion_sampling_schedule == "cosine"
         assert training_cfg.scene.num_envs == env_cfg.TRAINING_NUM_ENVS
         assert eval_cfg.scene.num_envs == 4096
-        assert training_cfg.recovery.enabled is False
-        assert eval_cfg.recovery.enabled is False
-        assert training_cfg.robust_tracking.enabled is True
-        assert eval_cfg.robust_tracking.enabled is True
-        assert training_cfg.robust_tracking.quality_gate.enabled is True
-        assert eval_cfg.robust_tracking.quality_gate.enabled is True
-        assert training_cfg.robust_tracking.quality_gate.soft_threshold == env_cfg.TRACKING_QUALITY_SOFT_THRESHOLD
-        assert eval_cfg.robust_tracking.quality_gate.soft_threshold == env_cfg.TRACKING_QUALITY_SOFT_THRESHOLD
-        assert training_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 1.8
-        assert eval_cfg.robust_tracking.quality_gate.hard_tracking_threshold == 1.8
-        assert training_cfg.robust_tracking.quality_gate.record_soft_violations is True
-        assert eval_cfg.robust_tracking.quality_gate.record_soft_violations is True
-        disabled_robust_tracking = env_cfg.set_robust_tracking_quality_gate_enabled(
-            training_cfg.robust_tracking,
-            False,
+        assert _termination_threshold(eval_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.10)
+        assert _termination_threshold(training_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.10)
+        assert _reward_term_ids(training_cfg) == REF2ACT_REWARD_TERM_IDS
+        assert _reward_term_ids(eval_cfg) == REF2ACT_REWARD_TERM_IDS
+
+        loose_termination = env_cfg.set_end_effector_termination_threshold(
+            eval_cfg.termination,
+            0.25,
         )
-        assert disabled_robust_tracking.quality_gate.enabled is False
-        assert disabled_robust_tracking.enabled is True
-        assert training_cfg.robust_tracking.quality_gate.enabled is True
-        assert training_cfg.robust_tracking.fall_recovery.enabled is False
-        assert eval_cfg.robust_tracking.fall_recovery.enabled is False
-        assert training_cfg.robust_tracking.fall_guard.enabled is False
-        assert eval_cfg.robust_tracking.fall_guard.enabled is False
-        assert _reward_term_ids(training_cfg) == REF2ACT_ROBUST_REWARD_TERM_IDS
-        assert _reward_term_ids(eval_cfg) == REF2ACT_ROBUST_REWARD_TERM_IDS
-        assert "tracking_recovery_penalty" not in _reward_term_ids(training_cfg)
+        assert _termination_threshold(
+            types.SimpleNamespace(termination=loose_termination),
+            env_cfg.END_EFFECTOR_TERMINATION_RULE_ID,
+        ) == pytest.approx(0.25)
+
     finally:
         sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
         sys.modules.pop("gmtp.integrations.ref2act", None)
