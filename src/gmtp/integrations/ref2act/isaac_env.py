@@ -20,15 +20,33 @@ ISAAC_EVAL_CAMERA_EYE = (2.0, 2.0, 0.5)
 ISAAC_EVAL_CAMERA_LOOKAT = (0.0, 0.0, 0.0)
 
 
+def _policy_dt_from_cfg(cfg) -> float:
+    sim_cfg = getattr(cfg, "sim", None)
+    sim_dt = float(getattr(sim_cfg, "dt", 1.0 / 200.0))
+    decimation = int(getattr(cfg, "decimation", 1))
+    if sim_dt <= 0.0:
+        raise ValueError("Ref2Act simulation dt must be positive.")
+    if decimation < 1:
+        raise ValueError("Ref2Act decimation must be positive.")
+    return sim_dt * float(decimation)
+
+
 def make_training_env(
     *,
     window_lengths: Mapping[str, int] | None = None,
     motion_files: list[str] | None = None,
+    sampler_failure_warmup_steps: int | None = None,
     end_effector_termination_curriculum_enabled: bool = False,
     end_effector_termination_initial_threshold: float = END_EFFECTOR_TERMINATE_START_THRESHOLD,
     end_effector_termination_end_threshold: float = END_EFFECTOR_TERMINATE_END_THRESHOLD,
 ):
     cfg = G1MultiMotionTrainingEnv()
+    if sampler_failure_warmup_steps is not None:
+        warmup_steps = int(sampler_failure_warmup_steps)
+        if warmup_steps < 0:
+            raise ValueError("sampler_failure_warmup_steps must be non-negative.")
+        cfg.motion_sampling_warmup_s = float(warmup_steps) * _policy_dt_from_cfg(cfg)
+        cfg.motion_sampling_ramp_s = 0.0
     if end_effector_termination_curriculum_enabled and not hasattr(cfg, "termination"):
         raise ValueError("Ref2Act environment config does not expose termination.")
     if hasattr(cfg, "termination"):
@@ -53,6 +71,7 @@ def make_eval_env(
     show_reference_motion: bool = False,
     window_lengths: Mapping[str, int] | None = None,
     render_mode: str | None = None,
+    end_effector_termination_threshold: float | None = None,
 ):
     cfg = G1MultiMotionEnv()
     cfg.expert_motion_file = resolve_motion_files(motion_files)
@@ -62,9 +81,14 @@ def make_eval_env(
     cfg.random_start = False
     cfg.events = None
     if hasattr(cfg, "termination"):
+        termination_threshold = (
+            END_EFFECTOR_TERMINATE_END_THRESHOLD
+            if end_effector_termination_threshold is None
+            else float(end_effector_termination_threshold)
+        )
         cfg.termination = set_end_effector_termination_threshold(
             cfg.termination,
-            END_EFFECTOR_TERMINATE_END_THRESHOLD,
+            termination_threshold,
         )
     cfg.observation = build_gmtp_observation_spec(add_noise=False, window_lengths=window_lengths)
     cfg.action = replace(cfg.action, buffer_length=1, latency_range=None, noise_scale=0.0)

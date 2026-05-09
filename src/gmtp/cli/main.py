@@ -89,27 +89,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the performance-gated end-effector termination curriculum and train with the final threshold.",
     )
     train_parser.add_argument("--end-effector-termination-start-threshold", type=float, default=0.25)
-    train_parser.add_argument("--end-effector-termination-end-threshold", type=float, default=0.10)
+    train_parser.add_argument("--end-effector-termination-end-threshold", type=float, default=0.15)
     train_parser.add_argument("--end-effector-termination-tighten-step", type=float, default=0.03)
     train_parser.add_argument(
         "--end-effector-termination-warmup-fraction",
         "--end-effector-termination-start-fraction",
         dest="end_effector_termination_warmup_fraction",
         type=float,
-        default=0.20,
+        default=0.10,
     )
     train_parser.add_argument(
         "--end-effector-termination-deadline-fraction",
         "--end-effector-termination-end-fraction",
         dest="end_effector_termination_deadline_fraction",
         type=float,
-        default=0.80,
+        default=0.50,
     )
     train_parser.add_argument("--end-effector-termination-ema-updates", type=int, default=20)
     train_parser.add_argument("--end-effector-termination-min-ema-samples", type=int, default=10)
     train_parser.add_argument("--end-effector-termination-hold-updates", type=int, default=20)
     train_parser.add_argument("--end-effector-termination-max-terminate-rate", type=float, default=0.03)
-    train_parser.add_argument("--end-effector-termination-error-margin", type=float, default=0.75)
+    train_parser.add_argument("--end-effector-termination-error-margin", type=float, default=1.10)
+    train_parser.add_argument(
+        "--sampler-failure-warmup-fraction",
+        type=float,
+        default=0.10,
+        help="Use uniform motion/anchor sampling for this fraction of training before failure weighting turns on.",
+    )
     train_parser.add_argument("--anchor-log-interval", type=int, default=100)
     train_parser.add_argument("--anchor-heatmap-bins", type=int, default=128)
     _add_disable_amp_argument(train_parser)
@@ -147,6 +153,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     isaac_parser = eval_subparsers.add_parser("isaac", help="Evaluate a checkpoint in Isaac Lab.")
     isaac_parser.add_argument("--checkpoint", required=True)
+    isaac_parser.add_argument(
+        "--motion-files",
+        nargs="+",
+        default=None,
+        help="Override evaluation motions. Accepts files, directories, or CMU/OMOMO dataset aliases.",
+    )
+    isaac_parser.add_argument(
+        "--end-effector-termination-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Override Isaac eval end-effector termination threshold. "
+            "By default, checkpoint curriculum state is used when available."
+        ),
+    )
     _add_num_blocks_argument(isaac_parser, default=None)
     _add_robot_window_length_argument(isaac_parser, default=None)
     _add_motion_window_length_argument(isaac_parser, default=None)
@@ -222,6 +243,7 @@ def _run_train(args) -> int:
                 end_effector_termination_hold_updates=args.end_effector_termination_hold_updates,
                 end_effector_termination_max_terminate_rate=args.end_effector_termination_max_terminate_rate,
                 end_effector_termination_error_margin=args.end_effector_termination_error_margin,
+                sampler_failure_warmup_fraction=args.sampler_failure_warmup_fraction,
                 rollout_steps=args.rollout_steps,
                 num_updates=args.num_updates,
                 checkpoint_interval=args.checkpoint_interval,
@@ -248,6 +270,8 @@ def _run_eval_isaac(args) -> int:
         IsaacEvalRunner(
             IsaacEvalConfig(
                 checkpoint_path=args.checkpoint,
+                motion_files=args.motion_files,
+                end_effector_termination_threshold=args.end_effector_termination_threshold,
                 num_blocks=args.num_blocks,
                 robot_window_length=args.robot_window_length,
                 motion_window_length=args.motion_window_length,

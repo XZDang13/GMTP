@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import math
 import re
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import gymnasium as gym
 import torch
 
-from gmtp.integrations.ref2act import DEFAULT_EXPERIMENT_MOTION_FILES, infer_motion_files_from_checkpoint, motion_label
+from gmtp.integrations.ref2act import (
+    DEFAULT_EXPERIMENT_MOTION_FILES,
+    infer_motion_files_from_checkpoint,
+    motion_label,
+    resolve_motion_files,
+)
 from gmtp.integrations.ref2act.observation_history import resolve_observation_window_lengths
 from gmtp.models import get_actor_observation
 from gmtp.runtime.checkpoints import load_checkpoint_v2
@@ -34,12 +41,11 @@ class IsaacEvalRunner:
         self.config = config
         self.checkpoint_path = Path(config.checkpoint_path).expanduser().resolve()
         self.checkpoint = load_checkpoint_v2(self.checkpoint_path)
-        self.motion_files = infer_motion_files_from_checkpoint(
-            self.checkpoint_path,
-            self.checkpoint.actor_type,
-            self.checkpoint.env,
-            self.checkpoint.motion_files or DEFAULT_EXPERIMENT_MOTION_FILES,
-        )
+        self.motion_files = self._resolve_motion_files()
+        (
+            self.end_effector_termination_threshold,
+            self.end_effector_termination_threshold_source,
+        ) = self._resolve_end_effector_termination_threshold()
         self.observation_window_lengths = resolve_observation_window_lengths(
             robot_window_length=config.robot_window_length,
             motion_window_length=config.motion_window_length,
@@ -59,6 +65,7 @@ class IsaacEvalRunner:
             show_reference_motion=config.show_reference_motion,
             window_lengths=self.observation_window_lengths,
             render_mode="rgb_array" if config.save_video else None,
+            end_effector_termination_threshold=self.end_effector_termination_threshold,
         )
         self.video_path = self._build_video_path() if config.save_video else None
         if self.video_path is not None:
@@ -103,6 +110,46 @@ class IsaacEvalRunner:
             motion_encoder_type_override=config.motion_encoder_type,
             motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
         )
+
+    def _resolve_motion_files(self) -> list[str]:
+        if self.config.motion_files is not None:
+            return resolve_motion_files(self.config.motion_files)
+        return infer_motion_files_from_checkpoint(
+            self.checkpoint_path,
+            self.checkpoint.actor_type,
+            self.checkpoint.env,
+            self.checkpoint.motion_files or DEFAULT_EXPERIMENT_MOTION_FILES,
+        )
+
+    def _resolve_end_effector_termination_threshold(self) -> tuple[float | None, str]:
+        if self.config.end_effector_termination_threshold is not None:
+            return self._validate_end_effector_termination_threshold(
+                self.config.end_effector_termination_threshold,
+                source="config",
+            ), "config"
+
+        threshold = self._checkpoint_end_effector_termination_threshold()
+        if threshold is None:
+            return None, "isaac_env_default"
+        return self._validate_end_effector_termination_threshold(threshold, source="checkpoint"), "checkpoint"
+
+    def _checkpoint_end_effector_termination_threshold(self) -> float | None:
+        curriculum = self.checkpoint.training.get("end_effector_termination_curriculum")
+        if not isinstance(curriculum, Mapping):
+            return None
+        threshold = curriculum.get("current_threshold")
+        if threshold is None:
+            return None
+        return float(threshold)
+
+    @staticmethod
+    def _validate_end_effector_termination_threshold(value: float, *, source: str) -> float:
+        threshold = float(value)
+        if not math.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError(
+                f"Isaac eval end-effector termination threshold from {source} must be a positive finite value."
+            )
+        return threshold
 
     def _configure_tracking_camera(self) -> None:
         controller = getattr(self.env.unwrapped, "viewport_camera_controller", None)
@@ -296,6 +343,8 @@ class IsaacEvalRunner:
                     "actor_kwargs": self.actor_kwargs,
                     "motion_files": list(self.motion_files),
                     "motion_mae_encoder_checkpoint": self.motion_mae_encoder_checkpoint,
+                    "end_effector_termination_threshold": self.end_effector_termination_threshold,
+                    "end_effector_termination_threshold_source": self.end_effector_termination_threshold_source,
                     "observation_window_lengths": self.observation_window_lengths,
                     "num_steps_requested": self.config.num_steps,
                     "num_steps_executed": step_count,
@@ -320,6 +369,8 @@ class IsaacEvalRunner:
             "actor_kwargs": self.actor_kwargs,
             "motion_files": list(self.motion_files),
             "motion_mae_encoder_checkpoint": self.motion_mae_encoder_checkpoint,
+            "end_effector_termination_threshold": self.end_effector_termination_threshold,
+            "end_effector_termination_threshold_source": self.end_effector_termination_threshold_source,
             "observation_window_lengths": self.observation_window_lengths,
             "num_steps": self.config.num_steps,
             "num_steps_executed": step_count,

@@ -1,4 +1,5 @@
 import json
+import sys
 import types
 
 import numpy as np
@@ -19,6 +20,32 @@ def test_build_episode_metrics_payload_separates_return_and_length_namespaces():
     }
 
 
+def test_build_episode_finish_metrics_payload_reports_terminate_timeout_split():
+    payload = TrainRunner._build_episode_finish_metrics_payload(
+        torch.tensor([True, False, False, True]),
+        torch.tensor([False, True, False, True]),
+    )
+
+    assert payload == pytest.approx(
+        {
+            "episode/finished_count": 3.0,
+            "episode/terminate_count": 2.0,
+            "episode/timeout_count": 2.0,
+            "episode/terminate_ratio": 2.0 / 3.0,
+            "episode/timeout_ratio": 2.0 / 3.0,
+        }
+    )
+
+
+def test_build_episode_finish_metrics_payload_skips_when_no_episode_finished():
+    payload = TrainRunner._build_episode_finish_metrics_payload(
+        torch.tensor([False, False]),
+        torch.tensor([False, False]),
+    )
+
+    assert payload == {}
+
+
 def test_build_end_effector_termination_curriculum_state_uses_performance_gate_defaults():
     config = RunConfig(
         use_wandb=False,
@@ -29,13 +56,31 @@ def test_build_end_effector_termination_curriculum_state_uses_performance_gate_d
     state = TrainRunner._build_end_effector_termination_curriculum_state(config)
 
     assert state.enabled is True
-    assert state.thresholds == pytest.approx((0.25, 0.22, 0.19, 0.16, 0.13, 0.10))
+    assert state.thresholds == pytest.approx((0.25, 0.22, 0.19, 0.16, 0.15))
     assert state.stage_index == 0
     assert state.current_threshold == pytest.approx(0.25)
-    assert state.warmup_fraction == pytest.approx(0.20)
-    assert state.deadline_fraction == pytest.approx(0.80)
+    assert state.warmup_fraction == pytest.approx(0.10)
+    assert state.deadline_fraction == pytest.approx(0.50)
     assert state.ema_alpha == pytest.approx(2.0 / 21.0)
     assert state.last_tighten_update == 0
+
+
+def test_sampler_failure_warmup_steps_uses_training_fraction():
+    config = RunConfig(
+        use_wandb=False,
+        rollout_steps=20,
+        num_updates=1000,
+        sampler_failure_warmup_fraction=0.10,
+    )
+
+    assert TrainRunner._sampler_failure_warmup_steps(config) == 2000
+
+
+def test_sampler_failure_warmup_fraction_must_be_unit_interval():
+    config = RunConfig(use_wandb=False, sampler_failure_warmup_fraction=1.1)
+
+    with pytest.raises(ValueError, match="sampler failure warmup fraction"):
+        TrainRunner._build_end_effector_termination_curriculum_state(config)
 
 
 def test_build_end_effector_termination_curriculum_state_disabled_uses_final_threshold():
@@ -47,8 +92,8 @@ def test_build_end_effector_termination_curriculum_state_disabled_uses_final_thr
     state = TrainRunner._build_end_effector_termination_curriculum_state(config)
 
     assert state.enabled is False
-    assert state.thresholds == pytest.approx((0.10,))
-    assert state.current_threshold == pytest.approx(0.10)
+    assert state.thresholds == pytest.approx((0.15,))
+    assert state.current_threshold == pytest.approx(0.15)
     assert state.gate_reason == "disabled"
 
 
@@ -94,10 +139,10 @@ def test_end_effector_curriculum_deadline_stage_index_ratchets_to_final_stage():
     config = RunConfig(use_wandb=False, num_updates=100)
     state = TrainRunner._build_end_effector_termination_curriculum_state(config)
 
-    assert TrainRunner._deadline_stage_index(state, update_count=79, num_updates=100) == 0
-    assert TrainRunner._deadline_stage_index(state, update_count=80, num_updates=100) == 0
-    assert TrainRunner._deadline_stage_index(state, update_count=84, num_updates=100) == 1
-    assert TrainRunner._deadline_stage_index(state, update_count=100, num_updates=100) == 5
+    assert TrainRunner._deadline_stage_index(state, update_count=49, num_updates=100) == 0
+    assert TrainRunner._deadline_stage_index(state, update_count=50, num_updates=100) == 0
+    assert TrainRunner._deadline_stage_index(state, update_count=60, num_updates=100) == 1
+    assert TrainRunner._deadline_stage_index(state, update_count=100, num_updates=100) == 4
 
 
 def test_set_runtime_end_effector_termination_threshold_updates_model_and_curriculum():
@@ -136,7 +181,7 @@ def test_end_effector_curriculum_gate_decisions_use_warmup_stability_and_error_m
     )
     state = runner.end_effector_termination_curriculum
 
-    runner.update_count = 19
+    runner.update_count = 9
     state.last_tighten_update = 0
     state.ema_sample_count = 10
     state.ema_error_sample_count = 10
@@ -162,10 +207,10 @@ def test_end_effector_curriculum_gate_decisions_use_warmup_stability_and_error_m
     assert runner._normal_end_effector_gate_passes(0.22) == (True, "passed_terminate_only")
 
     state.ema_error_sample_count = 10
-    state.ema_error_mean = 0.22 * 0.75 + 0.001
+    state.ema_error_mean = 0.22 * 1.10 + 0.001
     assert runner._normal_end_effector_gate_passes(0.22) == (False, "error_mean")
 
-    state.ema_error_mean = 0.22 * 0.75
+    state.ema_error_mean = 0.22 * 1.10
     assert runner._normal_end_effector_gate_passes(0.22) == (True, "passed")
 
     state.last_tighten_update = 5
@@ -197,11 +242,11 @@ def test_advance_end_effector_curriculum_uses_deadline_catchup_to_final_threshol
 
     state = runner.end_effector_termination_curriculum
     assert state.stage_index == len(state.thresholds) - 1
-    assert state.current_threshold == pytest.approx(0.10)
+    assert state.current_threshold == pytest.approx(0.15)
     assert state.deadline_forced is True
     assert state.gate_reason == "deadline"
-    assert rule.threshold == pytest.approx(0.10)
-    assert logged_payloads[-1]["curriculum/end_effector/current_threshold"] == pytest.approx(0.10)
+    assert rule.threshold == pytest.approx(0.15)
+    assert logged_payloads[-1]["curriculum/end_effector/current_threshold"] == pytest.approx(0.15)
 
 
 def test_advance_end_effector_curriculum_advances_on_stable_rollout_metrics():
@@ -338,6 +383,53 @@ def test_train_prints_failure_reason_and_reraises(capsys):
     output = capsys.readouterr().out
     assert "training script failed during rollout update 3: RuntimeError: env exploded" in output
     assert runner.env.closed is True
+
+
+def test_sync_latest_checkpoint_to_wandb_uses_single_stable_file(tmp_path, monkeypatch):
+    saved_files = []
+
+    class FakeRun:
+        def __init__(self):
+            self.summary = {}
+
+        def save(self, path, *, base_path=None, policy=None):
+            saved_files.append((path, base_path, policy))
+
+    fake_run = FakeRun()
+    monkeypatch.setitem(sys.modules, "wandb", types.SimpleNamespace(run=fake_run))
+
+    checkpoints_dir = tmp_path / "checkpoints"
+    checkpoints_dir.mkdir()
+    runner = TrainRunner.__new__(TrainRunner)
+    runner.use_wandb = True
+    runner.update_count = 7
+    runner.global_step = 140
+    runner.run_paths = types.SimpleNamespace(root=tmp_path, checkpoints_dir=checkpoints_dir)
+
+    first_checkpoint = checkpoints_dir / "model_0007.pth"
+    first_checkpoint.write_bytes(b"old")
+    runner._sync_latest_checkpoint_to_wandb(first_checkpoint)
+
+    latest_checkpoint = checkpoints_dir / "latest_checkpoint.pth"
+    assert latest_checkpoint.read_bytes() == b"old"
+    assert saved_files == [(str(latest_checkpoint), str(tmp_path), "now")]
+    assert fake_run.summary["checkpoint/latest_local_path"] == str(first_checkpoint)
+    assert fake_run.summary["checkpoint/latest_wandb_file"] == "checkpoints/latest_checkpoint.pth"
+    assert fake_run.summary["checkpoint/latest_update"] == 7
+    assert fake_run.summary["checkpoint/latest_global_step"] == 140
+
+    second_checkpoint = checkpoints_dir / "model_0008.pth"
+    second_checkpoint.write_bytes(b"new")
+    runner.update_count = 8
+    runner.global_step = 160
+    runner._sync_latest_checkpoint_to_wandb(second_checkpoint)
+
+    assert latest_checkpoint.read_bytes() == b"new"
+    assert saved_files[-1] == (str(latest_checkpoint), str(tmp_path), "now")
+    assert {path for path, _, _ in saved_files} == {str(latest_checkpoint)}
+    assert fake_run.summary["checkpoint/latest_local_path"] == str(second_checkpoint)
+    assert fake_run.summary["checkpoint/latest_update"] == 8
+    assert fake_run.summary["checkpoint/latest_global_step"] == 160
 
 
 def test_compute_anchor_reset_probabilities_aggregates_per_anchor_and_keeps_zero_entries():

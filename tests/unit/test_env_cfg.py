@@ -171,20 +171,20 @@ def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
         assert training_cfg.sampling_strategy == env_cfg.SamplingStrategy.FailureWeighted
         assert training_cfg.segment_source == env_cfg.SegmentSource.Anchor
         assert training_cfg.init_failure_bins is True
-        assert training_cfg.weight_fail == 0.55
-        assert training_cfg.weight_novel == 0.25
+        assert training_cfg.weight_fail == 0.60
+        assert training_cfg.weight_novel == 0.20
         assert training_cfg.cap_beta == 2.0
-        assert training_cfg.adaptive_uniform_ratio == 0.05
+        assert training_cfg.adaptive_uniform_ratio == 0.10
         assert training_cfg.adaptive_alpha == 0.005
         assert training_cfg.adaptive_kernel_size == 1
         assert training_cfg.adaptive_lambda == 0.8
         assert training_cfg.motion_sampling_warmup_s == 0.0
-        assert training_cfg.motion_sampling_ramp_s == 10.0
+        assert training_cfg.motion_sampling_ramp_s == 0.0
         assert training_cfg.motion_sampling_schedule == "cosine"
         assert training_cfg.scene.num_envs == env_cfg.TRAINING_NUM_ENVS
         assert eval_cfg.scene.num_envs == 4096
-        assert _termination_threshold(eval_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.10)
-        assert _termination_threshold(training_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.10)
+        assert _termination_threshold(eval_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.15)
+        assert _termination_threshold(training_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.15)
         assert _reward_term_ids(training_cfg) == REF2ACT_REWARD_TERM_IDS
         assert _reward_term_ids(eval_cfg) == REF2ACT_REWARD_TERM_IDS
 

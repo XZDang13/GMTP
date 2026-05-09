@@ -120,6 +120,14 @@ class _CurriculumExtrasTrainEnv(_DummyTrainEnv):
         return obs, reward, terminate, timeout, info
 
 
+class _EpisodeEndTrainEnv(_DummyTrainEnv):
+    def step(self, action):
+        obs, reward, terminate, timeout, info = super().step(action)
+        terminate = torch.tensor([True, False], dtype=torch.bool)
+        timeout = torch.tensor([False, True], dtype=torch.bool)
+        return obs, reward, terminate, timeout, info
+
+
 class _LocationMetricTrainEnv(_DummyTrainEnv):
     def _relative_anchor_pos(self) -> torch.Tensor:
         values = torch.zeros(self.batch_size, 3, dtype=torch.float32)
@@ -178,10 +186,13 @@ def _fake_train_module(env_cls=_DummyTrainEnv):
     def make_training_env(
         window_lengths=None,
         motion_files=None,
+        sampler_failure_warmup_steps=None,
         end_effector_termination_curriculum_enabled=False,
         end_effector_termination_initial_threshold=0.25,
-        end_effector_termination_end_threshold=0.10,
+        end_effector_termination_end_threshold=0.15,
     ):
+        policy_dt = 1.0 / 50.0
+        resolved_sampler_warmup_steps = 0 if sampler_failure_warmup_steps is None else int(sampler_failure_warmup_steps)
         cfg = types.SimpleNamespace(
             scene=types.SimpleNamespace(num_envs=2),
             action_space=2,
@@ -192,15 +203,16 @@ def _fake_train_module(env_cls=_DummyTrainEnv):
             anchor_body_name="torso_link",
             segment_source="Anchor",
             sampling_strategy="FailureWeighted",
-            weight_fail=0.55,
-            weight_novel=0.25,
+            weight_fail=0.60,
+            weight_novel=0.20,
             cap_beta=2.0,
-            adaptive_uniform_ratio=0.05,
+            adaptive_uniform_ratio=0.10,
             adaptive_alpha=0.005,
             adaptive_kernel_size=1,
             adaptive_lambda=0.8,
-            motion_sampling_warmup_s=0.0,
-            motion_sampling_ramp_s=10.0,
+            sampler_failure_warmup_steps=resolved_sampler_warmup_steps,
+            motion_sampling_warmup_s=float(resolved_sampler_warmup_steps) * policy_dt,
+            motion_sampling_ramp_s=0.0,
             motion_sampling_schedule="cosine",
             end_effector_termination_curriculum_enabled=bool(
                 end_effector_termination_curriculum_enabled
@@ -239,8 +251,17 @@ def _fake_structured_critic_train_module():
 
 def _fake_eval_module():
     cfg = types.SimpleNamespace(scene=types.SimpleNamespace(num_envs=1), action_space=2)
-    return types.SimpleNamespace(
-        make_eval_env=lambda motion_files, show_reference_motion=False, window_lengths=None, render_mode=None: (
+
+    def make_eval_env(
+        motion_files,
+        show_reference_motion=False,
+        window_lengths=None,
+        render_mode=None,
+        end_effector_termination_threshold=None,
+    ):
+        cfg.expert_motion_file = list(motion_files)
+        cfg.end_effector_termination_threshold = end_effector_termination_threshold
+        return (
             _DummyTrainEnv(
                 batch_size=1,
                 robot_window_length=_window_length(window_lengths, "projected_gravity", 1),
@@ -248,6 +269,9 @@ def _fake_eval_module():
             ),
             cfg,
         )
+
+    return types.SimpleNamespace(
+        make_eval_env=make_eval_env,
     )
 
 
@@ -260,6 +284,7 @@ def _write_checkpoint(
     motion_encoder_type: str = "transformer",
     motion_obs_dim: int | None = None,
     motion_mae_encoder_checkpoint: str | None = None,
+    training: dict | None = None,
 ):
     motion_obs_dim = motion_obs_dim if motion_obs_dim is not None else _motion_obs_dim(motion_window_length)
     robot_obs_dim = 12 * robot_window_length
@@ -299,6 +324,7 @@ def _write_checkpoint(
         sampling_strategy="failure_weighted",
         motion_mae_encoder_checkpoint=motion_mae_encoder_checkpoint,
         observation_window_lengths=observation_window_lengths or None,
+        training=training,
     )
     return save_checkpoint_v2(checkpoint, tmp_path / "model_v2.pth")
 
@@ -405,15 +431,16 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.disable_wandb is False
     assert args.disable_end_effector_termination_curriculum is False
     assert args.end_effector_termination_start_threshold == pytest.approx(0.25)
-    assert args.end_effector_termination_end_threshold == pytest.approx(0.10)
+    assert args.end_effector_termination_end_threshold == pytest.approx(0.15)
     assert args.end_effector_termination_tighten_step == pytest.approx(0.03)
-    assert args.end_effector_termination_warmup_fraction == pytest.approx(0.20)
-    assert args.end_effector_termination_deadline_fraction == pytest.approx(0.80)
+    assert args.end_effector_termination_warmup_fraction == pytest.approx(0.10)
+    assert args.end_effector_termination_deadline_fraction == pytest.approx(0.50)
     assert args.end_effector_termination_ema_updates == 20
     assert args.end_effector_termination_min_ema_samples == 10
     assert args.end_effector_termination_hold_updates == 20
     assert args.end_effector_termination_max_terminate_rate == pytest.approx(0.03)
-    assert args.end_effector_termination_error_margin == pytest.approx(0.75)
+    assert args.end_effector_termination_error_margin == pytest.approx(1.10)
+    assert args.sampler_failure_warmup_fraction == pytest.approx(0.10)
     assert args.motion_mae_encoder_checkpoint is None
     assert args.motion_files is None
     assert args.resume_checkpoint_path is None
@@ -453,6 +480,8 @@ def test_cli_parser_builds_train_and_eval_commands():
             "0.04",
             "--end-effector-termination-error-margin",
             "0.8",
+            "--sampler-failure-warmup-fraction",
+            "0.2",
         ]
     )
     assert args.disable_end_effector_termination_curriculum is True
@@ -466,6 +495,7 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.end_effector_termination_hold_updates == 7
     assert args.end_effector_termination_max_terminate_rate == pytest.approx(0.04)
     assert args.end_effector_termination_error_margin == pytest.approx(0.8)
+    assert args.sampler_failure_warmup_fraction == pytest.approx(0.2)
 
     args = parser.parse_args(["train", "--anchor-log-interval", "25", "--anchor-heatmap-bins", "64"])
     assert args.anchor_log_interval == 25
@@ -484,9 +514,29 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.command == "eval"
     assert args.eval_target == "isaac"
     assert args.disable_amp is True
+    assert args.motion_files is None
+    assert args.end_effector_termination_threshold is None
     assert args.motion_window_length is None
     assert args.motion_encoder_type is None
     assert args.motion_mae_encoder_checkpoint is None
+
+    args = parser.parse_args(
+        [
+            "eval",
+            "isaac",
+            "--checkpoint",
+            "foo.pth",
+            "--motion-files",
+            "foo",
+            "bar",
+            "--end-effector-termination-threshold",
+            "0.25",
+        ]
+    )
+    assert args.command == "eval"
+    assert args.eval_target == "isaac"
+    assert args.motion_files == ["foo", "bar"]
+    assert args.end_effector_termination_threshold == pytest.approx(0.25)
 
     args = parser.parse_args(
         [
@@ -610,17 +660,22 @@ def test_train_runner_passes_end_effector_termination_curriculum_to_training_env
 
     assert runner.cfg.end_effector_termination_curriculum_enabled is True
     assert runner.cfg.end_effector_termination_initial_threshold == pytest.approx(0.25)
-    assert runner.cfg.end_effector_termination_end_threshold == pytest.approx(0.10)
+    assert runner.cfg.end_effector_termination_end_threshold == pytest.approx(0.15)
     assert runner.end_effector_termination_curriculum.thresholds == pytest.approx(
-        (0.25, 0.22, 0.19, 0.16, 0.13, 0.10)
+        (0.25, 0.22, 0.19, 0.16, 0.15)
     )
+    assert runner.sampler_failure_warmup_steps == 2
+    assert runner.cfg.sampler_failure_warmup_steps == 2
+    assert runner.cfg.motion_sampling_warmup_s == pytest.approx(0.04)
+    assert runner.cfg.motion_sampling_ramp_s == pytest.approx(0.0)
     config_payload = json.loads(runner.run_paths.config_path.read_text(encoding="utf-8"))
     assert config_payload["config"]["end_effector_termination_curriculum_enabled"] is True
     assert config_payload["config"]["end_effector_termination_start_threshold"] == pytest.approx(0.25)
-    assert config_payload["config"]["end_effector_termination_end_threshold"] == pytest.approx(0.10)
+    assert config_payload["config"]["end_effector_termination_end_threshold"] == pytest.approx(0.15)
     assert config_payload["config"]["end_effector_termination_tighten_step"] == pytest.approx(0.03)
-    assert config_payload["config"]["end_effector_termination_warmup_fraction"] == pytest.approx(0.20)
-    assert config_payload["config"]["end_effector_termination_deadline_fraction"] == pytest.approx(0.80)
+    assert config_payload["config"]["end_effector_termination_warmup_fraction"] == pytest.approx(0.10)
+    assert config_payload["config"]["end_effector_termination_deadline_fraction"] == pytest.approx(0.50)
+    assert config_payload["config"]["sampler_failure_warmup_fraction"] == pytest.approx(0.10)
     runner.env.close()
 
 
@@ -635,8 +690,8 @@ def test_train_runner_can_disable_end_effector_termination_curriculum(monkeypatc
     )
 
     assert runner.cfg.end_effector_termination_curriculum_enabled is False
-    assert runner.cfg.end_effector_termination_initial_threshold == pytest.approx(0.10)
-    assert runner.cfg.end_effector_termination_end_threshold == pytest.approx(0.10)
+    assert runner.cfg.end_effector_termination_initial_threshold == pytest.approx(0.15)
+    assert runner.cfg.end_effector_termination_end_threshold == pytest.approx(0.15)
     runner.env.close()
 
 
@@ -726,6 +781,39 @@ def test_train_runner_skips_auxiliary_metric_log_when_unavailable(monkeypatch):
     runner.rollout(runner.initial_obs)
 
     assert logged_payloads == []
+    runner.env.close()
+
+
+def test_train_runner_logs_episode_finish_ratios(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "gmtp.integrations.ref2act.isaac_env",
+        _fake_train_module(_EpisodeEndTrainEnv),
+    )
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=1,
+            num_updates=1,
+        )
+    )
+    logged_payloads = []
+    runner._log_metrics = lambda payload: logged_payloads.append(dict(payload))
+
+    runner.rollout(runner.initial_obs)
+
+    episode_payload = next(payload for payload in logged_payloads if "episode/terminate_ratio" in payload)
+    assert episode_payload == pytest.approx(
+        {
+            "episode/returns": 1.0,
+            "episode/lengths": 1.0,
+            "episode/finished_count": 2.0,
+            "episode/terminate_count": 1.0,
+            "episode/timeout_count": 1.0,
+            "episode/terminate_ratio": 0.5,
+            "episode/timeout_ratio": 0.5,
+        }
+    )
     runner.env.close()
 
 
@@ -1032,12 +1120,13 @@ def test_train_runner_summary_and_checkpoint_record_anchor_sampler_metadata(tmp_
     assert checkpoint.motion_files[0].endswith("jump_anchor.npz")
 
 
-def test_train_runner_uses_failure_weighted_sampling_from_start(monkeypatch):
+def test_train_runner_configures_failure_weighted_sampling_with_warmup(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
     runner = TrainRunner(RunConfig(use_wandb=False))
 
     assert runner.sampling_strategy == "failure_weighted"
     assert runner.cfg.sampling_strategy == "FailureWeighted"
+    assert runner.sampler_failure_warmup_steps == 2000
     runner.env.close()
 
 
@@ -1055,11 +1144,103 @@ def test_isaac_eval_runner_dry_construction(tmp_path, monkeypatch):
     summary = runner.evaluate()
 
     assert runner.motion_files[0].endswith("jump_anchor.npz")
+    assert runner.end_effector_termination_threshold is None
+    assert runner.end_effector_termination_threshold_source == "isaac_env_default"
     assert summary["amp_requested"] is True
     assert summary["amp_enabled"] is False
     assert summary["amp_dtype"] == "float16"
+    assert summary["end_effector_termination_threshold"] is None
+    assert summary["end_effector_termination_threshold_source"] == "isaac_env_default"
     config_payload = json.loads(runner.run_paths.config_path.read_text(encoding="utf-8"))
     assert config_payload["config"]["use_amp"] is True
+
+
+def test_isaac_eval_runner_uses_checkpoint_curriculum_threshold(tmp_path, monkeypatch):
+    motion_file = tmp_path / "curriculum_motion.npz"
+    motion_file.write_bytes(b"")
+    checkpoint_path = _write_checkpoint(
+        tmp_path,
+        motion_files=[str(motion_file)],
+        training={
+            "end_effector_termination_curriculum": {
+                "enabled": True,
+                "current_threshold": 0.25,
+                "end_threshold": 0.10,
+            }
+        },
+    )
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_eval_module())
+    runner = IsaacEvalRunner(
+        IsaacEvalConfig(
+            checkpoint_path=str(checkpoint_path),
+            num_steps=1,
+            progress_interval=0,
+            output_root=str(tmp_path / "runs-curriculum-threshold"),
+        )
+    )
+    summary = runner.evaluate()
+
+    assert runner.end_effector_termination_threshold == pytest.approx(0.25)
+    assert runner.end_effector_termination_threshold_source == "checkpoint"
+    assert runner.cfg.end_effector_termination_threshold == pytest.approx(0.25)
+    assert summary["end_effector_termination_threshold"] == pytest.approx(0.25)
+    assert summary["end_effector_termination_threshold_source"] == "checkpoint"
+
+
+def test_isaac_eval_runner_allows_termination_threshold_override(tmp_path, monkeypatch):
+    motion_file = tmp_path / "override_motion.npz"
+    motion_file.write_bytes(b"")
+    checkpoint_path = _write_checkpoint(
+        tmp_path,
+        motion_files=[str(motion_file)],
+        training={
+            "end_effector_termination_curriculum": {
+                "enabled": True,
+                "current_threshold": 0.25,
+                "end_threshold": 0.10,
+            }
+        },
+    )
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_eval_module())
+    runner = IsaacEvalRunner(
+        IsaacEvalConfig(
+            checkpoint_path=str(checkpoint_path),
+            end_effector_termination_threshold=0.10,
+            num_steps=1,
+            progress_interval=0,
+            output_root=str(tmp_path / "runs-override-threshold"),
+        )
+    )
+    summary = runner.evaluate()
+
+    assert runner.end_effector_termination_threshold == pytest.approx(0.10)
+    assert runner.end_effector_termination_threshold_source == "config"
+    assert runner.cfg.end_effector_termination_threshold == pytest.approx(0.10)
+    assert summary["end_effector_termination_threshold"] == pytest.approx(0.10)
+    assert summary["end_effector_termination_threshold_source"] == "config"
+
+
+def test_isaac_eval_runner_accepts_motion_file_override(tmp_path, monkeypatch):
+    checkpoint_motion_file = tmp_path / "checkpoint_motion.npz"
+    checkpoint_motion_file.write_bytes(b"")
+    checkpoint_path = _write_checkpoint(tmp_path, motion_files=[str(checkpoint_motion_file)])
+    override_motion_file = tmp_path / "120_01_stageii.npz"
+    override_motion_file.write_bytes(b"")
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_eval_module())
+    runner = IsaacEvalRunner(
+        IsaacEvalConfig(
+            checkpoint_path=str(checkpoint_path),
+            motion_files=[str(override_motion_file)],
+            num_steps=1,
+            progress_interval=0,
+            output_root=str(tmp_path / "runs-override"),
+        )
+    )
+    summary = runner.evaluate()
+
+    assert runner.motion_files == [str(override_motion_file.resolve())]
+    assert runner.cfg.expert_motion_file == [str(override_motion_file.resolve())]
+    assert summary["motion_files"] == [str(override_motion_file.resolve())]
 
 
 def test_isaac_eval_runner_supports_actor_integrated_motion_mae(tmp_path, monkeypatch):

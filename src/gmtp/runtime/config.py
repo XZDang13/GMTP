@@ -17,16 +17,17 @@ class RunConfig:
     use_amp: bool = True
     end_effector_termination_curriculum_enabled: bool = True
     end_effector_termination_start_threshold: float = 0.25
-    end_effector_termination_end_threshold: float = 0.10
+    end_effector_termination_end_threshold: float = 0.15
     end_effector_termination_tighten_step: float = 0.03
-    end_effector_termination_warmup_fraction: float = 0.20
-    end_effector_termination_deadline_fraction: float = 0.80
+    end_effector_termination_warmup_fraction: float = 0.10
+    end_effector_termination_deadline_fraction: float = 0.50
     end_effector_termination_ema_updates: int = 20
     end_effector_termination_min_ema_samples: int = 10
     end_effector_termination_hold_updates: int = 20
     end_effector_termination_max_terminate_rate: float = 0.03
-    end_effector_termination_error_margin: float = 0.75
+    end_effector_termination_error_margin: float = 1.10
     end_effector_termination_allow_error_fallback: bool = True
+    sampler_failure_warmup_fraction: float = 0.10
     rollout_steps: int = 20
     num_updates: int = 1000
     checkpoint_interval: int = 4000
@@ -40,6 +41,8 @@ class RunConfig:
 @dataclass(frozen=True)
 class IsaacEvalConfig:
     checkpoint_path: str
+    motion_files: list[str] | None = None
+    end_effector_termination_threshold: float | None = None
     num_blocks: int | None = None
     robot_window_length: int | None = None
     motion_window_length: int | None = None

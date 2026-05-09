@@ -196,6 +196,8 @@ Common Isaac eval options:
 | Option | Default | Use |
 | --- | --- | --- |
 | `--checkpoint PATH` | required | Policy checkpoint to load. |
+| `--motion-files ...` | checkpoint/default inference | Override evaluation motions. |
+| `--end-effector-termination-threshold X` | checkpoint/default inference | Override Isaac eval end-effector termination threshold. |
 | `--num-steps N` | `1000` | Number of simulation steps. |
 | `--progress-interval N` | `50` | Console progress logging interval. |
 | `--show-reference-motion` | off | Show reference motion during evaluation. |
@@ -206,6 +208,7 @@ Common Isaac eval options:
 | `--headless` | off | Passed to Isaac Lab AppLauncher. |
 
 Evaluation restores actor configuration from checkpoint metadata. Use override flags such as `--num-blocks`, `--motion-window-length`, or `--motion-encoder-type` only for compatibility with intentionally overridden checkpoint specs.
+For checkpoints saved during the end-effector termination curriculum, Isaac eval uses the checkpoint's saved current threshold by default; pass `--end-effector-termination-threshold 0.15` to force the final strict threshold.
 
 ## MuJoCo Sim2Sim Evaluation
 

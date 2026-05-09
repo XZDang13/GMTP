@@ -195,10 +195,12 @@ class TrainRunner:
             config,
             checkpoint=self.resume_checkpoint,
         )
+        self.sampler_failure_warmup_steps = self._sampler_failure_warmup_steps(config)
         make_training_kwargs = self._build_make_training_env_kwargs(
             make_training_env,
             window_lengths=self.observation_window_lengths,
             motion_files=self.motion_file_inputs,
+            sampler_failure_warmup_steps=self.sampler_failure_warmup_steps,
             end_effector_termination_curriculum=self.end_effector_termination_curriculum,
         )
         if self.motion_file_inputs is None:
@@ -307,6 +309,7 @@ class TrainRunner:
         self.grad_scaler = build_grad_scaler(self.use_amp)
         self.lr_scheduler = KLAdaptiveLR(self.actor_optimizer, 0.01, min_lr = 5e-6)
         self._restore_resume_checkpoint(startup_timer)
+        self._sync_sampler_global_step()
         self.start_update_count = int(self.update_count)
         self.start_global_step = int(self.global_step)
 
@@ -504,6 +507,7 @@ class TrainRunner:
             f"weight_novel={float(getattr(self.cfg, 'weight_novel', 0.0)):.3g} "
             f"adaptive_alpha={float(getattr(self.cfg, 'adaptive_alpha', 0.0)):.3g} "
             f"adaptive_uniform={float(getattr(self.cfg, 'adaptive_uniform_ratio', 0.0)):.3g} "
+            f"warmup_s={float(getattr(self.cfg, 'motion_sampling_warmup_s', 0.0)):.3g} "
             f"ramp_s={float(getattr(self.cfg, 'motion_sampling_ramp_s', 0.0)):.3g}"
         )
 
@@ -553,6 +557,17 @@ class TrainRunner:
             raise ValueError("end-effector termination max terminate rate must be non-negative.")
         if float(config.end_effector_termination_error_margin) < 0.0:
             raise ValueError("end-effector termination error margin must be non-negative.")
+        sampler_warmup_fraction = float(config.sampler_failure_warmup_fraction)
+        if not 0.0 <= sampler_warmup_fraction <= 1.0:
+            raise ValueError("sampler failure warmup fraction must be in [0, 1].")
+
+    @staticmethod
+    def _sampler_failure_warmup_steps(config: RunConfig) -> int:
+        total_steps = int(config.rollout_steps) * int(config.num_updates)
+        warmup_fraction = float(config.sampler_failure_warmup_fraction)
+        if warmup_fraction <= 0.0:
+            return 0
+        return int(math.ceil(float(total_steps) * warmup_fraction))
 
     @staticmethod
     def _build_end_effector_threshold_stages(
@@ -681,9 +696,12 @@ class TrainRunner:
         *,
         window_lengths: Mapping[str, int],
         motion_files: list[str] | None,
+        sampler_failure_warmup_steps: int | None = None,
         end_effector_termination_curriculum: EndEffectorTerminationCurriculumState | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"window_lengths": window_lengths}
+        if sampler_failure_warmup_steps is not None:
+            kwargs["sampler_failure_warmup_steps"] = int(sampler_failure_warmup_steps)
         if end_effector_termination_curriculum is not None:
             kwargs.update(
                 {
@@ -1082,6 +1100,7 @@ class TrainRunner:
         return {
             "update_count": int(self.update_count),
             "global_step": int(self.global_step),
+            "sampler_failure_warmup_steps": int(self.sampler_failure_warmup_steps),
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "lr_scheduler": self.lr_scheduler.state_dict(),
@@ -1159,6 +1178,11 @@ class TrainRunner:
             f"restored trainer state at update={self.update_count} global_step={self.global_step}"
         )
 
+    def _sync_sampler_global_step(self) -> None:
+        sampler = getattr(getattr(self.env, "unwrapped", None), "sampler", None)
+        if sampler is not None and hasattr(sampler, "_global_step"):
+            sampler._global_step = int(self.global_step)
+
     def _log_metrics(self, payload: dict[str, float]) -> None:
         if self.use_wandb:
             WandbLogger.log_metrics(payload, self.global_step)
@@ -1215,6 +1239,28 @@ class TrainRunner:
         return {
             "episode/returns": float(mean_return),
             "episode/lengths": float(mean_length),
+        }
+
+    @staticmethod
+    def _build_episode_finish_metrics_payload(terminate: Any, timeout: Any) -> dict[str, float]:
+        terminated = torch.as_tensor(terminate, dtype=torch.bool)
+        timed_out = torch.as_tensor(timeout, dtype=torch.bool)
+        if terminated.shape != timed_out.shape:
+            raise ValueError("terminate and timeout tensors must have the same shape.")
+
+        done = terminated | timed_out
+        done_count = float(done.sum().detach().to(device="cpu").item())
+        if done_count <= 0.0:
+            return {}
+
+        terminate_count = float(terminated[done].sum().detach().to(device="cpu").item())
+        timeout_count = float(timed_out[done].sum().detach().to(device="cpu").item())
+        return {
+            "episode/finished_count": done_count,
+            "episode/terminate_count": terminate_count,
+            "episode/timeout_count": timeout_count,
+            "episode/terminate_ratio": terminate_count / done_count,
+            "episode/timeout_ratio": timeout_count / done_count,
         }
 
     @staticmethod
@@ -1681,6 +1727,9 @@ class TrainRunner:
             ),
             "sampler/config/motion_sampling_ramp_s": float(
                 getattr(cfg, "motion_sampling_ramp_s", getattr(sampler, "motion_sampling_ramp_s", 0.0))
+            ),
+            "sampler/config/failure_warmup_steps": float(
+                getattr(self, "sampler_failure_warmup_steps", 0)
             ),
         }
         return metrics
@@ -2592,12 +2641,12 @@ class TrainRunner:
             done = terminate | timeout
 
             if done.any():
-                self._log_metrics(
-                    self._build_episode_metrics_payload(
-                        self.tracker.get_mean("episode_return", done),
-                        self.tracker.get_mean("episode_length", done),
-                    )
+                episode_metrics = self._build_episode_metrics_payload(
+                    self.tracker.get_mean("episode_return", done),
+                    self.tracker.get_mean("episode_length", done),
                 )
+                episode_metrics.update(self._build_episode_finish_metrics_payload(terminate, timeout))
+                self._log_metrics(episode_metrics)
                 self.tracker.reset("episode_return", done)
                 self.tracker.reset("episode_length", done)
 
@@ -2787,7 +2836,45 @@ class TrainRunner:
             artifacts=checkpoint_artifacts,
             training=self._build_training_state(),
         )
-        return save_checkpoint_v2(checkpoint, self.run_paths.checkpoints_dir / f"{checkpoint_name}.pth")
+        checkpoint_path = save_checkpoint_v2(checkpoint, self.run_paths.checkpoints_dir / f"{checkpoint_name}.pth")
+        self._sync_latest_checkpoint_to_wandb(checkpoint_path)
+        return checkpoint_path
+
+    def _sync_latest_checkpoint_to_wandb(self, checkpoint_path: Path) -> None:
+        if not self.use_wandb:
+            return
+
+        try:
+            import wandb
+        except ImportError:
+            return
+
+        run = getattr(wandb, "run", None)
+        if run is None:
+            return
+
+        checkpoint_path = Path(checkpoint_path)
+        latest_checkpoint_path = self.run_paths.checkpoints_dir / "latest_checkpoint.pth"
+        try:
+            if checkpoint_path.resolve() != latest_checkpoint_path.resolve():
+                shutil.copyfile(checkpoint_path, latest_checkpoint_path)
+        except Exception as exc:
+            print(f"failed to prepare latest checkpoint for W&B: {exc}", flush=True)
+            return
+
+        run.summary["checkpoint/latest_local_path"] = str(checkpoint_path)
+        run.summary["checkpoint/latest_wandb_file"] = "checkpoints/latest_checkpoint.pth"
+        run.summary["checkpoint/latest_update"] = int(self.update_count)
+        run.summary["checkpoint/latest_global_step"] = int(self.global_step)
+
+        try:
+            run.save(
+                str(latest_checkpoint_path),
+                base_path=str(self.run_paths.root),
+                policy="now",
+            )
+        except Exception as exc:
+            print(f"failed to sync latest checkpoint to W&B files: {exc}", flush=True)
 
     @staticmethod
     def _format_failure_reason(exc: BaseException) -> str:
@@ -2841,6 +2928,7 @@ class TrainRunner:
             "start_global_step": self.start_global_step,
             "final_global_step": self.global_step,
             "rollout_steps": self.steps,
+            "sampler_failure_warmup_steps": self.sampler_failure_warmup_steps,
             "checkpoint_interval": self.checkpoint_interval,
             "anchor_log_interval": self.anchor_log_interval,
             "anchor_heatmap_bins": self.anchor_heatmap_bins,

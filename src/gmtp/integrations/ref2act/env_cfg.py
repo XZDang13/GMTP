@@ -9,7 +9,7 @@ from .observation_history import build_gmtp_observation_spec
 TRAINING_NUM_ENVS = 4096
 END_EFFECTOR_TERMINATION_RULE_ID = "end_effector_position_failure"
 END_EFFECTOR_TERMINATE_START_THRESHOLD = 0.25
-END_EFFECTOR_TERMINATE_END_THRESHOLD = 0.10
+END_EFFECTOR_TERMINATE_END_THRESHOLD = 0.15
 
 _REF2ACT = load_env_cfg_symbols()
 G1MotionTrackingEnvCfg = _REF2ACT.G1MotionTrackingEnvCfg
@@ -65,14 +65,16 @@ class G1MultiMotionTrainingEnv(G1MultiMotionEnv):
     sampling_strategy = SamplingStrategy.FailureWeighted
     segment_source = SegmentSource.Anchor
     init_failure_bins = True
-    weight_fail = 0.55
-    weight_novel = 0.25
+    # Ref2Act's anchor sampler uses failure EMA counts plus this uniform floor
+    # directly. The training runner overrides warmup_s for the sampler curriculum.
+    weight_fail = 0.6
+    weight_novel = 0.2
     cap_beta = 2.0
-    adaptive_uniform_ratio = 0.05
+    adaptive_uniform_ratio = 0.1
     adaptive_alpha = 0.005
     adaptive_kernel_size = 1
     adaptive_lambda = 0.8
     motion_sampling_warmup_s = 0.0
-    motion_sampling_ramp_s = 10.0
+    motion_sampling_ramp_s = 0.0
     motion_sampling_schedule = "cosine"
     events = G1TrainingEventCfg()
