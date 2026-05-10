@@ -21,13 +21,20 @@ from .critic import (
     get_critic_observation,
     get_critic_records,
 )
-from .pooling import LearnedQueryAttentionPool
+from .pooling import (
+    EncoderPoolingType,
+    LastTokenPool,
+    LearnedQueryAttentionPool,
+    normalize_encoder_pooling_type,
+)
 
 __all__ = [
     "ActorType",
     "ActorFusionType",
     "Critic",
     "FiLMResActor",
+    "EncoderPoolingType",
+    "LastTokenPool",
     "LearnedQueryAttentionPool",
     "build_critic_privilege_layout",
     "build_actor",
@@ -44,4 +51,5 @@ __all__ = [
     "infer_film_res_blocks",
     "normalize_actor_fusion_type",
     "normalize_actor_type",
+    "normalize_encoder_pooling_type",
 ]

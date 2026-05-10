@@ -37,7 +37,7 @@ from gmtp.motion_mae import (
     build_motion_mae_encoder_checkpoint,
     save_motion_mae_encoder_checkpoint,
 )
-from gmtp.models.pooling import LearnedQueryAttentionPool
+from gmtp.models.pooling import LastTokenPool, LearnedQueryAttentionPool
 from gmtp.runtime.checkpoints import CheckpointV2, build_training_checkpoint
 from gmtp.runtime.policy import (
     load_actor_from_checkpoint,
@@ -67,6 +67,20 @@ def _actor_obs_dims(
     motion_dim = build_motion_window_layout(action_dim, motion_window_length).motion_obs_dim
     robot_dim = build_robot_window_layout(action_dim, robot_window_length).robot_obs_dim
     return motion_dim, robot_dim
+
+
+def test_last_token_pool_returns_final_token_and_validates_shape():
+    pool = LastTokenPool(embed_dim=3)
+    tokens = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+
+    torch.testing.assert_close(pool(tokens), tokens[:, -1, :])
+
+    with pytest.raises(ValueError, match="shape"):
+        pool(torch.randn(2, 3))
+    with pytest.raises(ValueError, match="token dim"):
+        pool(torch.randn(2, 4, 2))
+    with pytest.raises(ValueError, match="sequence length"):
+        pool(torch.empty(2, 0, 3))
 
 
 def _motion_mae_schema(
@@ -266,6 +280,7 @@ def test_build_actor_constructs_film_res_with_requested_depth():
         "motion_window_length": 4,
         "motion_encoder_type": "transformer",
         "actor_fusion_type": "concat_mlp",
+        "encoder_pooling_type": "learned",
     }
     assert infer_film_res_blocks(actor.state_dict()) == 4
     assert infer_actor_fusion_type(actor.state_dict()) == "concat_mlp"
@@ -371,6 +386,7 @@ def test_film_res_actor_windowed_robot_encoder_supports_transformer_mode():
     )
 
     assert actor.robot_encoder.robot_encoder_type == "transformer"
+    assert actor.encoder_pooling_type == "learned"
     assert isinstance(actor.robot_encoder.window_encoder.encoder.transformer, nn.TransformerEncoder)
     assert isinstance(actor.robot_encoder.window_encoder.encoder.input_proj, nn.Linear)
     assert isinstance(actor.robot_encoder.window_encoder.pooling, LearnedQueryAttentionPool)
@@ -389,6 +405,7 @@ def test_film_res_actor_windowed_motion_encoder_supports_transformer_mode():
     )
 
     assert actor.motion_encoder.motion_encoder_type == "transformer"
+    assert actor.encoder_pooling_type == "learned"
     assert isinstance(actor.motion_encoder.window_encoder.encoder.transformer, nn.TransformerEncoder)
     assert isinstance(actor.motion_encoder.window_encoder.encoder.input_proj, nn.Linear)
     assert isinstance(actor.motion_encoder.window_encoder.pooling, LearnedQueryAttentionPool)
@@ -423,6 +440,35 @@ def test_motion_transformer_window_encoder_pools_all_time_tokens():
     assert output.shape == (2, MOTION_ENCODER_OUTPUT_DIM)
     assert pool.tokens is not None
     assert pool.tokens.shape == (2, 4, MOTION_ENCODER_HIDDEN_DIM)
+
+
+def test_windowed_actor_supports_last_token_pooling_mode():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(
+        action_dim=2,
+        robot_window_length=4,
+        motion_window_length=4,
+    )
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        robot_window_length=4,
+        motion_window_length=4,
+        encoder_pooling_type="last_token",
+    )
+
+    assert actor.encoder_pooling_type == "last_token"
+    assert actor.robot_encoder.encoder_pooling_type == "last_token"
+    assert actor.motion_encoder.encoder_pooling_type == "last_token"
+    assert isinstance(actor.robot_encoder.window_encoder.pooling, LastTokenPool)
+    assert isinstance(actor.motion_encoder.window_encoder.pooling, LastTokenPool)
+    assert not any(".pooling." in key for key in actor.state_dict())
+    assert get_actor_kwargs(actor, "film_res")["encoder_pooling_type"] == "last_token"
+
+
+def test_window_encoder_rejects_invalid_pooling_mode():
+    with pytest.raises(ValueError, match="encoder pooling type"):
+        RobotWindowEncoder(robot_step_dim=5, robot_window_length=4, encoder_pooling_type="mean")
 
 
 def test_film_res_actor_single_frame_motion_forces_mlp_mode():
@@ -513,6 +559,32 @@ def test_film_res_actor_forward_supports_windowed_motion_obs_with_mae_encoder(tm
     assert all(
         not parameter.requires_grad for parameter in actor.motion_encoder.window_encoder.encoder.parameters()
     )
+
+
+def test_motion_mae_window_encoder_supports_last_token_pooling(tmp_path):
+    checkpoint_path = _write_motion_mae_encoder_checkpoint(tmp_path, action_dim=2, past_frames=4)
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, motion_window_length=4)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        motion_window_length=4,
+        motion_encoder_type="mae",
+        encoder_pooling_type="last_token",
+        motion_mae_encoder_checkpoint=checkpoint_path,
+    )
+
+    step = actor(
+        {
+            "robot_obs": torch.randn(3, robot_obs_dim),
+            "motion_obs": torch.randn(3, 4, actor.motion_step_dim),
+        }
+    )
+
+    assert step.action.shape == (3, 2)
+    assert actor.motion_encoder.motion_encoder_type == "mae"
+    assert isinstance(actor.motion_encoder.window_encoder.pooling, LastTokenPool)
+    assert not any("motion_encoder.window_encoder.pooling." in key for key in actor.state_dict())
 
 
 def test_motion_mae_encoder_rejects_mismatched_past_frames(tmp_path):
@@ -784,6 +856,7 @@ def test_checkpoint_spec_preserves_num_blocks():
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
         "actor_fusion_type": "film",
+        "encoder_pooling_type": "learned",
     }
 
 
@@ -811,6 +884,7 @@ def test_checkpoint_override_replaces_num_blocks():
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
         "actor_fusion_type": "film",
+        "encoder_pooling_type": "learned",
     }
 
 
@@ -838,7 +912,112 @@ def test_checkpoint_spec_defaults_motion_and_robot_window_lengths_when_missing()
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
         "actor_fusion_type": "film",
+        "encoder_pooling_type": "learned",
     }
+
+
+def test_checkpoint_spec_restores_encoder_pooling_type_from_meta():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=3, robot_window_length=4)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=3,
+        num_blocks=2,
+        robot_window_length=4,
+        encoder_pooling_type="last_token",
+    )
+    checkpoint = CheckpointV2(
+        meta={
+            "actor_type": "film_res",
+            "actor_kwargs": {
+                "num_blocks": 2,
+                "robot_window_length": 4,
+                "robot_encoder_type": "transformer",
+                "encoder_pooling_type": "last_token",
+            },
+        },
+        model={"actor": actor.state_dict(), "critic": Critic(obs_dim=3).state_dict()},
+        env={},
+        artifacts={},
+    )
+
+    _, actor_kwargs = resolve_checkpoint_actor_spec(checkpoint)
+
+    assert actor_kwargs["encoder_pooling_type"] == "last_token"
+
+
+def test_load_actor_from_checkpoint_rejects_forced_pooling_mismatch():
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=3, robot_window_length=4)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=3,
+        num_blocks=2,
+        robot_window_length=4,
+        encoder_pooling_type="last_token",
+    )
+    checkpoint = CheckpointV2(
+        meta={
+            "actor_type": "film_res",
+            "actor_kwargs": {
+                "num_blocks": 2,
+                "robot_window_length": 4,
+                "robot_encoder_type": "transformer",
+                "encoder_pooling_type": "last_token",
+            },
+        },
+        model={"actor": actor.state_dict(), "critic": Critic(obs_dim=3).state_dict()},
+        env={},
+        artifacts={},
+    )
+
+    with pytest.raises(RuntimeError, match="pooling"):
+        load_actor_from_checkpoint(
+            checkpoint,
+            obs_dims={"robot": robot_obs_dim, "motion": motion_obs_dim, "policy": motion_obs_dim + robot_obs_dim},
+            action_dim=3,
+            device=torch.device("cpu"),
+            encoder_pooling_type_override="learned",
+        )
+
+
+def test_load_actor_from_checkpoint_rejects_forced_mae_pooling_mismatch(tmp_path):
+    checkpoint_path = _write_motion_mae_encoder_checkpoint(tmp_path, action_dim=2, past_frames=4)
+    motion_obs_dim, robot_obs_dim = _actor_obs_dims(action_dim=2, motion_window_length=4)
+    actor = FiLMResActor(
+        robot_obs_dim=robot_obs_dim,
+        motion_obs_dim=motion_obs_dim,
+        action_dim=2,
+        num_blocks=2,
+        motion_window_length=4,
+        motion_encoder_type="mae",
+        encoder_pooling_type="last_token",
+        motion_mae_encoder_checkpoint=checkpoint_path,
+    )
+    checkpoint = CheckpointV2(
+        meta={
+            "actor_type": "film_res",
+            "actor_kwargs": {
+                "num_blocks": 2,
+                "motion_window_length": 4,
+                "motion_encoder_type": "mae",
+                "encoder_pooling_type": "last_token",
+            },
+        },
+        model={"actor": actor.state_dict(), "critic": Critic(obs_dim=3).state_dict()},
+        env={},
+        artifacts={"motion_mae_encoder_checkpoint": str(checkpoint_path)},
+    )
+
+    with pytest.raises(RuntimeError, match="pooling"):
+        load_actor_from_checkpoint(
+            checkpoint,
+            obs_dims={"robot": robot_obs_dim, "motion": motion_obs_dim, "policy": motion_obs_dim + robot_obs_dim},
+            action_dim=2,
+            device=torch.device("cpu"),
+            encoder_pooling_type_override="learned",
+            motion_mae_encoder_checkpoint=checkpoint_path,
+        )
 
 
 def test_checkpoint_spec_restores_actor_fusion_type_from_meta():
@@ -925,6 +1104,7 @@ def test_load_actor_from_checkpoint_restores_film_res_weights():
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
         "actor_fusion_type": "film",
+        "encoder_pooling_type": "learned",
     }
     torch.testing.assert_close(
         loaded_actor.state_dict()["stack.blocks.0.res_scale"],

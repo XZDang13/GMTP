@@ -100,7 +100,8 @@ def _install_env_cfg_stubs(monkeypatch):
         action = ActionCfg()
         scene = SceneCfg()
         termination = TerminationSpec()
-        termination_curriculum = None
+        curriculum = "base_curriculum"
+        termination_curriculum = "base_termination_curriculum"
         rewards = RewardSpec()
 
     @_configclass
@@ -183,6 +184,10 @@ def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
         assert training_cfg.motion_sampling_schedule == "cosine"
         assert training_cfg.scene.num_envs == env_cfg.TRAINING_NUM_ENVS
         assert eval_cfg.scene.num_envs == 4096
+        assert training_cfg.curriculum is None
+        assert eval_cfg.curriculum is None
+        assert training_cfg.termination_curriculum is None
+        assert eval_cfg.termination_curriculum is None
         assert _termination_threshold(eval_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.15)
         assert _termination_threshold(training_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.15)
         assert _reward_term_ids(training_cfg) == REF2ACT_REWARD_TERM_IDS

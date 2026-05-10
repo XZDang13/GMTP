@@ -286,6 +286,7 @@ class Sim2SimEvalRunner:
             device=self.device,
             num_blocks=config.num_blocks,
             motion_encoder_type_override=config.motion_encoder_type,
+            encoder_pooling_type_override=config.encoder_pooling_type,
             motion_mae_encoder_checkpoint=self.motion_mae_encoder_checkpoint,
         )
         self._print_actor_weight_details()

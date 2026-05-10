@@ -427,9 +427,10 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.motion_window_length == 1
     assert args.motion_encoder_type == "transformer"
     assert args.actor_fusion_type == "film"
+    assert args.encoder_pooling_type == "learned"
     assert args.disable_amp is False
     assert args.disable_wandb is False
-    assert args.disable_end_effector_termination_curriculum is False
+    assert args.end_effector_termination_curriculum_enabled is False
     assert args.end_effector_termination_start_threshold == pytest.approx(0.25)
     assert args.end_effector_termination_end_threshold == pytest.approx(0.15)
     assert args.end_effector_termination_tighten_step == pytest.approx(0.03)
@@ -459,7 +460,7 @@ def test_cli_parser_builds_train_and_eval_commands():
     args = parser.parse_args(
         [
             "train",
-            "--disable-end-effector-termination-curriculum",
+            "--enable-end-effector-termination-curriculum",
             "--end-effector-termination-start-threshold",
             "0.3",
             "--end-effector-termination-end-threshold",
@@ -484,7 +485,7 @@ def test_cli_parser_builds_train_and_eval_commands():
             "0.2",
         ]
     )
-    assert args.disable_end_effector_termination_curriculum is True
+    assert args.end_effector_termination_curriculum_enabled is True
     assert args.end_effector_termination_start_threshold == pytest.approx(0.3)
     assert args.end_effector_termination_end_threshold == pytest.approx(0.12)
     assert args.end_effector_termination_warmup_fraction == pytest.approx(0.1)
@@ -504,6 +505,9 @@ def test_cli_parser_builds_train_and_eval_commands():
     args = parser.parse_args(["train", "--actor-fusion-type", "motion_residual"])
     assert args.actor_fusion_type == "motion_residual"
 
+    args = parser.parse_args(["train", "--encoder-pooling-type", "last_token"])
+    assert args.encoder_pooling_type == "last_token"
+
     args = parser.parse_args(["train", "--motion-files", "CMU/11/11_01_stageii.npz", "env/assests/jump_anchor.npz"])
     assert args.motion_files == ["CMU/11/11_01_stageii.npz", "env/assests/jump_anchor.npz"]
 
@@ -518,6 +522,7 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.end_effector_termination_threshold is None
     assert args.motion_window_length is None
     assert args.motion_encoder_type is None
+    assert args.encoder_pooling_type is None
     assert args.motion_mae_encoder_checkpoint is None
 
     args = parser.parse_args(
@@ -531,12 +536,15 @@ def test_cli_parser_builds_train_and_eval_commands():
             "bar",
             "--end-effector-termination-threshold",
             "0.25",
+            "--encoder-pooling-type",
+            "last_token",
         ]
     )
     assert args.command == "eval"
     assert args.eval_target == "isaac"
     assert args.motion_files == ["foo", "bar"]
     assert args.end_effector_termination_threshold == pytest.approx(0.25)
+    assert args.encoder_pooling_type == "last_token"
 
     args = parser.parse_args(
         [
@@ -562,6 +570,7 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.robot_window_length is None
     assert args.motion_window_length is None
     assert args.motion_encoder_type is None
+    assert args.encoder_pooling_type is None
     assert args.disable_amp is True
     assert args.save_video is False
     assert not hasattr(args, "attn_block_size")
@@ -655,6 +664,7 @@ def test_train_runner_passes_end_effector_termination_curriculum_to_training_env
             use_wandb=False,
             rollout_steps=2,
             num_updates=10,
+            end_effector_termination_curriculum_enabled=True,
         )
     )
 
@@ -702,6 +712,7 @@ def test_train_runner_constructs_film_res_actor(monkeypatch):
             num_blocks=4,
             robot_encoder_type="transformer",
             actor_fusion_type="motion_residual",
+            encoder_pooling_type="last_token",
             use_wandb=False,
         )
     )
@@ -713,6 +724,7 @@ def test_train_runner_constructs_film_res_actor(monkeypatch):
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
         "actor_fusion_type": "motion_residual",
+        "encoder_pooling_type": "last_token",
     }
     assert runner.observation_window_lengths == {
         **build_robot_policy_window_lengths(4),
@@ -888,10 +900,12 @@ def test_train_runner_update_smoke_uses_cpu_fallback(monkeypatch):
 
     assert runner.requested_amp is True
     assert runner.use_amp is False
+    assert hasattr(runner, "optimizer")
     assert hasattr(runner, "actor_optimizer")
     assert hasattr(runner, "critic_optimizer")
-    assert runner.actor_optimizer is not runner.critic_optimizer
-    assert runner.lr_scheduler.optimizer is runner.actor_optimizer
+    assert runner.optimizer is runner.actor_optimizer
+    assert runner.optimizer is runner.critic_optimizer
+    assert runner.lr_scheduler.optimizer is runner.optimizer
     runner.env.close()
 
 
@@ -983,11 +997,14 @@ def test_train_runner_warm_start_keeps_new_structured_critic_when_legacy_flat_cr
 
 def test_train_runner_restores_full_trainer_state_and_runs_additional_updates(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+    motion_file = tmp_path / "resume_motion.npz"
+    motion_file.write_text("stub", encoding="utf-8")
     source_runner = TrainRunner(
         RunConfig(
             use_wandb=False,
             rollout_steps=1,
             num_updates=1,
+            motion_files=[str(motion_file)],
             output_root=str(tmp_path / "source_runs"),
         )
     )
@@ -1017,14 +1034,14 @@ def test_train_runner_restores_full_trainer_state_and_runs_additional_updates(tm
     assert runner.lr_scheduler.state_dict() == checkpoint.training["lr_scheduler"]
     assert runner.grad_scaler.state_dict() == checkpoint.training["grad_scaler"]
 
-    restored_actor_optimizer = runner.actor_optimizer.state_dict()["optimizers"][0]["state"]
-    checkpoint_actor_optimizer = checkpoint.training["actor_optimizer"]["optimizers"][0]["state"]
-    assert restored_actor_optimizer.keys() == checkpoint_actor_optimizer.keys()
-    first_state_key = next(iter(checkpoint_actor_optimizer))
-    for state_name, checkpoint_state_value in checkpoint_actor_optimizer[first_state_key].items():
+    restored_optimizer = runner.optimizer.state_dict()["optimizers"][0]["state"]
+    checkpoint_optimizer = checkpoint.training["optimizer"]["optimizers"][0]["state"]
+    assert restored_optimizer.keys() == checkpoint_optimizer.keys()
+    first_state_key = next(iter(checkpoint_optimizer))
+    for state_name, checkpoint_state_value in checkpoint_optimizer[first_state_key].items():
         if torch.is_tensor(checkpoint_state_value):
             assert torch.equal(
-                restored_actor_optimizer[first_state_key][state_name].detach().cpu(),
+                restored_optimizer[first_state_key][state_name].detach().cpu(),
                 checkpoint_state_value.detach().cpu(),
             )
             break
@@ -1044,6 +1061,47 @@ def test_train_runner_restores_full_trainer_state_and_runs_additional_updates(tm
     assert summary["final_global_step"] == 3
     assert final_checkpoint.training["update_count"] == 3
     assert final_checkpoint.training["global_step"] == 3
+
+
+def test_train_runner_warm_starts_optimizer_from_legacy_separate_optimizer_state(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    motion_file = tmp_path / "legacy_optimizer_motion.npz"
+    motion_file.write_text("stub", encoding="utf-8")
+    legacy_training = {
+        "actor_optimizer": {"optimizers": []},
+        "critic_optimizer": {"optimizers": []},
+        "lr_scheduler": {},
+        "grad_scaler": {},
+        "update_count": 5,
+        "global_step": 100,
+    }
+    checkpoint_path = _write_checkpoint(
+        tmp_path,
+        motion_files=[str(motion_file)],
+        training=legacy_training,
+    )
+    monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
+
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            resume_checkpoint_path=str(checkpoint_path),
+            output_root=str(tmp_path / "legacy_resume_runs"),
+        )
+    )
+    output = capsys.readouterr().out
+
+    assert "separate actor/critic optimizer states" in output
+    assert runner.optimizer is runner.actor_optimizer
+    assert runner.optimizer is runner.critic_optimizer
+    assert runner.resume_mode == "optimizer_warm_start"
+    assert runner.resume_trainer_state_restored is False
+    assert runner.update_count == 5
+    assert runner.global_step == 100
+    runner.env.close()
 
 
 def test_train_runner_logs_anchor_probability_summary_and_heatmap_every_configured_interval(

@@ -12,8 +12,10 @@ from gmtp.models import (
     infer_film_res_blocks,
     normalize_actor_fusion_type,
     normalize_actor_type,
+    normalize_encoder_pooling_type,
 )
 from gmtp.models.motion_encoder import MotionEncoderType, normalize_motion_encoder_type
+from gmtp.models.pooling import EncoderPoolingType
 from gmtp.models.robot_encoder import RobotEncoderType, normalize_robot_encoder_type
 from gmtp.runtime.checkpoints import CheckpointV2
 
@@ -46,6 +48,7 @@ def resolve_checkpoint_actor_spec(
     actor_type_override: str | None = None,
     num_blocks: int | None = None,
     motion_encoder_type_override: str | None = None,
+    encoder_pooling_type_override: str | None = None,
 ) -> tuple[ActorType, dict[str, int | str]]:
     actor_type = normalize_actor_type(actor_type_override or checkpoint.meta.get("actor_type"))
     actor_weights = checkpoint.model["actor"]
@@ -61,6 +64,10 @@ def resolve_checkpoint_actor_spec(
         motion_encoder_type_override or MotionEncoderType.TRANSFORMER.value,
     )
     actor_fusion_type = checkpoint_actor_kwargs.get("actor_fusion_type", infer_actor_fusion_type(actor_weights))
+    requested_encoder_pooling_type = checkpoint_actor_kwargs.get(
+        "encoder_pooling_type",
+        EncoderPoolingType.LEARNED.value,
+    )
     actor_kwargs = {
         "num_blocks": int(
             num_blocks
@@ -80,6 +87,9 @@ def resolve_checkpoint_actor_spec(
             else normalize_motion_encoder_type(motion_encoder_type_override or requested_motion_encoder_type)
         ),
         "actor_fusion_type": str(normalize_actor_fusion_type(actor_fusion_type)),
+        "encoder_pooling_type": str(
+            normalize_encoder_pooling_type(encoder_pooling_type_override or requested_encoder_pooling_type)
+        ),
     }
     return actor_type, actor_kwargs
 
@@ -93,6 +103,7 @@ def load_actor_from_checkpoint(
     actor_type_override: str | None = None,
     num_blocks: int | None = None,
     motion_encoder_type_override: str | None = None,
+    encoder_pooling_type_override: str | None = None,
     motion_mae_encoder_checkpoint: str | Path | None = None,
 ) -> tuple[torch.nn.Module, ActorType, dict[str, int | str]]:
     actor_type, actor_kwargs = resolve_checkpoint_actor_spec(
@@ -100,6 +111,7 @@ def load_actor_from_checkpoint(
         actor_type_override=actor_type_override,
         num_blocks=num_blocks,
         motion_encoder_type_override=motion_encoder_type_override,
+        encoder_pooling_type_override=encoder_pooling_type_override,
     )
     actor = build_actor(
         obs_dims,
@@ -109,28 +121,61 @@ def load_actor_from_checkpoint(
         motion_mae_encoder_checkpoint=motion_mae_encoder_checkpoint,
         device=device,
     ).to(device)
-    load_actor_checkpoint_state(actor, checkpoint.model["actor"])
+    load_actor_checkpoint_state(
+        actor,
+        checkpoint.model["actor"],
+        checkpoint_actor_kwargs=checkpoint.actor_kwargs,
+        encoder_pooling_type_override=encoder_pooling_type_override,
+    )
     actor.eval()
     return actor, actor_type, actor_kwargs
+
+
+def _allows_legacy_missing_policy_mae_pooling(
+    actor: torch.nn.Module,
+    *,
+    checkpoint_actor_kwargs: dict[str, Any] | None,
+    encoder_pooling_type_override: str | None,
+) -> bool:
+    if encoder_pooling_type_override is not None:
+        return False
+    if checkpoint_actor_kwargs is None or "encoder_pooling_type" in checkpoint_actor_kwargs:
+        return False
+
+    motion_encoder = getattr(actor, "motion_encoder", None)
+    return getattr(motion_encoder, "motion_encoder_type", None) == MotionEncoderType.MAE
 
 
 def load_actor_checkpoint_state(
     actor: torch.nn.Module,
     state_dict: dict[str, torch.Tensor],
+    *,
+    checkpoint_actor_kwargs: dict[str, Any] | None = None,
+    encoder_pooling_type_override: str | None = None,
 ) -> Any:
     remapped_state_dict = _remap_legacy_actor_encoder_keys(state_dict)
     incompatible = actor.load_state_dict(remapped_state_dict, strict=False)
-    allowed_missing_prefixes = (
-        "motion_encoder.window_encoder.pooling.",
-        "motion_encoder.window_encoder.output_proj.",
-    )
+    allowed_missing_prefixes = []
+    if _allows_legacy_missing_policy_mae_pooling(
+        actor,
+        checkpoint_actor_kwargs=checkpoint_actor_kwargs,
+        encoder_pooling_type_override=encoder_pooling_type_override,
+    ):
+        allowed_missing_prefixes.extend(
+            (
+                "motion_encoder.window_encoder.pooling.",
+                "motion_encoder.window_encoder.output_proj.",
+            )
+        )
     allowed_unexpected_prefixes = (
         "motion_encoder.window_encoder.latent_pool.",
         "motion_encoder.window_encoder.output_proj.0.",
         "motion_encoder.window_encoder.output_proj.1.",
     )
     disallowed_missing = [
-        key for key in incompatible.missing_keys if not key.startswith(allowed_missing_prefixes)
+        key
+        for key in incompatible.missing_keys
+        if not any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
     ]
     disallowed_unexpected = [
         key for key in incompatible.unexpected_keys if not key.startswith(allowed_unexpected_prefixes)

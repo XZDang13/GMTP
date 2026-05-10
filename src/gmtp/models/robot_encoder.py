@@ -13,7 +13,12 @@ from gmtp.integrations.ref2act.observation_history import (
     build_robot_policy_window_lengths,
 )
 from gmtp.models.layers import MLPLayer, NormPosition
-from gmtp.models.pooling import LearnedQueryAttentionPool
+from gmtp.models.pooling import (
+    EncoderPoolingType,
+    LastTokenPool,
+    LearnedQueryAttentionPool,
+    normalize_encoder_pooling_type,
+)
 
 _OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")
 DEFAULT_OBSERVATION_TERM_REGISTRY = _OBSERVATION_SPEC.DEFAULT_OBSERVATION_TERM_REGISTRY
@@ -189,16 +194,26 @@ class RobotTransformerTokenEncoder(nn.Module):
 
 
 class RobotWindowEncoder(nn.Module):
-    def __init__(self, *, robot_step_dim: int, robot_window_length: int) -> None:
+    def __init__(
+        self,
+        *,
+        robot_step_dim: int,
+        robot_window_length: int,
+        encoder_pooling_type: str | EncoderPoolingType = EncoderPoolingType.LEARNED,
+    ) -> None:
         super().__init__()
+        self.encoder_pooling_type = normalize_encoder_pooling_type(encoder_pooling_type)
         self._encoder = RobotTransformerTokenEncoder(
             robot_step_dim=robot_step_dim,
             robot_window_length=robot_window_length,
         )
-        self.pooling = LearnedQueryAttentionPool(
-            ROBOT_ENCODER_HIDDEN_DIM,
-            ROBOT_ENCODER_TRANSFORMER_HEADS,
-        )
+        if self.encoder_pooling_type is EncoderPoolingType.LEARNED:
+            self.pooling = LearnedQueryAttentionPool(
+                ROBOT_ENCODER_HIDDEN_DIM,
+                ROBOT_ENCODER_TRANSFORMER_HEADS,
+            )
+        else:
+            self.pooling = LastTokenPool(ROBOT_ENCODER_HIDDEN_DIM)
         self.output_proj = nn.Linear(ROBOT_ENCODER_HIDDEN_DIM, ROBOT_ENCODER_OUTPUT_DIM)
 
     @property
@@ -218,6 +233,7 @@ class RobotHistoryEncoder(nn.Module):
         action_dim: int,
         robot_window_length: int,
         robot_encoder_type: str | RobotEncoderType = RobotEncoderType.TRANSFORMER,
+        encoder_pooling_type: str | EncoderPoolingType = EncoderPoolingType.LEARNED,
     ) -> None:
         super().__init__()
 
@@ -233,6 +249,7 @@ class RobotHistoryEncoder(nn.Module):
         self.robot_step_dim = int(self.robot_window_layout.robot_step_dim)
         self.is_windowed = self.robot_window_length > 1
         requested_encoder_type = normalize_robot_encoder_type(robot_encoder_type)
+        self.encoder_pooling_type = normalize_encoder_pooling_type(encoder_pooling_type)
 
         if not self.is_windowed:
             self.robot_encoder_type = RobotEncoderType.MLP
@@ -249,6 +266,7 @@ class RobotHistoryEncoder(nn.Module):
         self.window_encoder = RobotWindowEncoder(
             robot_step_dim=self.robot_step_dim,
             robot_window_length=self.robot_window_length,
+            encoder_pooling_type=self.encoder_pooling_type,
         )
 
     def forward(self, robot_obs: torch.Tensor) -> torch.Tensor:

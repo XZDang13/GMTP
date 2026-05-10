@@ -45,6 +45,15 @@ def _add_actor_fusion_type_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_encoder_pooling_type_argument(parser: argparse.ArgumentParser, *, default) -> None:
+    parser.add_argument(
+        "--encoder-pooling-type",
+        choices=("learned", "last_token"),
+        default=default,
+        help="Pooling used by windowed robot and motion encoders.",
+    )
+
+
 def _add_disable_amp_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--disable-amp", action="store_true", help="Disable CUDA automatic mixed precision.")
 
@@ -64,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_motion_window_length_argument(train_parser, default=1)
     _add_motion_encoder_type_argument(train_parser, default="transformer")
     _add_actor_fusion_type_argument(train_parser)
+    _add_encoder_pooling_type_argument(train_parser, default="learned")
     _add_motion_mae_encoder_checkpoint_argument(train_parser)
     train_parser.add_argument(
         "--motion-files",
@@ -84,9 +94,17 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--run-name", default=None)
     train_parser.add_argument("--disable-wandb", action="store_true")
     train_parser.add_argument(
-        "--disable-end-effector-termination-curriculum",
+        "--enable-end-effector-termination-curriculum",
+        dest="end_effector_termination_curriculum_enabled",
         action="store_true",
-        help="Disable the performance-gated end-effector termination curriculum and train with the final threshold.",
+        default=False,
+        help="Enable the performance-gated end-effector termination curriculum.",
+    )
+    train_parser.add_argument(
+        "--disable-end-effector-termination-curriculum",
+        dest="end_effector_termination_curriculum_enabled",
+        action="store_false",
+        help=argparse.SUPPRESS,
     )
     train_parser.add_argument("--end-effector-termination-start-threshold", type=float, default=0.25)
     train_parser.add_argument("--end-effector-termination-end-threshold", type=float, default=0.15)
@@ -172,6 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_robot_window_length_argument(isaac_parser, default=None)
     _add_motion_window_length_argument(isaac_parser, default=None)
     _add_motion_encoder_type_argument(isaac_parser, default=None)
+    _add_encoder_pooling_type_argument(isaac_parser, default=None)
     _add_motion_mae_encoder_checkpoint_argument(isaac_parser)
     isaac_parser.add_argument("--num-steps", type=int, default=1000)
     isaac_parser.add_argument("--progress-interval", type=int, default=50)
@@ -189,6 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_robot_window_length_argument(sim2sim_parser, default=None)
     _add_motion_window_length_argument(sim2sim_parser, default=None)
     _add_motion_encoder_type_argument(sim2sim_parser, default=None)
+    _add_encoder_pooling_type_argument(sim2sim_parser, default=None)
     _add_motion_mae_encoder_checkpoint_argument(sim2sim_parser)
     sim2sim_parser.add_argument("--num-steps", type=int, default=2000)
     sim2sim_parser.add_argument("--simulation-dt", type=float, default=1 / 200)
@@ -226,13 +246,12 @@ def _run_train(args) -> int:
                 motion_window_length=args.motion_window_length,
                 motion_encoder_type=args.motion_encoder_type,
                 actor_fusion_type=args.actor_fusion_type,
+                encoder_pooling_type=args.encoder_pooling_type,
                 motion_mae_encoder_checkpoint=args.motion_mae_encoder_checkpoint,
                 motion_files=args.motion_files,
                 resume_checkpoint_path=args.resume_checkpoint_path,
                 use_amp=not args.disable_amp,
-                end_effector_termination_curriculum_enabled=(
-                    not args.disable_end_effector_termination_curriculum
-                ),
+                end_effector_termination_curriculum_enabled=args.end_effector_termination_curriculum_enabled,
                 end_effector_termination_start_threshold=args.end_effector_termination_start_threshold,
                 end_effector_termination_end_threshold=args.end_effector_termination_end_threshold,
                 end_effector_termination_tighten_step=args.end_effector_termination_tighten_step,
@@ -276,6 +295,7 @@ def _run_eval_isaac(args) -> int:
                 robot_window_length=args.robot_window_length,
                 motion_window_length=args.motion_window_length,
                 motion_encoder_type=args.motion_encoder_type,
+                encoder_pooling_type=args.encoder_pooling_type,
                 motion_mae_encoder_checkpoint=args.motion_mae_encoder_checkpoint,
                 use_amp=not args.disable_amp,
                 num_steps=args.num_steps,
@@ -302,6 +322,7 @@ def _run_eval_sim2sim(args) -> int:
             robot_window_length=args.robot_window_length,
             motion_window_length=args.motion_window_length,
             motion_encoder_type=args.motion_encoder_type,
+            encoder_pooling_type=args.encoder_pooling_type,
             motion_mae_encoder_checkpoint=args.motion_mae_encoder_checkpoint,
             use_amp=not args.disable_amp,
             num_steps=args.num_steps,

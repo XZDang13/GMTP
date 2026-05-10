@@ -46,11 +46,36 @@ def test_build_episode_finish_metrics_payload_skips_when_no_episode_finished():
     assert payload == {}
 
 
+def test_build_optimizer_collection_uses_adam_for_all_trainable_parameters():
+    actor = torch.nn.Sequential(
+        torch.nn.Linear(3, 4),
+        torch.nn.LayerNorm(4),
+    )
+    critic = torch.nn.Linear(4, 1)
+
+    optimizer, stats = TrainRunner._build_optimizer_collection({"actor": actor, "critic": critic})
+    trainable_parameters = [
+        parameter
+        for module in (actor, critic)
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    ]
+
+    assert len(optimizer.optimizers) == 1
+    assert isinstance(optimizer.optimizers[0], torch.optim.Adam)
+    assert stats == {
+        "adam_tensors": len(trainable_parameters),
+        "adam_numel": sum(parameter.numel() for parameter in trainable_parameters),
+    }
+    assert [group.get("name") for group in optimizer.optimizers[0].param_groups] == ["actor", "critic"]
+
+
 def test_build_end_effector_termination_curriculum_state_uses_performance_gate_defaults():
     config = RunConfig(
         use_wandb=False,
         rollout_steps=2,
         num_updates=100,
+        end_effector_termination_curriculum_enabled=True,
     )
 
     state = TrainRunner._build_end_effector_termination_curriculum_state(config)
@@ -121,7 +146,7 @@ def test_build_end_effector_termination_curriculum_state_restores_checkpoint_gat
     )
 
     state = TrainRunner._build_end_effector_termination_curriculum_state(
-        RunConfig(use_wandb=False),
+        RunConfig(use_wandb=False, end_effector_termination_curriculum_enabled=True),
         checkpoint=checkpoint,
     )
 
@@ -136,7 +161,11 @@ def test_build_end_effector_termination_curriculum_state_restores_checkpoint_gat
 
 
 def test_end_effector_curriculum_deadline_stage_index_ratchets_to_final_stage():
-    config = RunConfig(use_wandb=False, num_updates=100)
+    config = RunConfig(
+        use_wandb=False,
+        num_updates=100,
+        end_effector_termination_curriculum_enabled=True,
+    )
     state = TrainRunner._build_end_effector_termination_curriculum_state(config)
 
     assert TrainRunner._deadline_stage_index(state, update_count=49, num_updates=100) == 0
@@ -173,6 +202,7 @@ def test_end_effector_curriculum_gate_decisions_use_warmup_stability_and_error_m
     runner.config = RunConfig(
         use_wandb=False,
         num_updates=100,
+        end_effector_termination_curriculum_enabled=True,
         end_effector_termination_hold_updates=20,
         end_effector_termination_min_ema_samples=10,
     )
@@ -220,7 +250,11 @@ def test_end_effector_curriculum_gate_decisions_use_warmup_stability_and_error_m
 
 def test_advance_end_effector_curriculum_uses_deadline_catchup_to_final_threshold():
     runner = TrainRunner.__new__(TrainRunner)
-    runner.config = RunConfig(use_wandb=False, num_updates=100)
+    runner.config = RunConfig(
+        use_wandb=False,
+        num_updates=100,
+        end_effector_termination_curriculum_enabled=True,
+    )
     runner.end_effector_termination_curriculum = (
         TrainRunner._build_end_effector_termination_curriculum_state(runner.config)
     )
@@ -254,6 +288,7 @@ def test_advance_end_effector_curriculum_advances_on_stable_rollout_metrics():
     runner.config = RunConfig(
         use_wandb=False,
         num_updates=100,
+        end_effector_termination_curriculum_enabled=True,
         end_effector_termination_min_ema_samples=1,
         end_effector_termination_hold_updates=0,
     )

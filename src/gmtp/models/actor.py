@@ -20,6 +20,7 @@ from .motion_encoder import (
     normalize_motion_encoder_type,
     reshape_motion_history,
 )
+from .pooling import EncoderPoolingType, normalize_encoder_pooling_type
 from .robot_encoder import (
     RobotHistoryEncoder,
     RobotEncoderType,
@@ -106,6 +107,7 @@ class FiLMResActor(nn.Module):
         motion_window_length: int = 1,
         motion_encoder_type: str | MotionEncoderType = MotionEncoderType.TRANSFORMER,
         actor_fusion_type: str | ActorFusionType = ActorFusionType.FILM,
+        encoder_pooling_type: str | EncoderPoolingType = EncoderPoolingType.LEARNED,
         motion_mae_encoder_checkpoint: str | Path | None = None,
         device: torch.device | str = "cpu",
     ):
@@ -136,6 +138,7 @@ class FiLMResActor(nn.Module):
         self.motion_obs_normlizer = Normalizer(motion_normalizer_shape)
         self.num_blocks = num_blocks
         self.actor_fusion_type = normalize_actor_fusion_type(actor_fusion_type)
+        self.encoder_pooling_type = normalize_encoder_pooling_type(encoder_pooling_type)
         self.robot_step_dim = self.robot_window_layout.robot_step_dim
         self.motion_step_dim = self.motion_window_layout.motion_step_dim
         self.robot_encoder_type = (
@@ -153,12 +156,14 @@ class FiLMResActor(nn.Module):
             action_dim=action_dim,
             robot_window_length=self.robot_window_length,
             robot_encoder_type=self.robot_encoder_type,
+            encoder_pooling_type=self.encoder_pooling_type,
         )
         self.motion_encoder = MotionHistoryEncoder(
             motion_obs_dim=motion_obs_dim,
             action_dim=action_dim,
             motion_window_length=self.motion_window_length,
             motion_encoder_type=self.motion_encoder_type,
+            encoder_pooling_type=self.encoder_pooling_type,
             motion_mae_encoder_checkpoint=motion_mae_encoder_checkpoint,
             device=device,
         )
@@ -227,6 +232,7 @@ def build_actor(
         motion_window_length=int(actor_kwargs.get("motion_window_length", 1)),
         motion_encoder_type=str(actor_kwargs.get("motion_encoder_type", MotionEncoderType.TRANSFORMER.value)),
         actor_fusion_type=str(actor_kwargs.get("actor_fusion_type", ActorFusionType.FILM.value)),
+        encoder_pooling_type=str(actor_kwargs.get("encoder_pooling_type", EncoderPoolingType.LEARNED.value)),
         motion_mae_encoder_checkpoint=motion_mae_encoder_checkpoint,
         device=device,
     )
@@ -244,6 +250,7 @@ def get_actor_kwargs(
         "motion_window_length": int(actor.motion_window_length),
         "motion_encoder_type": str(actor.motion_encoder_type),
         "actor_fusion_type": str(actor.actor_fusion_type),
+        "encoder_pooling_type": str(actor.encoder_pooling_type),
     }
 
 

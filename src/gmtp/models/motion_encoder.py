@@ -14,7 +14,12 @@ from gmtp.integrations.ref2act.observation_history import (
     build_motion_policy_window_lengths,
 )
 from gmtp.models.layers import MLPLayer, NormPosition
-from gmtp.models.pooling import LearnedQueryAttentionPool
+from gmtp.models.pooling import (
+    EncoderPoolingType,
+    LastTokenPool,
+    LearnedQueryAttentionPool,
+    normalize_encoder_pooling_type,
+)
 from gmtp.motion_mae import build_frozen_motion_mae_encoder
 
 _OBSERVATION_SPEC = _import_module("ref2act.common.observation_spec")
@@ -23,7 +28,7 @@ ObservationLayout = _OBSERVATION_SPEC.ObservationLayout
 
 MOTION_ENCODER_HIDDEN_DIM = 128
 MOTION_ENCODER_OUTPUT_DIM = 512
-MOTION_ENCODER_TRANSFORMER_HEADS = 4
+MOTION_ENCODER_TRANSFORMER_HEADS = 8
 MOTION_ENCODER_TRANSFORMER_LAYERS = 1
 MOTION_ENCODER_FEEDFORWARD_DIM = 256
 
@@ -201,11 +206,13 @@ class MotionWindowEncoder(nn.Module):
         motion_step_dim: int,
         motion_window_length: int,
         motion_encoder_type: MotionEncoderType,
+        encoder_pooling_type: str | EncoderPoolingType = EncoderPoolingType.LEARNED,
         checkpoint_path: str | Path | None = None,
         device: torch.device | str,
     ) -> None:
         super().__init__()
         self.motion_encoder_type = motion_encoder_type
+        self.encoder_pooling_type = normalize_encoder_pooling_type(encoder_pooling_type)
         self._encoder_is_registered = motion_encoder_type != MotionEncoderType.MAE
 
         if motion_encoder_type == MotionEncoderType.MAE:
@@ -243,10 +250,13 @@ class MotionWindowEncoder(nn.Module):
             token_dim = MOTION_ENCODER_HIDDEN_DIM
             num_heads = MOTION_ENCODER_TRANSFORMER_HEADS
 
-        self.pooling = LearnedQueryAttentionPool(
-            token_dim,
-            num_heads,
-        )
+        if self.encoder_pooling_type is EncoderPoolingType.LEARNED:
+            self.pooling = LearnedQueryAttentionPool(
+                token_dim,
+                num_heads,
+            )
+        else:
+            self.pooling = LastTokenPool(token_dim)
         self.output_proj = nn.Linear(token_dim, MOTION_ENCODER_OUTPUT_DIM)
 
     @property
@@ -277,6 +287,7 @@ class MotionHistoryEncoder(nn.Module):
         action_dim: int,
         motion_window_length: int,
         motion_encoder_type: str | MotionEncoderType = MotionEncoderType.TRANSFORMER,
+        encoder_pooling_type: str | EncoderPoolingType = EncoderPoolingType.LEARNED,
         motion_mae_encoder_checkpoint: str | Path | None = None,
         device: torch.device | str = "cpu",
     ) -> None:
@@ -294,6 +305,7 @@ class MotionHistoryEncoder(nn.Module):
         self.motion_step_dim = int(self.motion_window_layout.motion_step_dim)
         self.is_windowed = self.motion_window_length > 1
         requested_encoder_type = normalize_motion_encoder_type(motion_encoder_type)
+        self.encoder_pooling_type = normalize_encoder_pooling_type(encoder_pooling_type)
 
         if not self.is_windowed:
             self.motion_encoder_type = MotionEncoderType.MLP
@@ -312,6 +324,7 @@ class MotionHistoryEncoder(nn.Module):
             motion_step_dim=self.motion_step_dim,
             motion_window_length=self.motion_window_length,
             motion_encoder_type=self.motion_encoder_type,
+            encoder_pooling_type=self.encoder_pooling_type,
             checkpoint_path=motion_mae_encoder_checkpoint,
             device=device,
         )

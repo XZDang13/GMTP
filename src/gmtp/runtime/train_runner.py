@@ -59,13 +59,13 @@ ANCHOR_DASHBOARD_MAX_RANK_BANDS = 80
 ANCHOR_DASHBOARD_TOP_K = 20
 ANCHOR_DASHBOARD_LABEL_CHARS = 34
 REQUIRED_TRAINER_STATE_KEYS = (
-    "actor_optimizer",
-    "critic_optimizer",
     "lr_scheduler",
     "grad_scaler",
     "update_count",
     "global_step",
 )
+OPTIMIZER_STATE_KEY = "optimizer"
+LEGACY_OPTIMIZER_STATE_KEYS = ("actor_optimizer", "critic_optimizer")
 
 
 @dataclass(frozen=True)
@@ -267,7 +267,8 @@ class TrainRunner:
             f"robot_encoder={self.actor_config_kwargs['robot_encoder_type']} "
             f"robot_window={self.actor_config_kwargs['robot_window_length']} "
             f"motion_encoder={self.actor_config_kwargs['motion_encoder_type']} "
-            f"motion_window={self.actor_config_kwargs['motion_window_length']}"
+            f"motion_window={self.actor_config_kwargs['motion_window_length']} "
+            f"encoder_pooling={self.actor_config_kwargs['encoder_pooling_type']}"
         )
         if self.motion_mae_encoder_checkpoint is not None:
             startup_timer.log(f"loading Motion MAE encoder checkpoint {self.motion_mae_encoder_checkpoint}")
@@ -298,16 +299,13 @@ class TrainRunner:
         startup_timer.log(f"critic model ready: type={self.critic.critic_type}")
         startup_timer.log("creating optimizers and rollout storage")
 
-        self.actor_optimizer, actor_optimizer_stats = self._build_optimizer_collection(
-            {"actor": self.actor},
-            prefer_muon=self.device.type == "cuda",
+        self.optimizer, optimizer_stats = self._build_optimizer_collection(
+            {"actor": self.actor, "critic": self.critic}
         )
-        self.critic_optimizer, critic_optimizer_stats = self._build_optimizer_collection(
-            {"critic": self.critic},
-            prefer_muon=self.device.type == "cuda",
-        )
+        self.actor_optimizer = self.optimizer
+        self.critic_optimizer = self.optimizer
         self.grad_scaler = build_grad_scaler(self.use_amp)
-        self.lr_scheduler = KLAdaptiveLR(self.actor_optimizer, 0.01, min_lr = 5e-6)
+        self.lr_scheduler = KLAdaptiveLR(self.optimizer, 0.01, min_lr = 5e-6)
         self._restore_resume_checkpoint(startup_timer)
         self._sync_sampler_global_step()
         self.start_update_count = int(self.update_count)
@@ -364,14 +362,8 @@ class TrainRunner:
         startup_timer.log("ready to enter PPO loop")
 
         print(
-            "actor optimizer split:",
-            f"Muon={actor_optimizer_stats['muon_tensors']} tensors / {actor_optimizer_stats['muon_numel']} params,",
-            f"AdamW={actor_optimizer_stats['adamw_tensors']} tensors / {actor_optimizer_stats['adamw_numel']} params",
-        )
-        print(
-            "critic optimizer split:",
-            f"Muon={critic_optimizer_stats['muon_tensors']} tensors / {critic_optimizer_stats['muon_numel']} params,",
-            f"AdamW={critic_optimizer_stats['adamw_tensors']} tensors / {critic_optimizer_stats['adamw_numel']} params",
+            "shared optimizer:",
+            f"Adam={optimizer_stats['adam_tensors']} tensors / {optimizer_stats['adam_numel']} params",
         )
 
     @staticmethod
@@ -464,6 +456,7 @@ class TrainRunner:
             "motion_window_length": config.motion_window_length,
             "motion_encoder_type": config.motion_encoder_type,
             "actor_fusion_type": config.actor_fusion_type,
+            "encoder_pooling_type": config.encoder_pooling_type,
         }
 
     @classmethod
@@ -973,60 +966,37 @@ class TrainRunner:
         }
 
     @staticmethod
-    def _split_optimizer_param_groups(
+    def _build_adam_param_groups(
         modules: dict[str, torch.nn.Module],
-        *,
-        prefer_muon: bool = True,
-    ) -> tuple[list[dict], list[dict], dict[str, int]]:
-        muon_groups = []
-        adamw_groups = []
+    ) -> tuple[list[dict], dict[str, int]]:
+        adam_groups = []
         stats = {
-            "muon_tensors": 0,
-            "muon_numel": 0,
-            "adamw_tensors": 0,
-            "adamw_numel": 0,
+            "adam_tensors": 0,
+            "adam_numel": 0,
         }
 
         for module_name, module in modules.items():
-            muon_params = []
-            adamw_params = []
+            adam_params = []
 
             for _, param in module.named_parameters():
                 if not param.requires_grad:
                     continue
-                if prefer_muon and param.ndim == 2:
-                    muon_params.append(param)
-                    stats["muon_tensors"] += 1
-                    stats["muon_numel"] += param.numel()
-                else:
-                    adamw_params.append(param)
-                    stats["adamw_tensors"] += 1
-                    stats["adamw_numel"] += param.numel()
+                adam_params.append(param)
+                stats["adam_tensors"] += 1
+                stats["adam_numel"] += param.numel()
 
-            if muon_params:
-                muon_groups.append({"params": muon_params, "name": module_name})
-            if adamw_params:
-                adamw_groups.append({"params": adamw_params, "name": f"{module_name}_adamw"})
+            if adam_params:
+                adam_groups.append({"params": adam_params, "name": module_name})
 
-        return muon_groups, adamw_groups, stats
+        return adam_groups, stats
 
     @classmethod
     def _build_optimizer_collection(
         cls,
         modules: dict[str, torch.nn.Module],
-        *,
-        prefer_muon: bool = True,
     ) -> tuple[OptimizerCollection, dict[str, int]]:
-        muon_groups, adamw_groups, stats = cls._split_optimizer_param_groups(
-            modules,
-            prefer_muon=prefer_muon,
-        )
-        optimizers = []
-        if muon_groups:
-            optimizers.append(torch.optim.Muon(muon_groups, lr=1e-3, weight_decay=0.0))
-        if adamw_groups:
-            optimizers.append(torch.optim.AdamW(adamw_groups, lr=1e-3, weight_decay=0.0))
-        return OptimizerCollection(*optimizers), stats
+        adam_groups, stats = cls._build_adam_param_groups(modules)
+        return OptimizerCollection(torch.optim.Adam(adam_groups, lr=1e-3, weight_decay=0.0)), stats
 
     @staticmethod
     def _optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
@@ -1036,7 +1006,14 @@ class TrainRunner:
 
     @staticmethod
     def _training_state_missing_keys(training_state: Mapping[str, Any]) -> list[str]:
-        return [key for key in REQUIRED_TRAINER_STATE_KEYS if key not in training_state]
+        missing_keys = [key for key in REQUIRED_TRAINER_STATE_KEYS if key not in training_state]
+        if OPTIMIZER_STATE_KEY not in training_state and not all(
+            key in training_state for key in LEGACY_OPTIMIZER_STATE_KEYS
+        ):
+            missing_keys.append(
+                f"{OPTIMIZER_STATE_KEY} or legacy {', '.join(LEGACY_OPTIMIZER_STATE_KEYS)}"
+            )
+        return missing_keys
 
     @staticmethod
     def _list_to_tuple(value: Any) -> Any:
@@ -1101,8 +1078,7 @@ class TrainRunner:
             "update_count": int(self.update_count),
             "global_step": int(self.global_step),
             "sampler_failure_warmup_steps": int(self.sampler_failure_warmup_steps),
-            "actor_optimizer": self.actor_optimizer.state_dict(),
-            "critic_optimizer": self.critic_optimizer.state_dict(),
+            OPTIMIZER_STATE_KEY: self.optimizer.state_dict(),
             "lr_scheduler": self.lr_scheduler.state_dict(),
             "grad_scaler": self.grad_scaler.state_dict(),
             "amp": {
@@ -1120,7 +1096,11 @@ class TrainRunner:
 
         checkpoint = self.resume_checkpoint
         startup_timer.log("restoring actor and critic weights from resume checkpoint")
-        actor_incompatible_keys = load_actor_checkpoint_state(self.actor, checkpoint.model["actor"])
+        actor_incompatible_keys = load_actor_checkpoint_state(
+            self.actor,
+            checkpoint.model["actor"],
+            checkpoint_actor_kwargs=checkpoint.actor_kwargs,
+        )
         if actor_incompatible_keys.missing_keys or actor_incompatible_keys.unexpected_keys:
             print(
                 "resume checkpoint actor was loaded across the encoder redesign; "
@@ -1165,17 +1145,25 @@ class TrainRunner:
                 f"Missing keys: {', '.join(missing_keys)}."
             )
 
-        self.actor_optimizer.load_state_dict(training_state["actor_optimizer"])
-        self.critic_optimizer.load_state_dict(training_state["critic_optimizer"])
+        optimizer_state_restored = False
+        if OPTIMIZER_STATE_KEY in training_state:
+            self.optimizer.load_state_dict(training_state[OPTIMIZER_STATE_KEY])
+            optimizer_state_restored = True
+        elif all(key in training_state for key in LEGACY_OPTIMIZER_STATE_KEYS):
+            print(
+                "resume checkpoint stores separate actor/critic optimizer states; "
+                "using a freshly initialized shared optimizer while restoring scheduler, scaler, and counters.",
+                flush=True,
+            )
         self.lr_scheduler.load_state_dict(training_state["lr_scheduler"])
         self.grad_scaler.load_state_dict(training_state["grad_scaler"])
         self.update_count = int(training_state["update_count"])
         self.global_step = int(training_state["global_step"])
         self._restore_rng_state(training_state.get("rng_state"))
-        self.resume_mode = "full_state"
-        self.resume_trainer_state_restored = True
+        self.resume_mode = "full_state" if optimizer_state_restored else "optimizer_warm_start"
+        self.resume_trainer_state_restored = optimizer_state_restored
         startup_timer.log(
-            f"restored trainer state at update={self.update_count} global_step={self.global_step}"
+            f"restored trainer counters at update={self.update_count} global_step={self.global_step}"
         )
 
     def _sync_sampler_global_step(self) -> None:
@@ -2750,23 +2738,19 @@ class TrainRunner:
                     critic_loss = value_loss
                     ac_loss = actor_loss + critic_loss
 
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                self.critic_optimizer.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=True)
                 if self.use_amp:
                     self.grad_scaler.scale(ac_loss).backward()
-                    self.grad_scaler.unscale_(self.actor_optimizer)
-                    self.grad_scaler.unscale_(self.critic_optimizer)
+                    self.grad_scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                    self.grad_scaler.step(self.actor_optimizer)
-                    self.grad_scaler.step(self.critic_optimizer)
+                    self.grad_scaler.step(self.optimizer)
                     self.grad_scaler.update()
                 else:
                     ac_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                    self.actor_optimizer.step()
-                    self.critic_optimizer.step()
+                    self.optimizer.step()
                 self.lr_scheduler.set_kl(float(kl_divergence.detach().to(device="cpu", dtype=torch.float32).item()))
                 self.lr_scheduler.step()
 
@@ -2795,8 +2779,8 @@ class TrainRunner:
                 "update/avg_advantage_std": self.tracker.get_mean("advantage_std"),
                 "update/avg_value_explained_variance": self.tracker.get_mean("value_explained_variance"),
                 "update/avg_value_clip_fraction": self.tracker.get_mean("value_clip_fraction"),
-                "update/actor_lr": self._optimizer_lr(self.actor_optimizer),
-                "update/critic_lr": self._optimizer_lr(self.critic_optimizer),
+                "update/actor_lr": self._optimizer_lr(self.optimizer),
+                "update/critic_lr": self._optimizer_lr(self.optimizer),
             }
         )
         self.update_count += 1

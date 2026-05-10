@@ -11,11 +11,12 @@ class RunConfig:
     motion_window_length: int = 1
     motion_encoder_type: str = "transformer"
     actor_fusion_type: str = "film"
+    encoder_pooling_type: str = "learned"
     motion_mae_encoder_checkpoint: str | None = None
     motion_files: list[str] | None = None
     resume_checkpoint_path: str | None = None
     use_amp: bool = True
-    end_effector_termination_curriculum_enabled: bool = True
+    end_effector_termination_curriculum_enabled: bool = False
     end_effector_termination_start_threshold: float = 0.25
     end_effector_termination_end_threshold: float = 0.15
     end_effector_termination_tighten_step: float = 0.03
@@ -47,6 +48,7 @@ class IsaacEvalConfig:
     robot_window_length: int | None = None
     motion_window_length: int | None = None
     motion_encoder_type: str | None = None
+    encoder_pooling_type: str | None = None
     motion_mae_encoder_checkpoint: str | None = None
     use_amp: bool = True
     num_steps: int = 1000
@@ -65,6 +67,7 @@ class Sim2SimEvalConfig:
     robot_window_length: int | None = None
     motion_window_length: int | None = None
     motion_encoder_type: str | None = None
+    encoder_pooling_type: str | None = None
     motion_mae_encoder_checkpoint: str | None = None
     use_amp: bool = True
     num_steps: int = 2000

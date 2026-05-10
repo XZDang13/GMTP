@@ -49,6 +49,10 @@ class G1MultiMotionEnv(G1MotionTrackingEnvCfg):
     action = replace(_BASE_G1_ENV_CFG.action, mode="offset")
     random_start = False
     events = None
+    if hasattr(_BASE_G1_ENV_CFG, "curriculum"):
+        curriculum = None
+    if hasattr(_BASE_G1_ENV_CFG, "termination_curriculum"):
+        termination_curriculum = None
     root_link_name = "pelvis"
     anchor_body_name = "pelvis"
     if hasattr(_BASE_G1_ENV_CFG, "termination"):

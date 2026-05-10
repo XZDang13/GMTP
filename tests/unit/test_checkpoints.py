@@ -73,6 +73,7 @@ def test_checkpoint_v2_roundtrip(tmp_path):
         "motion_window_length": 1,
         "motion_encoder_type": "mlp",
         "actor_fusion_type": "film",
+        "encoder_pooling_type": "learned",
     }
     assert loaded.meta["critic"] == {
         "critic_type": "flat",
