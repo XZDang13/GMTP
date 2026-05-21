@@ -9,30 +9,78 @@ DESKTOP_ROOT = PROJECT_ROOT.parent
 MOTION_ASSET_DIR = PROJECT_ROOT / "env" / "assests"
 MOCAP_DATA_DIR = DESKTOP_ROOT / "mocap_data"
 DEFAULT_MOCAP_DATASET_NAMES = ("CMU", "OMOMO")
+MOCAP_TRAINING_DATA_DIR = MOCAP_DATA_DIR / "training_data"
+MOCAP_DATASET_ALIASES = {
+    "CMU": (
+        "CMU",
+        "CMU_data",
+        "selected_1000_each_longer_than_2s/CMU_data",
+    ),
+    "OMOMO": (
+        "OMOMO",
+        "OMOMO_data",
+        "selected_1000_each_longer_than_2s/OMOMO_data",
+    ),
+}
+MOCAP_FLAT_DATASET_PREFIXES = {
+    "CMU": "CMU_data__",
+    "OMOMO": "OMOMO_data__",
+}
 _MAX_VERBOSE_MOTION_LABEL_NAMES = 12
 
 
+def _directory_has_motion_files(path: Path) -> bool:
+    return path.is_dir() and any(path.rglob("*.npz"))
+
+
+@lru_cache(maxsize=None)
+def _resolve_mocap_dataset_dir(dataset_name: str) -> Path | None:
+    normalized_name = _normalized_dataset_name(dataset_name)
+    if normalized_name is None:
+        return None
+    for relative_path in MOCAP_DATASET_ALIASES[normalized_name]:
+        candidate = (MOCAP_DATA_DIR / relative_path).resolve()
+        if _directory_has_motion_files(candidate):
+            return candidate
+    return None
+
+
+@lru_cache(maxsize=None)
+def _find_flattened_mocap_dataset_files(dataset_name: str) -> tuple[str, ...]:
+    normalized_name = _normalized_dataset_name(dataset_name)
+    if normalized_name is None or not MOCAP_TRAINING_DATA_DIR.is_dir():
+        return ()
+    prefix = MOCAP_FLAT_DATASET_PREFIXES.get(normalized_name)
+    if prefix is None:
+        return ()
+    return tuple(
+        str(path.resolve())
+        for path in sorted(MOCAP_TRAINING_DATA_DIR.glob(f"{prefix}*.npz"))
+        if path.is_file()
+    )
+
+
+def _resolve_mocap_dataset_sources(dataset_name: str) -> tuple[str, ...]:
+    dataset_dir = _resolve_mocap_dataset_dir(dataset_name)
+    if dataset_dir is not None:
+        return (str(dataset_dir),)
+    return _find_flattened_mocap_dataset_files(dataset_name)
+
+
 def _discover_default_experiment_motion_files() -> tuple[str, ...]:
-    dataset_dirs = tuple((MOCAP_DATA_DIR / name).resolve() for name in DEFAULT_MOCAP_DATASET_NAMES)
-    missing_dirs = [path for path in dataset_dirs if not path.is_dir()]
-    if missing_dirs:
-        raise FileNotFoundError(
-            "Default mocap dataset directories were not found: "
-            f"{', '.join(str(path) for path in missing_dirs)}. "
-            f"Expected CMU and OMOMO data under {MOCAP_DATA_DIR}."
-        )
+    sources: list[str] = []
+    for dataset_name in DEFAULT_MOCAP_DATASET_NAMES:
+        sources.extend(_resolve_mocap_dataset_sources(dataset_name))
 
-    empty_dirs = [path for path in dataset_dirs if not any(path.rglob("*.npz"))]
-    if empty_dirs:
-        raise FileNotFoundError(
-            "Default mocap dataset directories contain no .npz motion files: "
-            f"{', '.join(str(path) for path in empty_dirs)}."
-        )
+    if sources:
+        return tuple(sources)
 
-    return tuple(str(path) for path in dataset_dirs)
-
-
-DEFAULT_EXPERIMENT_MOTION_FILES = _discover_default_experiment_motion_files()
+    asset_motion_files = tuple(
+        str(path.resolve())
+        for path in sorted(MOTION_ASSET_DIR.glob("*.npz"))
+        if path.is_file()
+    )
+    return asset_motion_files
 
 
 def normalize_motion_files(motion_files: str | Sequence[str] | None) -> list[str]:
@@ -66,6 +114,19 @@ def _normalized_dataset_name(name: str) -> str | None:
     for dataset_name in DEFAULT_MOCAP_DATASET_NAMES:
         if normalized == dataset_name.lower():
             return dataset_name
+        for alias in MOCAP_DATASET_ALIASES[dataset_name]:
+            if normalized == Path(alias).name.lower():
+                return dataset_name
+    return None
+
+
+DEFAULT_EXPERIMENT_MOTION_FILES = _discover_default_experiment_motion_files()
+
+
+def _dataset_name_from_flattened_file_name(file_name: str) -> str | None:
+    for dataset_name, prefix in MOCAP_FLAT_DATASET_PREFIXES.items():
+        if str(file_name).startswith(prefix):
+            return dataset_name
     return None
 
 
@@ -76,14 +137,48 @@ def _path_under_mocap_dataset(path: Path) -> str | None:
         return None
     if not relative_path.parts:
         return None
-    return _normalized_dataset_name(relative_path.parts[0])
+    if len(relative_path.parts) >= 2 and relative_path.parts[0] == MOCAP_TRAINING_DATA_DIR.name:
+        flattened_dataset_name = _dataset_name_from_flattened_file_name(relative_path.parts[1])
+        if flattened_dataset_name is not None:
+            return flattened_dataset_name
+    for part in relative_path.parts:
+        dataset_name = _normalized_dataset_name(part)
+        if dataset_name is not None:
+            return dataset_name
+    return None
 
 
 @lru_cache(maxsize=None)
 def _find_mocap_motion_file_by_name(file_name: str) -> tuple[Path, ...]:
     if not MOCAP_DATA_DIR.is_dir():
         return ()
-    return tuple(sorted(path.resolve() for path in MOCAP_DATA_DIR.rglob(file_name) if path.is_file()))
+    matches = {path.resolve() for path in MOCAP_DATA_DIR.rglob(file_name) if path.is_file()}
+    if MOCAP_TRAINING_DATA_DIR.is_dir():
+        matches.update(
+            path.resolve()
+            for path in MOCAP_TRAINING_DATA_DIR.glob(f"*__{file_name}")
+            if path.is_file()
+        )
+    return tuple(sorted(matches))
+
+
+@lru_cache(maxsize=None)
+def _find_mocap_motion_file_by_dataset_and_name(dataset_name: str, file_name: str) -> tuple[Path, ...]:
+    normalized_name = _normalized_dataset_name(dataset_name)
+    if normalized_name is None:
+        return ()
+    matches = []
+    dataset_dir = _resolve_mocap_dataset_dir(normalized_name)
+    if dataset_dir is not None:
+        matches.extend(path.resolve() for path in dataset_dir.rglob(file_name) if path.is_file())
+    if MOCAP_TRAINING_DATA_DIR.is_dir():
+        prefix = MOCAP_FLAT_DATASET_PREFIXES[normalized_name]
+        matches.extend(
+            path.resolve()
+            for path in MOCAP_TRAINING_DATA_DIR.glob(f"{prefix}*__{file_name}")
+            if path.is_file()
+        )
+    return tuple(sorted(set(matches)))
 
 
 @lru_cache(maxsize=None)
@@ -112,6 +207,13 @@ def _resolve_motion_path_candidate(motion_file: str) -> Path:
     if path.parts:
         dataset_name = _normalized_dataset_name(path.parts[0])
         if dataset_name is not None:
+            dataset_dir = _resolve_mocap_dataset_dir(dataset_name)
+            if dataset_dir is not None:
+                return (dataset_dir / Path(*path.parts[1:])).resolve()
+            if len(path.parts) > 1:
+                dataset_matches = _find_mocap_motion_file_by_dataset_and_name(dataset_name, path.parts[-1])
+                if len(dataset_matches) == 1:
+                    return dataset_matches[0]
             return (MOCAP_DATA_DIR / dataset_name / Path(*path.parts[1:])).resolve()
         if str(path.parts[0]).lower() == "mocap_data":
             return (DESKTOP_ROOT / path).resolve()
@@ -153,6 +255,21 @@ def resolve_motion_file(motion_file: str) -> str:
 def resolve_motion_files(motion_files: str | Sequence[str] | None) -> list[str]:
     resolved: list[str] = []
     for motion_file in normalize_motion_files(motion_files):
+        dataset_name = _normalized_dataset_name(str(motion_file))
+        if dataset_name is not None and not _looks_like_explicit_path(str(motion_file)):
+            dataset_sources = _resolve_mocap_dataset_sources(dataset_name)
+            if dataset_sources:
+                for source in dataset_sources:
+                    path = Path(source)
+                    if path.is_dir():
+                        nested_motion_files = _find_motion_files_under_directory(str(path))
+                        if not nested_motion_files:
+                            raise FileNotFoundError(f"No .npz motion files found under directory: {path}")
+                        resolved.extend(nested_motion_files)
+                    else:
+                        resolved.append(str(path))
+                continue
+
         path = _resolve_motion_path_candidate(motion_file)
         if not path.exists():
             raise FileNotFoundError(f"Motion file does not exist: {path}")

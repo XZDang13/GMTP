@@ -5,10 +5,20 @@ import types
 import numpy as np
 import pytest
 import torch
+from RLAlg.scheduler import KLAdaptiveLR
 
 from gmtp.runtime.checkpoints import CheckpointV2
 from gmtp.runtime.config import RunConfig
-from gmtp.runtime.train_runner import ANCHOR_CONSOLE_TOP_K, ANCHOR_DASHBOARD_MAX_RANK_BANDS, TrainRunner
+from gmtp.runtime.train_runner import (
+    ANCHOR_CONSOLE_TOP_K,
+    ANCHOR_DASHBOARD_MAX_RANK_BANDS,
+    ACTOR_LEARNING_RATE,
+    CRITIC_LEARNING_RATE,
+    KL_SCHEDULER_MIN_LR,
+    Muon,
+    OptimizerCollection,
+    TrainRunner,
+)
 
 
 def test_build_episode_metrics_payload_separates_return_and_length_namespaces():
@@ -46,7 +56,7 @@ def test_build_episode_finish_metrics_payload_skips_when_no_episode_finished():
     assert payload == {}
 
 
-def test_build_optimizer_collection_uses_adam_for_all_trainable_parameters():
+def test_build_optimizer_collection_uses_separate_muon_adam_optimizers_for_actor_and_critic():
     actor = torch.nn.Sequential(
         torch.nn.Linear(3, 4),
         torch.nn.LayerNorm(4),
@@ -54,20 +64,86 @@ def test_build_optimizer_collection_uses_adam_for_all_trainable_parameters():
     critic = torch.nn.Linear(4, 1)
 
     optimizer, stats = TrainRunner._build_optimizer_collection({"actor": actor, "critic": critic})
-    trainable_parameters = [
+    actor_muon_parameters = [
         parameter
-        for module in (actor, critic)
-        for parameter in module.parameters()
-        if parameter.requires_grad
+        for parameter in actor.parameters()
+        if parameter.requires_grad and parameter.ndim >= 2
+    ]
+    actor_adam_parameters = [
+        parameter
+        for parameter in actor.parameters()
+        if parameter.requires_grad and parameter.ndim < 2
+    ]
+    critic_muon_parameters = [
+        parameter
+        for parameter in critic.parameters()
+        if parameter.requires_grad and parameter.ndim >= 2
+    ]
+    critic_adam_parameters = [
+        parameter
+        for parameter in critic.parameters()
+        if parameter.requires_grad and parameter.ndim < 2
     ]
 
-    assert len(optimizer.optimizers) == 1
-    assert isinstance(optimizer.optimizers[0], torch.optim.Adam)
+    assert len(optimizer.optimizers) == 2
+    actor_optimizer, critic_optimizer = optimizer.optimizers
+    assert isinstance(actor_optimizer, OptimizerCollection)
+    assert isinstance(critic_optimizer, OptimizerCollection)
+    assert [type(inner) for inner in actor_optimizer.optimizers] == [Muon, torch.optim.Adam]
+    assert [type(inner) for inner in critic_optimizer.optimizers] == [Muon, torch.optim.Adam]
     assert stats == {
-        "adam_tensors": len(trainable_parameters),
-        "adam_numel": sum(parameter.numel() for parameter in trainable_parameters),
+        "muon_tensors": len(actor_muon_parameters) + len(critic_muon_parameters),
+        "muon_numel": sum(parameter.numel() for parameter in actor_muon_parameters + critic_muon_parameters),
+        "adam_tensors": len(actor_adam_parameters) + len(critic_adam_parameters),
+        "adam_numel": sum(parameter.numel() for parameter in actor_adam_parameters + critic_adam_parameters),
+        "actor_muon_tensors": len(actor_muon_parameters),
+        "actor_muon_numel": sum(parameter.numel() for parameter in actor_muon_parameters),
+        "actor_adam_tensors": len(actor_adam_parameters),
+        "actor_adam_numel": sum(parameter.numel() for parameter in actor_adam_parameters),
+        "critic_muon_tensors": len(critic_muon_parameters),
+        "critic_muon_numel": sum(parameter.numel() for parameter in critic_muon_parameters),
+        "critic_adam_tensors": len(critic_adam_parameters),
+        "critic_adam_numel": sum(parameter.numel() for parameter in critic_adam_parameters),
     }
-    assert [group.get("name") for group in optimizer.optimizers[0].param_groups] == ["actor", "critic"]
+    assert [group.get("name") for group in actor_optimizer.param_groups] == ["actor_muon", "actor_adam"]
+    assert [group.get("name") for group in critic_optimizer.param_groups] == ["critic_muon", "critic_adam"]
+    assert {group["lr"] for group in actor_optimizer.param_groups} == {ACTOR_LEARNING_RATE}
+    assert {group["lr"] for group in critic_optimizer.param_groups} == {CRITIC_LEARNING_RATE}
+
+
+def test_kl_scheduler_updates_actor_optimizer_without_changing_critic_lr():
+    actor = torch.nn.Linear(3, 4)
+    critic = torch.nn.Linear(4, 1)
+
+    actor_optimizer, critic_optimizer, _ = TrainRunner._build_actor_critic_optimizers(actor, critic)
+    scheduler = KLAdaptiveLR(actor_optimizer, 0.01, min_lr=KL_SCHEDULER_MIN_LR)
+
+    actor_lr = TrainRunner._optimizer_lr(actor_optimizer)
+    critic_lr = TrainRunner._optimizer_lr(critic_optimizer)
+    actor_optimizer.step()
+    scheduler.set_kl(1.0)
+    scheduler.step()
+
+    assert TrainRunner._optimizer_lr(actor_optimizer) == pytest.approx(actor_lr * 0.5)
+    assert TrainRunner._optimizer_lr(critic_optimizer) == pytest.approx(critic_lr)
+
+
+def test_restore_optimizer_state_warm_starts_from_legacy_shared_actor_critic_adam_state():
+    actor = torch.nn.Linear(3, 4)
+    critic = torch.nn.Linear(4, 1)
+    adam_groups, _ = TrainRunner._build_adam_param_groups({"actor": actor, "critic": critic})
+    legacy_optimizer = torch.optim.Adam(adam_groups, lr=1e-3, weight_decay=0.0)
+    legacy_loss = actor(torch.ones(2, 3)).sum() + critic(torch.ones(2, 4)).sum()
+    legacy_loss.backward()
+    legacy_optimizer.step()
+
+    runner = TrainRunner.__new__(TrainRunner)
+    runner.actor_optimizer, runner.critic_optimizer, _ = TrainRunner._build_actor_critic_optimizers(actor, critic)
+    runner.optimizer = OptimizerCollection(runner.actor_optimizer, runner.critic_optimizer)
+
+    restored = runner._restore_optimizer_state({"optimizer": {"optimizers": [legacy_optimizer.state_dict()]}})
+
+    assert restored is False
 
 
 def test_build_end_effector_termination_curriculum_state_uses_performance_gate_defaults():

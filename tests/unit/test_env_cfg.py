@@ -70,6 +70,7 @@ def _install_env_cfg_stubs(monkeypatch):
         id: str
         type: str
         threshold: float
+        height_only: bool = False
 
     @dataclass(frozen=True)
     class TerminationSpec:
@@ -158,6 +159,40 @@ def _termination_threshold(env_cfg, rule_id: str) -> float:
     raise AssertionError(f"Missing termination rule: {rule_id}")
 
 
+def _termination_height_only(env_cfg, rule_id: str) -> bool:
+    for rule in env_cfg.termination.failure_rules:
+        if rule.id == rule_id:
+            return bool(rule.height_only)
+    raise AssertionError(f"Missing termination rule: {rule_id}")
+
+
+def test_end_effector_termination_is_height_only(monkeypatch):
+    _install_env_cfg_stubs(monkeypatch)
+    sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
+    sys.modules.pop("gmtp.integrations.ref2act", None)
+
+    try:
+        env_cfg = importlib.import_module("gmtp.integrations.ref2act.env_cfg")
+        eval_cfg = env_cfg.G1MultiMotionEnv()
+        training_cfg = env_cfg.G1MultiMotionTrainingEnv()
+
+        assert _termination_height_only(eval_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) is True
+        assert _termination_height_only(training_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) is True
+
+        loose_termination = env_cfg.set_end_effector_termination_threshold(
+            eval_cfg.termination,
+            0.25,
+        )
+        assert _termination_height_only(
+            types.SimpleNamespace(termination=loose_termination),
+            env_cfg.END_EFFECTOR_TERMINATION_RULE_ID,
+        ) is True
+
+    finally:
+        sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
+        sys.modules.pop("gmtp.integrations.ref2act", None)
+
+
 def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
     _install_env_cfg_stubs(monkeypatch)
     sys.modules.pop("gmtp.integrations.ref2act.env_cfg", None)
@@ -188,8 +223,12 @@ def test_training_env_uses_anchor_failure_weighted_sampling(monkeypatch):
         assert eval_cfg.curriculum is None
         assert training_cfg.termination_curriculum is None
         assert eval_cfg.termination_curriculum is None
-        assert _termination_threshold(eval_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.15)
-        assert _termination_threshold(training_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(0.15)
+        assert _termination_threshold(eval_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(
+            env_cfg.END_EFFECTOR_TERMINATE_END_THRESHOLD
+        )
+        assert _termination_threshold(training_cfg, env_cfg.END_EFFECTOR_TERMINATION_RULE_ID) == pytest.approx(
+            env_cfg.END_EFFECTOR_TERMINATE_END_THRESHOLD
+        )
         assert _reward_term_ids(training_cfg) == REF2ACT_REWARD_TERM_IDS
         assert _reward_term_ids(eval_cfg) == REF2ACT_REWARD_TERM_IDS
 

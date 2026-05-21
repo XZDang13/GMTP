@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,145 @@ from gmtp.runtime.policy import (
 
 DEFAULT_VIDEO_HEIGHT = 720
 DEFAULT_VIDEO_WIDTH = 1280
+VIDEO_MACRO_BLOCK_SIZE = 16
+DEFAULT_CAMERA_DISTANCE = 4.0
+DEFAULT_CAMERA_AZIMUTH = -140.0
+DEFAULT_CAMERA_ELEVATION = -20.0
+
+
+def _floor_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 1 or value < multiple:
+        return max(1, int(value))
+    return max(multiple, int(value) // multiple * multiple)
+
+
+def _aligned_video_candidate(
+    *,
+    width: int,
+    height: int,
+    max_width: int,
+    max_height: int,
+    macro_block_size: int,
+) -> tuple[int, int] | None:
+    if width < macro_block_size or height < macro_block_size:
+        return None
+
+    width = min(max_width, _floor_to_multiple(width, macro_block_size))
+    height = min(max_height, _floor_to_multiple(height, macro_block_size))
+    if width < macro_block_size or height < macro_block_size:
+        return None
+    if width > max_width or height > max_height:
+        return None
+    return width, height
+
+
+def resolve_video_frame_size(
+    *,
+    requested_width: int,
+    requested_height: int,
+    macro_block_size: int = VIDEO_MACRO_BLOCK_SIZE,
+) -> tuple[int, int]:
+    requested_width = max(1, int(requested_width))
+    requested_height = max(1, int(requested_height))
+    macro_block_size = max(1, int(macro_block_size))
+    return (
+        _floor_to_multiple(requested_width, macro_block_size),
+        _floor_to_multiple(requested_height, macro_block_size),
+    )
+
+
+def resolve_mujoco_renderer_size(
+    mj_model: Any,
+    *,
+    requested_width: int,
+    requested_height: int,
+    macro_block_size: int = VIDEO_MACRO_BLOCK_SIZE,
+) -> tuple[int, int]:
+    requested_width = max(1, int(requested_width))
+    requested_height = max(1, int(requested_height))
+    macro_block_size = max(1, int(macro_block_size))
+
+    vis = getattr(mj_model, "vis", None)
+    global_vis = getattr(vis, "global_", None)
+    max_width = max(1, int(getattr(global_vis, "offwidth", requested_width)))
+    max_height = max(1, int(getattr(global_vis, "offheight", requested_height)))
+
+    scale = min(1.0, max_width / requested_width, max_height / requested_height)
+    fit_width = max(1, min(max_width, int(np.floor(requested_width * scale))))
+    fit_height = max(1, min(max_height, int(np.floor(requested_height * scale))))
+    if macro_block_size <= 1 or (
+        fit_width % macro_block_size == 0 and fit_height % macro_block_size == 0
+    ):
+        return fit_width, fit_height
+    if fit_width < macro_block_size or fit_height < macro_block_size:
+        return fit_width, fit_height
+
+    aspect_ratio = requested_width / requested_height
+    aligned_fit_width = _floor_to_multiple(fit_width, macro_block_size)
+    aligned_fit_height = _floor_to_multiple(fit_height, macro_block_size)
+    candidates = [
+        _aligned_video_candidate(
+            width=aligned_fit_width,
+            height=aligned_fit_height,
+            max_width=fit_width,
+            max_height=fit_height,
+            macro_block_size=macro_block_size,
+        ),
+        _aligned_video_candidate(
+            width=aligned_fit_width,
+            height=round(aligned_fit_width / aspect_ratio),
+            max_width=fit_width,
+            max_height=fit_height,
+            macro_block_size=macro_block_size,
+        ),
+        _aligned_video_candidate(
+            width=round(aligned_fit_height * aspect_ratio),
+            height=aligned_fit_height,
+            max_width=fit_width,
+            max_height=fit_height,
+            macro_block_size=macro_block_size,
+        ),
+    ]
+    valid_candidates = [candidate for candidate in candidates if candidate is not None]
+    if not valid_candidates:
+        return fit_width, fit_height
+
+    return min(
+        valid_candidates,
+        key=lambda size: (
+            abs((size[0] / size[1]) - aspect_ratio),
+            -(size[0] * size[1]),
+        ),
+    )
+
+
+def _resize_rgb_frame_nearest(frame: np.ndarray, *, width: int, height: int) -> np.ndarray:
+    if frame.shape[0] == height and frame.shape[1] == width:
+        return np.ascontiguousarray(frame)
+
+    y_indices = np.linspace(0, frame.shape[0] - 1, height).astype(np.intp)
+    x_indices = np.linspace(0, frame.shape[1] - 1, width).astype(np.intp)
+    return np.ascontiguousarray(frame[y_indices[:, None], x_indices[None, :]])
+
+
+def _fit_rgb_frame_to_size(frame: np.ndarray, *, width: int, height: int) -> np.ndarray:
+    frame = np.asarray(frame, dtype=np.uint8)
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError(f"Expected RGB frame with shape (H, W, 3), got {frame.shape}.")
+
+    target_aspect = width / height
+    frame_height, frame_width = frame.shape[:2]
+    frame_aspect = frame_width / frame_height
+    if frame_aspect > target_aspect:
+        crop_width = max(1, min(frame_width, int(round(frame_height * target_aspect))))
+        x0 = (frame_width - crop_width) // 2
+        frame = frame[:, x0 : x0 + crop_width]
+    elif frame_aspect < target_aspect:
+        crop_height = max(1, min(frame_height, int(round(frame_width / target_aspect))))
+        y0 = (frame_height - crop_height) // 2
+        frame = frame[y0 : y0 + crop_height]
+
+    return _resize_rgb_frame_nearest(frame, width=width, height=height)
 
 
 class OffscreenMujocoVideoRecorder:
@@ -70,42 +210,193 @@ class OffscreenMujocoVideoRecorder:
 
         self.output_path = Path(output_path).expanduser().resolve()
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        width, height = resolve_mujoco_renderer_size(
+            mj_model,
+            requested_width=width,
+            requested_height=height,
+        )
         self._mujoco = mujoco
-        self._renderer = mujoco.Renderer(mj_model, height=height, width=width)
-        self._mj_data = mj_data
-        self._env = env
+        self._mj_model = mj_model
         self._width = int(width)
         self._height = int(height)
+        self._renderer = self._make_renderer()
+        self._mj_data = mj_data
+        self._env = env
         self._camera = getattr(mujoco, "MjvCamera", lambda: None)()
         if self._camera is not None and hasattr(mujoco, "mjv_defaultFreeCamera"):
             mujoco.mjv_defaultFreeCamera(mj_model, self._camera)
         self._writer = imageio.get_writer(self.output_path, fps=fps)
 
-    def capture_frame(self) -> None:
-        if self._camera is not None and self._env is not None:
-            update_tracking_camera = getattr(self._env, "_update_tracking_camera", None)
-            if callable(update_tracking_camera):
-                update_tracking_camera(
-                    self._camera,
-                    frame_width=self._width,
-                    frame_height=self._height,
-                    mujoco_module=self._mujoco,
-                )
+    @property
+    def width(self) -> int:
+        return self._width
 
+    @property
+    def height(self) -> int:
+        return self._height
+
+    def _make_renderer(self):
+        return self._mujoco.Renderer(self._mj_model, height=self._height, width=self._width)
+
+    def _update_camera_from_env(self) -> None:
+        if self._camera is None or self._env is None:
+            return
+
+        update_tracking_camera = getattr(self._env, "_update_tracking_camera", None)
+        if callable(update_tracking_camera):
+            update_tracking_camera(
+                self._camera,
+                frame_width=self._width,
+                frame_height=self._height,
+                mujoco_module=self._mujoco,
+            )
+            return
+
+        body_id = getattr(self._env, "root_body_id", None)
+        if body_id is None:
+            body_id = getattr(self._env, "anchor_body_id", None)
+        if body_id is None:
+            body_id = getattr(self._env, "free_root_body_id", None)
+
+        camera_type = getattr(getattr(self._mujoco, "mjtCamera", None), "mjCAMERA_TRACKING", None)
+        if camera_type is not None:
+            self._camera.type = camera_type
+        self._camera.fixedcamid = -1
+        self._camera.distance = DEFAULT_CAMERA_DISTANCE
+        self._camera.azimuth = DEFAULT_CAMERA_AZIMUTH
+        self._camera.elevation = DEFAULT_CAMERA_ELEVATION
+
+        if body_id is not None:
+            self._camera.trackbodyid = int(body_id)
+            xpos = getattr(self._mj_data, "xpos", None)
+            if xpos is not None and hasattr(self._camera, "lookat"):
+                self._camera.lookat[:] = np.asarray(xpos[int(body_id)], dtype=np.float64)
+            return
+
+        qpos = getattr(self._mj_data, "qpos", None)
+        if qpos is not None and hasattr(self._camera, "lookat"):
+            self._camera.lookat[:] = np.asarray(qpos[:3], dtype=np.float64)
+
+    def capture_frame(self) -> bool:
+        self._update_camera_from_env()
+
+        renderer = self._renderer
         if self._camera is None:
-            self._renderer.update_scene(self._mj_data)
+            renderer.update_scene(self._mj_data)
         else:
             try:
-                self._renderer.update_scene(self._mj_data, camera=self._camera)
+                renderer.update_scene(self._mj_data, camera=self._camera)
             except TypeError:
-                self._renderer.update_scene(self._mj_data)
-        self._writer.append_data(self._renderer.render())
+                renderer.update_scene(self._mj_data)
+        frame = np.asarray(renderer.render(), dtype=np.uint8).copy()
+        self._writer.append_data(frame)
+        return True
 
     def close(self) -> None:
         try:
             self._writer.close()
         finally:
-            self._renderer.close()
+            if self._renderer is not None:
+                self._renderer.close()
+                self._renderer = None
+
+
+class LiveMujocoViewerVideoRecorder:
+    def __init__(
+        self,
+        *,
+        env: Any,
+        output_path: str | Path,
+        fps: int,
+        width: int = DEFAULT_VIDEO_WIDTH,
+        height: int = DEFAULT_VIDEO_HEIGHT,
+    ):
+        import glfw
+        import mujoco
+
+        self.output_path = Path(output_path).expanduser().resolve()
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._env = env
+        self._glfw = glfw
+        self._mujoco = mujoco
+        self._width, self._height = resolve_video_frame_size(
+            requested_width=width,
+            requested_height=height,
+        )
+        self._writer = imageio.get_writer(self.output_path, fps=fps)
+        self.closed_by_viewer = False
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    @property
+    def height(self) -> int:
+        return self._height
+
+    def _get_live_viewer(self):
+        viewer = getattr(self._env, "mj_viewer", None)
+        if viewer is None or not bool(getattr(viewer, "is_alive", True)):
+            self.closed_by_viewer = True
+            return None
+        window = getattr(viewer, "window", None)
+        if window is not None and self._glfw.window_should_close(window):
+            close = getattr(viewer, "close", None)
+            if callable(close):
+                close()
+            if hasattr(self._env, "mj_viewer"):
+                self._env.mj_viewer = None
+            self.closed_by_viewer = True
+            return None
+        return viewer
+
+    def capture_frame(self) -> bool:
+        viewer = self._get_live_viewer()
+        if viewer is None:
+            return False
+
+        window_width, window_height = self._glfw.get_framebuffer_size(viewer.window)
+        if window_width <= 0 or window_height <= 0:
+            return False
+        viewer.viewport.width = int(window_width)
+        viewer.viewport.height = int(window_height)
+
+        lock = getattr(viewer, "_gui_lock", None)
+        context = lock if lock is not None else nullcontext()
+        with context:
+            self._mujoco.mjv_updateScene(
+                viewer.model,
+                viewer.data,
+                viewer.vopt,
+                viewer.pert,
+                viewer.cam,
+                self._mujoco.mjtCatBit.mjCAT_ALL.value,
+                viewer.scn,
+            )
+            for marker in getattr(viewer, "_markers", []):
+                add_marker = getattr(viewer, "_add_marker_to_scene", None)
+                if callable(add_marker):
+                    add_marker(marker)
+            self._mujoco.mjr_render(viewer.viewport, viewer.scn, viewer.ctx)
+            frame = np.zeros((window_height, window_width, 3), dtype=np.uint8)
+            self._mujoco.mjr_readPixels(frame, None, viewer.viewport, viewer.ctx)
+            self._glfw.swap_buffers(viewer.window)
+        self._glfw.poll_events()
+
+        frame = np.flipud(frame)
+        frame = _fit_rgb_frame_to_size(frame, width=self._width, height=self._height)
+        self._writer.append_data(frame)
+
+        markers = getattr(viewer, "_markers", None)
+        if isinstance(markers, list):
+            markers[:] = []
+        apply_perturbations = getattr(viewer, "apply_perturbations", None)
+        if callable(apply_perturbations):
+            apply_perturbations()
+        return True
+
+    def close(self) -> None:
+        self._writer.close()
 
 
 def _infer_action_dim(checkpoint_env: Mapping[str, Any]) -> int:
@@ -438,6 +729,45 @@ class Sim2SimEvalRunner:
             return int(self.config.video_fps)
         return max(1, round(1.0 / (self.config.simulation_dt * self.config.decimation)))
 
+    def _build_video_recorder(self, *, env: Any, video_path: Path, video_fps: int):
+        if self.config.render and getattr(env, "mj_viewer", None) is not None:
+            return LiveMujocoViewerVideoRecorder(
+                env=env,
+                output_path=video_path,
+                fps=video_fps,
+                width=DEFAULT_VIDEO_WIDTH,
+                height=DEFAULT_VIDEO_HEIGHT,
+            )
+        return OffscreenMujocoVideoRecorder(
+            mj_model=env.mj_model,
+            mj_data=env.mj_data,
+            env=env,
+            output_path=video_path,
+            fps=video_fps,
+            width=DEFAULT_VIDEO_WIDTH,
+            height=DEFAULT_VIDEO_HEIGHT,
+        )
+
+    def _call_without_internal_viewer_render(self, env: Any, method, *args, suppress: bool):
+        viewer = getattr(env, "mj_viewer", None) if suppress else None
+        if viewer is None:
+            return method(*args)
+
+        env.mj_viewer = None
+        try:
+            return method(*args)
+        finally:
+            if getattr(env, "mj_viewer", None) is None and bool(getattr(viewer, "is_alive", True)):
+                env.mj_viewer = viewer
+
+    def _viewer_is_running(self, env: Any) -> bool:
+        if not self.config.render:
+            return True
+        viewer = getattr(env, "mj_viewer", None)
+        if viewer is None:
+            return False
+        return bool(getattr(viewer, "is_alive", True))
+
     @torch.no_grad()
     def _get_action(
         self,
@@ -461,36 +791,63 @@ class Sim2SimEvalRunner:
     ) -> dict[str, Any]:
         logger = RolloutDebugLogger(self._build_debug_prefix(motion_index, motion_file))
         video_path = self._build_video_path(motion_index, motion_file) if self.config.save_video else None
-        video_recorder = (
-            OffscreenMujocoVideoRecorder(
-                mj_model=env.mj_model,
-                mj_data=env.mj_data,
-                env=env,
-                output_path=video_path,
-                fps=self._get_video_fps(),
-                width=DEFAULT_VIDEO_WIDTH,
-                height=DEFAULT_VIDEO_HEIGHT,
+        video_fps = self._get_video_fps() if video_path is not None else None
+        video_recorder = None
+        video_width = None
+        video_height = None
+        if video_path is not None:
+            video_recorder = self._build_video_recorder(env=env, video_path=video_path, video_fps=video_fps)
+            video_width = int(getattr(video_recorder, "width", getattr(video_recorder, "_width", DEFAULT_VIDEO_WIDTH)))
+            video_height = int(
+                getattr(video_recorder, "height", getattr(video_recorder, "_height", DEFAULT_VIDEO_HEIGHT))
             )
-            if video_path is not None
-            else None
-        )
+        suppress_internal_viewer_render = isinstance(video_recorder, LiveMujocoViewerVideoRecorder)
         error_message: str | None = None
         metric_records: list[dict[str, float]] = []
         step_count = 0
         debug_summary: dict[str, Any] = {}
 
         try:
-            obs_parts = self._extract_obs_parts(env, env.reset())
+            obs_parts = self._extract_obs_parts(
+                env,
+                self._call_without_internal_viewer_render(
+                    env,
+                    env.reset,
+                    suppress=suppress_internal_viewer_render,
+                ),
+            )
             self._validate_obs_dims(obs_parts)
             if video_recorder is not None:
-                video_recorder.capture_frame()
+                if video_recorder.capture_frame() is False:
+                    return {
+                        "motion_index": motion_index,
+                        "motion_file": motion_file,
+                        "steps": step_count,
+                        "metrics": _mean_metrics(metric_records),
+                        "debug_json_path": str(self._build_debug_prefix(motion_index, motion_file).with_suffix(".json")),
+                        "debug_npz_path": str(self._build_debug_prefix(motion_index, motion_file).with_suffix(".npz")),
+                        "video_path": str(video_path) if video_path is not None else None,
+                        "video_fps": video_fps,
+                        "video_width": video_width,
+                        "video_height": video_height,
+                    }
 
             for step_idx in range(self.config.num_steps):
+                if not self._viewer_is_running(env):
+                    break
                 actor_env_obs = _tensor_dict_to_batch(obs_parts)
                 actor_obs = get_actor_observation(actor_env_obs, self.actor_type)
                 action, actor_log_fields = self._get_action(actor_obs)
 
-                next_obs_parts = self._extract_obs_parts(env, env.step(action))
+                next_obs_parts = self._extract_obs_parts(
+                    env,
+                    self._call_without_internal_viewer_render(
+                        env,
+                        env.step,
+                        action,
+                        suppress=suppress_internal_viewer_render,
+                    ),
+                )
                 metrics = extract_sim2sim_metrics_from_parts(next_obs_parts)
                 metric_records.append(metrics)
 
@@ -503,11 +860,11 @@ class Sim2SimEvalRunner:
                     **_extract_sim_state(env),
                 }
                 logger.log_step(step_idx, step_payload)
-                if video_recorder is not None:
-                    video_recorder.capture_frame()
-
                 obs_parts = next_obs_parts
                 step_count = step_idx + 1
+                if video_recorder is not None:
+                    if video_recorder.capture_frame() is False:
+                        break
         except Exception as exc:
             error_message = repr(exc)
             raise
@@ -535,6 +892,9 @@ class Sim2SimEvalRunner:
                 "anchor_body_name": self.anchor_body_name,
                 "allow_unstable_init": self.config.allow_unstable_init,
                 "video_path": str(video_path) if video_path is not None else None,
+                "video_fps": video_fps,
+                "video_width": video_width,
+                "video_height": video_height,
                 "error": error_message,
             }
             logger.finish(debug_summary)
@@ -548,6 +908,9 @@ class Sim2SimEvalRunner:
             "debug_json_path": str(debug_prefix.with_suffix(".json")),
             "debug_npz_path": str(debug_prefix.with_suffix(".npz")),
             "video_path": str(video_path) if video_path is not None else None,
+            "video_fps": video_fps,
+            "video_width": video_width,
+            "video_height": video_height,
         }
 
     def evaluate(self) -> dict[str, Any]:
@@ -589,6 +952,7 @@ class Sim2SimEvalRunner:
                 [(int(item["steps"]), dict(item["metrics"])) for item in motion_summaries if item["metrics"]]
             ),
             "motions": motion_summaries,
+            "video_fps": self._get_video_fps() if self.config.save_video else None,
             "run_dir": str(self.run_paths.root),
         }
         write_json(self.run_paths.summary_path, summary)

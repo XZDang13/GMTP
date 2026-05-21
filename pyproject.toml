@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 sim2sim = [
+    "imageio-ffmpeg",
     "mujoco",
     "mujoco-python-viewer",
 ]

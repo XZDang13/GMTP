@@ -51,6 +51,11 @@ from gmtp.runtime.policy import (
 RELATIVE_ANCHOR_POS_DIM = 3
 PPO_CLIP_RATIO = 0.2
 ENTROPY_COEF = 0.01
+ACTOR_LEARNING_RATE = 1e-3
+CRITIC_LEARNING_RATE = 3e-4
+KL_SCHEDULER_MIN_LR = 1e-6
+MUON_MOMENTUM = 0.95
+MUON_NS_STEPS = 5
 CURRICULUM_METRIC_PREFIX = "curriculum/"
 END_EFFECTOR_TERMINATION_RULE_ID = "end_effector_position_failure"
 END_EFFECTOR_TERMINATION_STATE_KEY = "end_effector_termination_curriculum"
@@ -65,7 +70,9 @@ REQUIRED_TRAINER_STATE_KEYS = (
     "global_step",
 )
 OPTIMIZER_STATE_KEY = "optimizer"
-LEGACY_OPTIMIZER_STATE_KEYS = ("actor_optimizer", "critic_optimizer")
+ACTOR_OPTIMIZER_STATE_KEY = "actor_optimizer"
+CRITIC_OPTIMIZER_STATE_KEY = "critic_optimizer"
+LEGACY_OPTIMIZER_STATE_KEYS = (ACTOR_OPTIMIZER_STATE_KEY, CRITIC_OPTIMIZER_STATE_KEY)
 
 
 @dataclass(frozen=True)
@@ -116,6 +123,90 @@ class StartupTimer:
         print(f"{self.prefix} [{elapsed:7.2f}s]: {message}", flush=True)
 
 
+class Muon(torch.optim.Optimizer):
+    """Muon optimizer for matrix-shaped parameters.
+
+    Non-matrix parameters should stay on Adam; this optimizer expects each
+    parameter to have at least two dimensions.
+    """
+
+    def __init__(
+        self,
+        params,
+        *,
+        lr: float,
+        momentum: float = MUON_MOMENTUM,
+        nesterov: bool = True,
+        ns_steps: int = MUON_NS_STEPS,
+    ) -> None:
+        if lr <= 0.0:
+            raise ValueError("Muon lr must be positive.")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError("Muon momentum must be in [0, 1).")
+        if ns_steps < 1:
+            raise ValueError("Muon ns_steps must be positive.")
+        defaults = {
+            "lr": float(lr),
+            "momentum": float(momentum),
+            "nesterov": bool(nesterov),
+            "ns_steps": int(ns_steps),
+        }
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _zeropower_via_newtonschulz5(update: torch.Tensor, ns_steps: int) -> torch.Tensor:
+        original_shape = update.shape
+        matrix = update.reshape(original_shape[0], -1).to(dtype=torch.float32)
+        transpose = matrix.size(0) > matrix.size(1)
+        if transpose:
+            matrix = matrix.T
+
+        matrix = matrix / matrix.norm().clamp_min(1.0e-7)
+        a, b, c = 3.4445, -4.7750, 2.0315
+        for _ in range(ns_steps):
+            gram = matrix @ matrix.T
+            matrix = a * matrix + (b * gram + c * gram @ gram) @ matrix
+
+        if transpose:
+            matrix = matrix.T
+        return matrix.reshape(original_shape)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            momentum = float(group["momentum"])
+            ns_steps = int(group["ns_steps"])
+            nesterov = bool(group["nesterov"])
+            for param in group["params"]:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError("Muon does not support sparse gradients.")
+                if grad.ndim < 2:
+                    raise RuntimeError("Muon parameters must have at least two dimensions.")
+
+                state = self.state[param]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(grad)
+                buffer = state["momentum_buffer"]
+                buffer.mul_(momentum).add_(grad)
+                update = grad.add(buffer, alpha=momentum) if nesterov else buffer
+                update = self._zeropower_via_newtonschulz5(update, ns_steps)
+                rows = int(update.shape[0])
+                cols = int(update.numel() // max(rows, 1))
+                scale = math.sqrt(max(1.0, float(rows) / float(max(cols, 1))))
+                param.add_(update.to(dtype=param.dtype), alpha=-lr * scale)
+
+        return loss
+
+
 class OptimizerCollection(torch.optim.Optimizer):
     def __init__(self, *optimizers: torch.optim.Optimizer):
         self.optimizers = [optimizer for optimizer in optimizers if optimizer is not None]
@@ -136,6 +227,25 @@ class OptimizerCollection(torch.optim.Optimizer):
         super().__init__(params, defaults={})
         self.param_groups = [group for optimizer in self.optimizers for group in optimizer.param_groups]
 
+    def _refresh_param_groups(self) -> None:
+        self.param_groups = [group for optimizer in self.optimizers for group in optimizer.param_groups]
+
+    def state_dict(self):
+        return {"optimizers": [optimizer.state_dict() for optimizer in self.optimizers]}
+
+    def load_state_dict(self, state_dict):
+        optimizer_states = state_dict.get("optimizers") if isinstance(state_dict, Mapping) else None
+        if not isinstance(optimizer_states, list):
+            raise ValueError("OptimizerCollection state must contain an 'optimizers' list.")
+        if len(optimizer_states) != len(self.optimizers):
+            raise ValueError(
+                f"OptimizerCollection expected {len(self.optimizers)} optimizer state(s), "
+                f"got {len(optimizer_states)}."
+            )
+        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states, strict=True):
+            optimizer.load_state_dict(optimizer_state)
+        self._refresh_param_groups()
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -151,19 +261,6 @@ class OptimizerCollection(torch.optim.Optimizer):
     def zero_grad(self, set_to_none: bool = True):
         for optimizer in self.optimizers:
             optimizer.zero_grad(set_to_none=set_to_none)
-
-    def state_dict(self):
-        return {"optimizers": [optimizer.state_dict() for optimizer in self.optimizers]}
-
-    def load_state_dict(self, state_dict):
-        optimizer_states = state_dict["optimizers"]
-        if len(optimizer_states) != len(self.optimizers):
-            raise ValueError(f"Expected {len(self.optimizers)} optimizer states, got {len(optimizer_states)}.")
-
-        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states, strict=True):
-            optimizer.load_state_dict(optimizer_state)
-
-        self.param_groups = [group for optimizer in self.optimizers for group in optimizer.param_groups]
 
 
 class TrainRunner:
@@ -299,13 +396,13 @@ class TrainRunner:
         startup_timer.log(f"critic model ready: type={self.critic.critic_type}")
         startup_timer.log("creating optimizers and rollout storage")
 
-        self.optimizer, optimizer_stats = self._build_optimizer_collection(
-            {"actor": self.actor, "critic": self.critic}
+        self.actor_optimizer, self.critic_optimizer, optimizer_stats = self._build_actor_critic_optimizers(
+            self.actor,
+            self.critic,
         )
-        self.actor_optimizer = self.optimizer
-        self.critic_optimizer = self.optimizer
+        self.optimizer = OptimizerCollection(self.actor_optimizer, self.critic_optimizer)
         self.grad_scaler = build_grad_scaler(self.use_amp)
-        self.lr_scheduler = KLAdaptiveLR(self.optimizer, 0.01, min_lr = 5e-6)
+        self.lr_scheduler = KLAdaptiveLR(self.actor_optimizer, 0.01, min_lr=KL_SCHEDULER_MIN_LR)
         self._restore_resume_checkpoint(startup_timer)
         self._sync_sampler_global_step()
         self.start_update_count = int(self.update_count)
@@ -362,8 +459,15 @@ class TrainRunner:
         startup_timer.log("ready to enter PPO loop")
 
         print(
-            "shared optimizer:",
-            f"Adam={optimizer_stats['adam_tensors']} tensors / {optimizer_stats['adam_numel']} params",
+            "optimizers:",
+            f"actor Muon={optimizer_stats['actor_muon_tensors']} tensors / "
+            f"{optimizer_stats['actor_muon_numel']} params",
+            f"actor Adam={optimizer_stats['actor_adam_tensors']} tensors / "
+            f"{optimizer_stats['actor_adam_numel']} params",
+            f"critic Muon={optimizer_stats['critic_muon_tensors']} tensors / "
+            f"{optimizer_stats['critic_muon_numel']} params",
+            f"critic Adam={optimizer_stats['critic_adam_tensors']} tensors / "
+            f"{optimizer_stats['critic_adam_numel']} params",
         )
 
     @staticmethod
@@ -757,36 +861,36 @@ class TrainRunner:
 
         return updated
 
-    def _extract_end_effector_termination_error_mean(self) -> float | None:
+    def _extract_end_effector_termination_error_sample(self) -> torch.Tensor | None:
         env_unwrapped = getattr(self.env, "unwrapped", self.env)
-        extras = getattr(env_unwrapped, "extras", None)
-        if isinstance(extras, Mapping):
-            scalar = self._coerce_metric_scalar(extras.get("curriculum/end_effector/error_mean"))
-            if scalar is not None:
-                return scalar
 
         termination_model = getattr(env_unwrapped, "termination_model", None)
-        if termination_model is None:
-            return None
-        rule = self._find_end_effector_failure_rule(termination_model)
-        if rule is None or not callable(getattr(rule, "error", None)):
-            return None
-        context_builder = getattr(termination_model, "build_context", None)
-        if not callable(context_builder):
-            return None
+        if termination_model is not None:
+            rule = self._find_end_effector_failure_rule(termination_model)
+            context_builder = getattr(termination_model, "build_context", None)
+            if rule is not None and callable(getattr(rule, "error", None)) and callable(context_builder):
+                try:
+                    context = context_builder(
+                        getattr(env_unwrapped, "episode_length_buf"),
+                        getattr(env_unwrapped, "max_episode_length"),
+                        getattr(env_unwrapped, "robot"),
+                        getattr(env_unwrapped, "reference_motion"),
+                        getattr(env_unwrapped, "sampler"),
+                    )
+                    error = rule.error(context)
+                except (AttributeError, TypeError, RuntimeError, ValueError):
+                    error = None
+                tensor = self._coerce_metric_tensor(error)
+                if tensor is not None:
+                    return tensor
 
-        try:
-            context = context_builder(
-                getattr(env_unwrapped, "episode_length_buf"),
-                getattr(env_unwrapped, "max_episode_length"),
-                getattr(env_unwrapped, "robot"),
-                getattr(env_unwrapped, "reference_motion"),
-                getattr(env_unwrapped, "sampler"),
-            )
-            error = rule.error(context)
-        except (AttributeError, TypeError, RuntimeError, ValueError):
-            return None
-        return self._coerce_metric_scalar(error)
+        extras = getattr(env_unwrapped, "extras", None)
+        if isinstance(extras, Mapping):
+            return self._coerce_metric_tensor(extras.get("curriculum/end_effector/error_mean"))
+        return None
+
+    def _extract_end_effector_termination_error_mean(self) -> float | None:
+        return self._coerce_metric_scalar(self._extract_end_effector_termination_error_sample())
 
     @staticmethod
     def _deadline_stage_index(
@@ -990,13 +1094,95 @@ class TrainRunner:
 
         return adam_groups, stats
 
+    @staticmethod
+    def _build_muon_adam_param_groups(
+        modules: dict[str, torch.nn.Module],
+    ) -> tuple[list[dict], list[dict], dict[str, int]]:
+        muon_groups = []
+        adam_groups = []
+        stats = {
+            "muon_tensors": 0,
+            "muon_numel": 0,
+            "adam_tensors": 0,
+            "adam_numel": 0,
+        }
+
+        for module_name, module in modules.items():
+            muon_params = []
+            adam_params = []
+
+            for _, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if param.ndim >= 2:
+                    muon_params.append(param)
+                    stats["muon_tensors"] += 1
+                    stats["muon_numel"] += param.numel()
+                else:
+                    adam_params.append(param)
+                    stats["adam_tensors"] += 1
+                    stats["adam_numel"] += param.numel()
+
+            if muon_params:
+                muon_groups.append({"params": muon_params, "name": f"{module_name}_muon"})
+            if adam_params:
+                adam_groups.append({"params": adam_params, "name": f"{module_name}_adam"})
+
+        return muon_groups, adam_groups, stats
+
     @classmethod
     def _build_optimizer_collection(
         cls,
         modules: dict[str, torch.nn.Module],
     ) -> tuple[OptimizerCollection, dict[str, int]]:
-        adam_groups, stats = cls._build_adam_param_groups(modules)
-        return OptimizerCollection(torch.optim.Adam(adam_groups, lr=1e-3, weight_decay=0.0)), stats
+        optimizers, stats = cls._build_muon_adam_optimizers(modules)
+        return OptimizerCollection(*optimizers.values()), stats
+
+    @classmethod
+    def _build_actor_critic_optimizers(
+        cls,
+        actor: torch.nn.Module,
+        critic: torch.nn.Module,
+    ) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer, dict[str, int]]:
+        optimizers, stats = cls._build_muon_adam_optimizers({"actor": actor, "critic": critic})
+        missing = [name for name in ("actor", "critic") if name not in optimizers]
+        if missing:
+            raise ValueError(f"Cannot build optimizer for module(s) without trainable parameters: {missing}.")
+        return optimizers["actor"], optimizers["critic"], stats
+
+    @classmethod
+    def _build_muon_adam_optimizers(
+        cls,
+        modules: dict[str, torch.nn.Module],
+    ) -> tuple[dict[str, torch.optim.Optimizer], dict[str, int]]:
+        optimizers: dict[str, torch.optim.Optimizer] = {}
+        stats = {
+            "muon_tensors": 0,
+            "muon_numel": 0,
+            "adam_tensors": 0,
+            "adam_numel": 0,
+        }
+
+        for module_name, module in modules.items():
+            muon_groups, adam_groups, module_stats = cls._build_muon_adam_param_groups({module_name: module})
+            stats["muon_tensors"] += module_stats["muon_tensors"]
+            stats["muon_numel"] += module_stats["muon_numel"]
+            stats["adam_tensors"] += module_stats["adam_tensors"]
+            stats["adam_numel"] += module_stats["adam_numel"]
+            stats[f"{module_name}_muon_tensors"] = module_stats["muon_tensors"]
+            stats[f"{module_name}_muon_numel"] = module_stats["muon_numel"]
+            stats[f"{module_name}_adam_tensors"] = module_stats["adam_tensors"]
+            stats[f"{module_name}_adam_numel"] = module_stats["adam_numel"]
+            module_optimizers: list[torch.optim.Optimizer] = []
+            lr = CRITIC_LEARNING_RATE if module_name == "critic" else ACTOR_LEARNING_RATE
+            if muon_groups:
+                module_optimizers.append(Muon(muon_groups, lr=lr))
+            if adam_groups:
+                module_optimizers.append(torch.optim.Adam(adam_groups, lr=lr, weight_decay=0.0))
+            if module_optimizers:
+                optimizers[module_name] = OptimizerCollection(*module_optimizers)
+
+        return optimizers, stats
 
     @staticmethod
     def _optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
@@ -1014,6 +1200,111 @@ class TrainRunner:
                 f"{OPTIMIZER_STATE_KEY} or legacy {', '.join(LEGACY_OPTIMIZER_STATE_KEYS)}"
             )
         return missing_keys
+
+    @staticmethod
+    def _single_group_optimizer_state(
+        optimizer_state: Mapping[str, Any],
+        param_group: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        param_ids = set(param_group.get("params", ()))
+        state = optimizer_state.get("state", {})
+        if not isinstance(state, Mapping):
+            state = {}
+        return {
+            "state": {param_id: value for param_id, value in state.items() if param_id in param_ids},
+            "param_groups": [dict(param_group)],
+        }
+
+    @staticmethod
+    def _single_group_state_matches_optimizer(
+        optimizer: torch.optim.Optimizer,
+        optimizer_state: Mapping[str, Any],
+    ) -> bool:
+        param_groups = optimizer_state.get("param_groups")
+        if not isinstance(param_groups, list) or len(param_groups) != len(optimizer.param_groups):
+            return False
+        return all(
+            len(saved_group.get("params", ())) == len(current_group["params"])
+            for saved_group, current_group in zip(param_groups, optimizer.param_groups, strict=True)
+        )
+
+    def _restore_split_optimizer_state_from_shared(self, optimizer_state: Mapping[str, Any]) -> bool:
+        optimizer_states = optimizer_state.get("optimizers")
+        if isinstance(optimizer_states, (list, tuple)):
+            if len(optimizer_states) != 1:
+                return False
+            shared_optimizer_state = optimizer_states[0]
+        else:
+            shared_optimizer_state = optimizer_state
+        if not isinstance(shared_optimizer_state, Mapping):
+            return False
+
+        param_groups = shared_optimizer_state.get("param_groups")
+        if not isinstance(param_groups, list):
+            return False
+        groups_by_name = {
+            str(group.get("name")): group
+            for group in param_groups
+            if isinstance(group, Mapping) and group.get("name") in {"actor", "critic"}
+        }
+        if set(groups_by_name) != {"actor", "critic"}:
+            return False
+
+        actor_state = self._single_group_optimizer_state(shared_optimizer_state, groups_by_name["actor"])
+        critic_state = self._single_group_optimizer_state(shared_optimizer_state, groups_by_name["critic"])
+        if not self._single_group_state_matches_optimizer(self.actor_optimizer, actor_state):
+            return False
+        if not self._single_group_state_matches_optimizer(self.critic_optimizer, critic_state):
+            return False
+
+        self.actor_optimizer.load_state_dict(actor_state)
+        self.critic_optimizer.load_state_dict(critic_state)
+        return True
+
+    def _restore_optimizer_state(self, training_state: Mapping[str, Any]) -> bool:
+        if OPTIMIZER_STATE_KEY in training_state:
+            optimizer_state = training_state[OPTIMIZER_STATE_KEY]
+            try:
+                self.optimizer.load_state_dict(optimizer_state)
+                return True
+            except (KeyError, RuntimeError, ValueError) as exc:
+                if isinstance(optimizer_state, Mapping) and self._restore_split_optimizer_state_from_shared(
+                    optimizer_state
+                ):
+                    print(
+                        "resume checkpoint stores a shared actor/critic optimizer state; "
+                        "split it into separate actor and critic optimizers.",
+                        flush=True,
+                    )
+                    return True
+                print(
+                    "resume checkpoint optimizer state is incompatible with the current Muon+Adam optimizers; "
+                    "using freshly initialized actor and critic optimizers while restoring scheduler, scaler, "
+                    f"and counters. Reason: {self._format_failure_reason(exc)}",
+                    flush=True,
+                )
+                return False
+
+        if not all(key in training_state for key in LEGACY_OPTIMIZER_STATE_KEYS):
+            return False
+
+        try:
+            self.actor_optimizer.load_state_dict(training_state[ACTOR_OPTIMIZER_STATE_KEY])
+            self.critic_optimizer.load_state_dict(training_state[CRITIC_OPTIMIZER_STATE_KEY])
+        except (KeyError, RuntimeError, ValueError) as exc:
+            print(
+                "resume checkpoint stores separate actor/critic optimizer states, but they are incompatible "
+                "with the current optimizers; using freshly initialized actor and critic optimizers while "
+                f"restoring scheduler, scaler, and counters. Reason: {self._format_failure_reason(exc)}",
+                flush=True,
+            )
+            return False
+
+        print(
+            "resume checkpoint stores separate actor/critic optimizer states; restored both optimizers.",
+            flush=True,
+        )
+        return True
 
     @staticmethod
     def _list_to_tuple(value: Any) -> Any:
@@ -1145,17 +1436,9 @@ class TrainRunner:
                 f"Missing keys: {', '.join(missing_keys)}."
             )
 
-        optimizer_state_restored = False
-        if OPTIMIZER_STATE_KEY in training_state:
-            self.optimizer.load_state_dict(training_state[OPTIMIZER_STATE_KEY])
-            optimizer_state_restored = True
-        elif all(key in training_state for key in LEGACY_OPTIMIZER_STATE_KEYS):
-            print(
-                "resume checkpoint stores separate actor/critic optimizer states; "
-                "using a freshly initialized shared optimizer while restoring scheduler, scaler, and counters.",
-                flush=True,
-            )
+        optimizer_state_restored = self._restore_optimizer_state(training_state)
         self.lr_scheduler.load_state_dict(training_state["lr_scheduler"])
+        self.lr_scheduler.min_lr = KL_SCHEDULER_MIN_LR
         self.grad_scaler.load_state_dict(training_state["grad_scaler"])
         self.update_count = int(training_state["update_count"])
         self.global_step = int(training_state["global_step"])
@@ -1186,16 +1469,24 @@ class TrainRunner:
                 yield metric_name, value
 
     @staticmethod
-    def _coerce_metric_scalar(value: Any) -> float | None:
+    def _coerce_metric_tensor(value: Any) -> torch.Tensor | None:
         try:
             tensor = torch.as_tensor(value, dtype=torch.float32)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RuntimeError):
             return None
         if tensor.numel() == 0:
             return None
+        tensor = tensor.detach()
         if tensor.device.type != "cpu":
-            tensor = tensor.detach().to(device="cpu")
-        if not torch.isfinite(tensor).all():
+            tensor = tensor.to(device="cpu")
+        if not bool(torch.isfinite(tensor).all().item()):
+            return None
+        return tensor.reshape(-1)
+
+    @classmethod
+    def _coerce_metric_scalar(cls, value: Any) -> float | None:
+        tensor = cls._coerce_metric_tensor(value)
+        if tensor is None:
             return None
         return float(tensor.mean().item())
 
@@ -1319,6 +1610,31 @@ class TrainRunner:
                 torch.quantile(location_error, 0.95).detach().to(device="cpu").item()
             ),
             "tracking/location_error_max_m": float(location_error.max().detach().to(device="cpu").item()),
+        }
+
+    @classmethod
+    def _build_end_effector_tracking_metrics(cls, end_effector_error_samples: list[torch.Tensor]) -> dict[str, float]:
+        if not end_effector_error_samples:
+            return {}
+
+        flattened_samples: list[torch.Tensor] = []
+        for sample in end_effector_error_samples:
+            tensor = cls._coerce_metric_tensor(sample)
+            if tensor is None:
+                return {}
+            flattened_samples.append(tensor)
+
+        if not flattened_samples:
+            return {}
+
+        end_effector_error = torch.cat(flattened_samples, dim=0)
+        if end_effector_error.numel() == 0 or not bool(torch.isfinite(end_effector_error).all().item()):
+            return {}
+
+        return {
+            "tracking/end_effector_position_error_m": float(end_effector_error.mean().item()),
+            "tracking/end_effector_position_error_p95_m": float(torch.quantile(end_effector_error, 0.95).item()),
+            "tracking/end_effector_position_error_max_m": float(end_effector_error.max().item()),
         }
 
     @staticmethod
@@ -2589,7 +2905,7 @@ class TrainRunner:
     def rollout(self, obs):
         latest_curriculum_metrics: dict[str, float] = {}
         terminate_rate_samples: list[float] = []
-        end_effector_error_samples: list[float] = []
+        end_effector_error_samples: list[torch.Tensor] = []
         relative_anchor_pos_samples: list[torch.Tensor] = []
         location_tracking_available = True
         for _ in range(self.steps):
@@ -2601,9 +2917,9 @@ class TrainRunner:
             terminate_rate = self._coerce_metric_scalar(terminate.to(dtype=torch.float32))
             if terminate_rate is not None:
                 terminate_rate_samples.append(terminate_rate)
-            end_effector_error_mean = self._extract_end_effector_termination_error_mean()
-            if end_effector_error_mean is not None:
-                end_effector_error_samples.append(end_effector_error_mean)
+            end_effector_error_sample = self._extract_end_effector_termination_error_sample()
+            if end_effector_error_sample is not None:
+                end_effector_error_samples.append(end_effector_error_sample)
             curriculum_metric_sample = self._extract_curriculum_metric_sample(info)
             if curriculum_metric_sample:
                 latest_curriculum_metrics.update(curriculum_metric_sample)
@@ -2657,14 +2973,15 @@ class TrainRunner:
             location_tracking_payload = self._build_location_tracking_metrics(relative_anchor_pos_samples)
             if location_tracking_payload:
                 self._log_metrics(location_tracking_payload)
+        end_effector_tracking_payload = self._build_end_effector_tracking_metrics(end_effector_error_samples)
+        if end_effector_tracking_payload:
+            self._log_metrics(end_effector_tracking_payload)
 
         terminate_rate = (
             float(sum(terminate_rate_samples) / len(terminate_rate_samples)) if terminate_rate_samples else None
         )
-        error_mean = (
-            float(sum(end_effector_error_samples) / len(end_effector_error_samples))
-            if end_effector_error_samples
-            else None
+        error_mean = self._coerce_optional_float(
+            end_effector_tracking_payload.get("tracking/end_effector_position_error_m")
         )
         self._last_end_effector_curriculum_rollout_metrics = {
             "terminate_rate": terminate_rate,
@@ -2738,19 +3055,23 @@ class TrainRunner:
                     critic_loss = value_loss
                     ac_loss = actor_loss + critic_loss
 
-                self.optimizer.zero_grad(set_to_none=True)
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                self.critic_optimizer.zero_grad(set_to_none=True)
                 if self.use_amp:
                     self.grad_scaler.scale(ac_loss).backward()
-                    self.grad_scaler.unscale_(self.optimizer)
+                    self.grad_scaler.unscale_(self.actor_optimizer)
+                    self.grad_scaler.unscale_(self.critic_optimizer)
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.step(self.actor_optimizer)
+                    self.grad_scaler.step(self.critic_optimizer)
                     self.grad_scaler.update()
                 else:
                     ac_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                    self.optimizer.step()
+                    self.actor_optimizer.step()
+                    self.critic_optimizer.step()
                 self.lr_scheduler.set_kl(float(kl_divergence.detach().to(device="cpu", dtype=torch.float32).item()))
                 self.lr_scheduler.step()
 
@@ -2779,8 +3100,8 @@ class TrainRunner:
                 "update/avg_advantage_std": self.tracker.get_mean("advantage_std"),
                 "update/avg_value_explained_variance": self.tracker.get_mean("value_explained_variance"),
                 "update/avg_value_clip_fraction": self.tracker.get_mean("value_clip_fraction"),
-                "update/actor_lr": self._optimizer_lr(self.optimizer),
-                "update/critic_lr": self._optimizer_lr(self.optimizer),
+                "update/actor_lr": self._optimizer_lr(self.actor_optimizer),
+                "update/critic_lr": self._optimizer_lr(self.critic_optimizer),
             }
         )
         self.update_count += 1

@@ -17,6 +17,8 @@ For MuJoCo sim-to-sim evaluation, install the optional sim2sim dependencies if t
 pip install -e ".[sim2sim]"
 ```
 
+This extra includes the MuJoCo bridge dependencies and the FFmpeg backend used for `.mp4` video output.
+
 The default training motion set resolves through Ref2Act to:
 
 ```text

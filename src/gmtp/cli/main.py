@@ -131,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         "--sampler-failure-warmup-fraction",
         type=float,
-        default=0.10,
+        default=0.0,
         help="Use uniform motion/anchor sampling for this fraction of training before failure weighting turns on.",
     )
     train_parser.add_argument("--anchor-log-interval", type=int, default=100)

@@ -8,8 +8,9 @@ from .observation_history import build_gmtp_observation_spec
 
 TRAINING_NUM_ENVS = 4096
 END_EFFECTOR_TERMINATION_RULE_ID = "end_effector_position_failure"
-END_EFFECTOR_TERMINATE_START_THRESHOLD = 0.25
-END_EFFECTOR_TERMINATE_END_THRESHOLD = 0.15
+END_EFFECTOR_TERMINATE_START_THRESHOLD = 0.2
+END_EFFECTOR_TERMINATE_END_THRESHOLD = 0.2
+END_EFFECTOR_TERMINATE_HEIGHT_ONLY = True
 
 _REF2ACT = load_env_cfg_symbols()
 G1MotionTrackingEnvCfg = _REF2ACT.G1MotionTrackingEnvCfg
@@ -33,7 +34,15 @@ def set_end_effector_termination_threshold(termination_cfg, threshold: float):
             continue
         if not hasattr(rule_cfg, "threshold"):
             raise ValueError(f"Termination rule {END_EFFECTOR_TERMINATION_RULE_ID!r} does not expose a threshold.")
-        updated_failure_rules.append(replace(rule_cfg, threshold=float(threshold)))
+        if not hasattr(rule_cfg, "height_only"):
+            raise ValueError(f"Termination rule {END_EFFECTOR_TERMINATION_RULE_ID!r} does not expose height_only.")
+        updated_failure_rules.append(
+            replace(
+                rule_cfg,
+                threshold=float(threshold),
+                height_only=END_EFFECTOR_TERMINATE_HEIGHT_ONLY,
+            )
+        )
         matched_rule = True
 
     if not matched_rule:
@@ -69,13 +78,12 @@ class G1MultiMotionTrainingEnv(G1MultiMotionEnv):
     sampling_strategy = SamplingStrategy.FailureWeighted
     segment_source = SegmentSource.Anchor
     init_failure_bins = True
-    # Ref2Act's anchor sampler uses failure EMA counts plus this uniform floor
-    # directly. The training runner overrides warmup_s for the sampler curriculum.
-    weight_fail = 0.6
-    weight_novel = 0.2
+    # Failure weighting is active from the first training update by default.
+    weight_fail = 0.5
+    weight_novel = 0.3
     cap_beta = 2.0
     adaptive_uniform_ratio = 0.1
-    adaptive_alpha = 0.005
+    adaptive_alpha = 0.001
     adaptive_kernel_size = 1
     adaptive_lambda = 0.8
     motion_sampling_warmup_s = 0.0

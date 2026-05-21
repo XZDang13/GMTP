@@ -28,7 +28,7 @@ class RunConfig:
     end_effector_termination_max_terminate_rate: float = 0.03
     end_effector_termination_error_margin: float = 1.10
     end_effector_termination_allow_error_fallback: bool = True
-    sampler_failure_warmup_fraction: float = 0.10
+    sampler_failure_warmup_fraction: float = 0.0
     rollout_steps: int = 20
     num_updates: int = 1000
     checkpoint_interval: int = 4000

@@ -153,6 +153,53 @@ class _LocationMetricTrainEnv(_DummyTrainEnv):
         return obs, reward, terminate, timeout, info
 
 
+class _EndEffectorErrorRule:
+    id = "end_effector_position_failure"
+
+    def __init__(self, env):
+        self.env = env
+        self.threshold = 0.15
+
+    def error(self, context):
+        return self.env.end_effector_error()
+
+
+class _EndEffectorTerminationModel:
+    def __init__(self, env):
+        self.rule = _EndEffectorErrorRule(env)
+        self.failure_rules = [self.rule]
+
+    def get_failure_rule(self, rule_id: str):
+        if rule_id != self.rule.id:
+            raise KeyError(rule_id)
+        return self.rule
+
+    def build_context(self, episode_length_buf, max_episode_length, robot, reference_motion, sampler):
+        return types.SimpleNamespace()
+
+
+class _EndEffectorMetricTrainEnv(_DummyTrainEnv):
+    def __init__(self, batch_size: int, *, robot_window_length: int = 4, motion_window_length: int = 1):
+        super().__init__(
+            batch_size,
+            robot_window_length=robot_window_length,
+            motion_window_length=motion_window_length,
+        )
+        self.episode_length_buf = torch.zeros(batch_size, dtype=torch.long)
+        self.max_episode_length = torch.full((batch_size,), 100, dtype=torch.long)
+        self.robot = types.SimpleNamespace()
+        self.sampler = types.SimpleNamespace()
+        self.termination_model = _EndEffectorTerminationModel(self)
+
+    def end_effector_error(self) -> torch.Tensor:
+        values = torch.zeros(self.batch_size, 2, dtype=torch.float32)
+        if self.step_count == 1:
+            values[:2] = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+        elif self.step_count == 2:
+            values[:2] = torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float32)
+        return values
+
+
 class _StructuredCriticTrainEnv(_DummyTrainEnv):
     def __init__(self, batch_size: int, *, robot_window_length: int = 4, motion_window_length: int = 1):
         super().__init__(
@@ -441,7 +488,7 @@ def test_cli_parser_builds_train_and_eval_commands():
     assert args.end_effector_termination_hold_updates == 20
     assert args.end_effector_termination_max_terminate_rate == pytest.approx(0.03)
     assert args.end_effector_termination_error_margin == pytest.approx(1.10)
-    assert args.sampler_failure_warmup_fraction == pytest.approx(0.10)
+    assert args.sampler_failure_warmup_fraction == pytest.approx(0.0)
     assert args.motion_mae_encoder_checkpoint is None
     assert args.motion_files is None
     assert args.resume_checkpoint_path is None
@@ -674,9 +721,9 @@ def test_train_runner_passes_end_effector_termination_curriculum_to_training_env
     assert runner.end_effector_termination_curriculum.thresholds == pytest.approx(
         (0.25, 0.22, 0.19, 0.16, 0.15)
     )
-    assert runner.sampler_failure_warmup_steps == 2
-    assert runner.cfg.sampler_failure_warmup_steps == 2
-    assert runner.cfg.motion_sampling_warmup_s == pytest.approx(0.04)
+    assert runner.sampler_failure_warmup_steps == 0
+    assert runner.cfg.sampler_failure_warmup_steps == 0
+    assert runner.cfg.motion_sampling_warmup_s == pytest.approx(0.0)
     assert runner.cfg.motion_sampling_ramp_s == pytest.approx(0.0)
     config_payload = json.loads(runner.run_paths.config_path.read_text(encoding="utf-8"))
     assert config_payload["config"]["end_effector_termination_curriculum_enabled"] is True
@@ -685,7 +732,7 @@ def test_train_runner_passes_end_effector_termination_curriculum_to_training_env
     assert config_payload["config"]["end_effector_termination_tighten_step"] == pytest.approx(0.03)
     assert config_payload["config"]["end_effector_termination_warmup_fraction"] == pytest.approx(0.10)
     assert config_payload["config"]["end_effector_termination_deadline_fraction"] == pytest.approx(0.50)
-    assert config_payload["config"]["sampler_failure_warmup_fraction"] == pytest.approx(0.10)
+    assert config_payload["config"]["sampler_failure_warmup_fraction"] == pytest.approx(0.0)
     runner.env.close()
 
 
@@ -863,6 +910,39 @@ def test_train_runner_logs_rollout_location_tracking_metrics(monkeypatch):
     runner.env.close()
 
 
+def test_train_runner_logs_rollout_end_effector_tracking_metrics(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "gmtp.integrations.ref2act.isaac_env",
+        _fake_train_module(_EndEffectorMetricTrainEnv),
+    )
+    runner = TrainRunner(
+        RunConfig(
+            use_wandb=False,
+            rollout_steps=2,
+            num_updates=1,
+        )
+    )
+    logged_payloads = []
+    runner._log_metrics = lambda payload: logged_payloads.append(dict(payload))
+
+    runner.rollout(runner.initial_obs)
+
+    end_effector_error = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], dtype=torch.float32)
+    payload = next(payload for payload in logged_payloads if "tracking/end_effector_position_error_m" in payload)
+    assert payload == pytest.approx(
+        {
+            "tracking/end_effector_position_error_m": float(end_effector_error.mean().item()),
+            "tracking/end_effector_position_error_p95_m": float(torch.quantile(end_effector_error, 0.95).item()),
+            "tracking/end_effector_position_error_max_m": float(end_effector_error.max().item()),
+        }
+    )
+    assert runner._last_end_effector_curriculum_rollout_metrics["error_mean"] == pytest.approx(
+        float(end_effector_error.mean().item())
+    )
+    runner.env.close()
+
+
 def test_train_runner_supports_actor_integrated_motion_mae(tmp_path, monkeypatch):
     motion_mae_checkpoint = _write_motion_mae_encoder_checkpoint(tmp_path)
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
@@ -903,9 +983,11 @@ def test_train_runner_update_smoke_uses_cpu_fallback(monkeypatch):
     assert hasattr(runner, "optimizer")
     assert hasattr(runner, "actor_optimizer")
     assert hasattr(runner, "critic_optimizer")
-    assert runner.optimizer is runner.actor_optimizer
-    assert runner.optimizer is runner.critic_optimizer
-    assert runner.lr_scheduler.optimizer is runner.optimizer
+    assert runner.optimizer is not runner.actor_optimizer
+    assert runner.optimizer is not runner.critic_optimizer
+    assert runner.actor_optimizer is not runner.critic_optimizer
+    assert runner.optimizer.optimizers == [runner.actor_optimizer, runner.critic_optimizer]
+    assert runner.lr_scheduler.optimizer is runner.actor_optimizer
     runner.env.close()
 
 
@@ -1034,19 +1116,28 @@ def test_train_runner_restores_full_trainer_state_and_runs_additional_updates(tm
     assert runner.lr_scheduler.state_dict() == checkpoint.training["lr_scheduler"]
     assert runner.grad_scaler.state_dict() == checkpoint.training["grad_scaler"]
 
-    restored_optimizer = runner.optimizer.state_dict()["optimizers"][0]["state"]
-    checkpoint_optimizer = checkpoint.training["optimizer"]["optimizers"][0]["state"]
-    assert restored_optimizer.keys() == checkpoint_optimizer.keys()
-    first_state_key = next(iter(checkpoint_optimizer))
-    for state_name, checkpoint_state_value in checkpoint_optimizer[first_state_key].items():
-        if torch.is_tensor(checkpoint_state_value):
-            assert torch.equal(
-                restored_optimizer[first_state_key][state_name].detach().cpu(),
-                checkpoint_state_value.detach().cpu(),
-            )
-            break
-    else:
-        raise AssertionError("Expected at least one tensor optimizer state value.")
+    restored_optimizers = runner.optimizer.state_dict()["optimizers"]
+    checkpoint_optimizers = checkpoint.training["optimizer"]["optimizers"]
+    assert len(restored_optimizers) == 2
+    assert len(checkpoint_optimizers) == 2
+    for restored_optimizer_state, checkpoint_optimizer_state in zip(
+        restored_optimizers,
+        checkpoint_optimizers,
+        strict=True,
+    ):
+        restored_optimizer = restored_optimizer_state["state"]
+        checkpoint_optimizer = checkpoint_optimizer_state["state"]
+        assert restored_optimizer.keys() == checkpoint_optimizer.keys()
+        first_state_key = next(iter(checkpoint_optimizer))
+        for state_name, checkpoint_state_value in checkpoint_optimizer[first_state_key].items():
+            if torch.is_tensor(checkpoint_state_value):
+                assert torch.equal(
+                    restored_optimizer[first_state_key][state_name].detach().cpu(),
+                    checkpoint_state_value.detach().cpu(),
+                )
+                break
+        else:
+            raise AssertionError("Expected at least one tensor optimizer state value.")
 
     summary = runner.train()
     final_checkpoint = load_checkpoint_v2(summary["final_checkpoint"])
@@ -1095,8 +1186,9 @@ def test_train_runner_warm_starts_optimizer_from_legacy_separate_optimizer_state
     output = capsys.readouterr().out
 
     assert "separate actor/critic optimizer states" in output
-    assert runner.optimizer is runner.actor_optimizer
-    assert runner.optimizer is runner.critic_optimizer
+    assert runner.optimizer is not runner.actor_optimizer
+    assert runner.optimizer is not runner.critic_optimizer
+    assert runner.optimizer.optimizers == [runner.actor_optimizer, runner.critic_optimizer]
     assert runner.resume_mode == "optimizer_warm_start"
     assert runner.resume_trainer_state_restored is False
     assert runner.update_count == 5
@@ -1178,13 +1270,13 @@ def test_train_runner_summary_and_checkpoint_record_anchor_sampler_metadata(tmp_
     assert checkpoint.motion_files[0].endswith("jump_anchor.npz")
 
 
-def test_train_runner_configures_failure_weighted_sampling_with_warmup(monkeypatch):
+def test_train_runner_configures_failure_weighted_sampling_without_warmup(monkeypatch):
     monkeypatch.setitem(sys.modules, "gmtp.integrations.ref2act.isaac_env", _fake_train_module())
     runner = TrainRunner(RunConfig(use_wandb=False))
 
     assert runner.sampling_strategy == "failure_weighted"
     assert runner.cfg.sampling_strategy == "FailureWeighted"
-    assert runner.sampler_failure_warmup_steps == 2000
+    assert runner.sampler_failure_warmup_steps == 0
     runner.env.close()
 
 

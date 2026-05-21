@@ -1,6 +1,7 @@
 import json
 import sys
 import types
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -498,15 +499,236 @@ def test_offscreen_video_recorder_uses_env_tracking_camera(monkeypatch, tmp_path
 
     try:
         recorder.capture_frame()
+        renderer = recorder._renderer
     finally:
         recorder.close()
 
-    assert update_calls == [(640, 360)]
-    assert recorder._renderer.last_camera is recorder._camera
+    assert update_calls == [(624, 352)]
+    assert renderer is not None
+    assert renderer.last_camera is recorder._camera
     assert np.allclose(recorder._camera.lookat, np.asarray([1.0, 2.0, 3.0], dtype=np.float64))
     assert recorder._camera.distance == pytest.approx(4.0)
     assert fake_writer.frames == 1
     assert fake_writer.closed is True
+
+
+def test_offscreen_video_recorder_tracks_mujoco_root(monkeypatch, tmp_path):
+    renderer_instances: list[object] = []
+
+    class _FakeCamera:
+        def __init__(self):
+            self.type = -1
+            self.fixedcamid = 99
+            self.trackbodyid = 88
+            self.lookat = np.zeros(3, dtype=np.float64)
+            self.distance = 0.0
+            self.azimuth = 0.0
+            self.elevation = 0.0
+
+    class _FakeRenderer:
+        def __init__(self, mj_model, *, height, width):
+            self.height = height
+            self.width = width
+            self.last_camera = None
+            self.closed = False
+            renderer_instances.append(self)
+
+        def update_scene(self, mj_data, camera=None):
+            self.last_camera = camera
+
+        def render(self):
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+        def close(self):
+            self.closed = True
+
+    class _FakeWriter:
+        def append_data(self, frame):
+            pass
+
+        def close(self):
+            pass
+
+    fake_mujoco = types.SimpleNamespace(
+        Renderer=_FakeRenderer,
+        MjvCamera=_FakeCamera,
+        mjtCamera=types.SimpleNamespace(mjCAMERA_TRACKING=123),
+        mjv_defaultFreeCamera=lambda mj_model, camera: setattr(camera, "distance", 1.5),
+    )
+    monkeypatch.setitem(sys.modules, "mujoco", fake_mujoco)
+    monkeypatch.setattr(eval_sim2sim.imageio, "get_writer", lambda output_path, fps: _FakeWriter())
+
+    env = types.SimpleNamespace(root_body_id=2)
+    mj_data = types.SimpleNamespace(
+        xpos=np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [23.0, -19.0, 0.8],
+            ],
+            dtype=np.float64,
+        )
+    )
+    recorder = eval_sim2sim.OffscreenMujocoVideoRecorder(
+        mj_model=object(),
+        mj_data=mj_data,
+        env=env,
+        output_path=tmp_path / "tracking.mp4",
+        fps=30,
+        width=640,
+        height=360,
+    )
+
+    try:
+        recorder.capture_frame()
+    finally:
+        recorder.close()
+
+    assert len(renderer_instances) == 1
+    assert renderer_instances[0].closed is True
+    assert recorder._renderer is None
+    camera = renderer_instances[0].last_camera
+    assert camera.type == 123
+    assert camera.trackbodyid == 2
+    assert camera.fixedcamid == -1
+    assert np.allclose(camera.lookat, np.asarray([23.0, -19.0, 0.8], dtype=np.float64))
+    assert camera.distance == pytest.approx(eval_sim2sim.DEFAULT_CAMERA_DISTANCE)
+    assert camera.azimuth == pytest.approx(eval_sim2sim.DEFAULT_CAMERA_AZIMUTH)
+    assert camera.elevation == pytest.approx(eval_sim2sim.DEFAULT_CAMERA_ELEVATION)
+
+
+def test_live_viewer_video_recorder_captures_from_viewer_context(monkeypatch, tmp_path):
+    calls: list[tuple] = []
+
+    class _FakeWriter:
+        def __init__(self):
+            self.frames: list[np.ndarray] = []
+            self.closed = False
+
+        def append_data(self, frame):
+            self.frames.append(np.asarray(frame).copy())
+
+        def close(self):
+            self.closed = True
+
+    fake_writer = _FakeWriter()
+
+    class _Cat:
+        value = 7
+
+    def _read_pixels(rgb, depth, viewport, ctx):
+        rgb[:] = np.arange(rgb.size, dtype=np.uint8).reshape(rgb.shape)
+
+    fake_mujoco = types.SimpleNamespace(
+        mjtCatBit=types.SimpleNamespace(mjCAT_ALL=_Cat),
+        mjv_updateScene=lambda *args: calls.append(("update", args[-2])),
+        mjr_render=lambda viewport, scn, ctx: calls.append(("render", viewport.width, viewport.height)),
+        mjr_readPixels=_read_pixels,
+    )
+    fake_glfw = types.SimpleNamespace(
+        window_should_close=lambda window: False,
+        get_framebuffer_size=lambda window: (4, 4),
+        swap_buffers=lambda window: calls.append(("swap", window)),
+        poll_events=lambda: calls.append(("poll",)),
+    )
+    monkeypatch.setitem(sys.modules, "mujoco", fake_mujoco)
+    monkeypatch.setitem(sys.modules, "glfw", fake_glfw)
+    monkeypatch.setattr(eval_sim2sim.imageio, "get_writer", lambda output_path, fps: fake_writer)
+
+    viewer = types.SimpleNamespace(
+        is_alive=True,
+        window=object(),
+        viewport=types.SimpleNamespace(width=0, height=0),
+        model=object(),
+        data=object(),
+        vopt=object(),
+        pert=object(),
+        cam=object(),
+        scn=object(),
+        ctx=object(),
+        _gui_lock=nullcontext(),
+        _markers=[],
+        apply_perturbations=lambda: calls.append(("perturb",)),
+    )
+    env = types.SimpleNamespace(mj_viewer=viewer)
+
+    recorder = eval_sim2sim.LiveMujocoViewerVideoRecorder(
+        env=env,
+        output_path=tmp_path / "viewer.mp4",
+        fps=30,
+        width=4,
+        height=4,
+    )
+    try:
+        assert recorder.capture_frame() is True
+    finally:
+        recorder.close()
+
+    assert fake_writer.closed is True
+    assert len(fake_writer.frames) == 1
+    assert fake_writer.frames[0].shape == (4, 4, 3)
+    assert ("render", 4, 4) in calls
+    assert ("poll",) in calls
+    assert recorder.closed_by_viewer is False
+
+
+def test_offscreen_video_recorder_scales_to_model_framebuffer(monkeypatch, tmp_path):
+    renderer_sizes: list[tuple[int, int]] = []
+
+    class _FakeRenderer:
+        def __init__(self, mj_model, *, height, width):
+            max_width = mj_model.vis.global_.offwidth
+            max_height = mj_model.vis.global_.offheight
+            if width > max_width or height > max_height:
+                raise ValueError("renderer exceeds framebuffer")
+            self.width = width
+            self.height = height
+            renderer_sizes.append((width, height))
+
+        def update_scene(self, mj_data, camera=None):
+            pass
+
+        def render(self):
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    class _FakeWriter:
+        def append_data(self, frame):
+            pass
+
+        def close(self):
+            pass
+
+    fake_mujoco = types.SimpleNamespace(
+        Renderer=_FakeRenderer,
+        MjvCamera=lambda: None,
+        mjv_defaultFreeCamera=lambda mj_model, camera: None,
+    )
+    monkeypatch.setitem(sys.modules, "mujoco", fake_mujoco)
+    monkeypatch.setattr(eval_sim2sim.imageio, "get_writer", lambda output_path, fps: _FakeWriter())
+
+    model = types.SimpleNamespace(
+        vis=types.SimpleNamespace(global_=types.SimpleNamespace(offwidth=640, offheight=480))
+    )
+    recorder = eval_sim2sim.OffscreenMujocoVideoRecorder(
+        mj_model=model,
+        mj_data=object(),
+        output_path=tmp_path / "scaled.mp4",
+        fps=30,
+        width=1280,
+        height=720,
+    )
+
+    try:
+        recorder.capture_frame()
+    finally:
+        recorder.close()
+
+    assert renderer_sizes == [(624, 352)]
+    assert recorder.width == 624
+    assert recorder.height == 352
 
 
 def test_sim2sim_runner_evaluate_writes_summary_debug_and_video(tmp_path, monkeypatch):
@@ -539,6 +761,8 @@ def test_sim2sim_runner_evaluate_writes_summary_debug_and_video(tmp_path, monkey
     assert [env.render for env in _FakeMujocoEnv.instances] == [False, False]
     assert len(_FakeVideoRecorder.instances) == 2
     assert all(recorder.frames == 3 for recorder in _FakeVideoRecorder.instances)
+    assert all(recorder.fps == 50 for recorder in _FakeVideoRecorder.instances)
+    assert summary["video_fps"] == 50
 
     expected_aggregate = {
         "gravity_mae": (_metric_values(0.0)["gravity_mae"] + _metric_values(0.25)["gravity_mae"]) / 2,
@@ -555,6 +779,9 @@ def test_sim2sim_runner_evaluate_writes_summary_debug_and_video(tmp_path, monkey
         assert Path(motion["debug_json_path"]).exists()
         assert Path(motion["debug_npz_path"]).exists()
         assert Path(motion["video_path"]).exists()
+        assert motion["video_fps"] == 50
+        assert motion["video_width"] == eval_sim2sim.DEFAULT_VIDEO_WIDTH
+        assert motion["video_height"] == eval_sim2sim.DEFAULT_VIDEO_HEIGHT
 
         debug_payload = json.loads(Path(motion["debug_json_path"]).read_text(encoding="utf-8"))
         assert {"action", "sim_ctrl", "sim_motion_time", "sim_qpos", "sim_qvel", "sim_target_pos"}.issubset(
@@ -562,6 +789,9 @@ def test_sim2sim_runner_evaluate_writes_summary_debug_and_video(tmp_path, monkey
         )
         assert debug_payload["steps_executed"] == 2
         assert debug_payload["metrics"] == pytest.approx(motion["metrics"])
+        assert debug_payload["video_fps"] == 50
+        assert debug_payload["video_width"] == eval_sim2sim.DEFAULT_VIDEO_WIDTH
+        assert debug_payload["video_height"] == eval_sim2sim.DEFAULT_VIDEO_HEIGHT
 
 
 def test_sim2sim_runner_rejects_unexpected_obs_dim(tmp_path, monkeypatch):
